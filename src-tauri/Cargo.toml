@@ -1,0 +1,26 @@
+[package]
+name = "p2p-notes"
+version = "0.1.0"
+description = "A local-first, peer-to-peer, end-to-end encrypted markdown notes app"
+authors = ["you"]
+license = "MIT"
+repository = ""
+edition = "2021"
+
+[lib]
+name = "p2p_notes_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+notes-core = { path = "../crates/notes-core" }
+serde_json.workspace = true
+serde.workspace = true
+log.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+tauri = { version = "2", features = [] }
+tauri-plugin-log = "2"
+dirs = "6"

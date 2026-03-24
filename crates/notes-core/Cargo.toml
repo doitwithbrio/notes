@@ -1,0 +1,18 @@
+[package]
+name = "notes-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+automerge.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+log.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+dashmap.workspace = true
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3"

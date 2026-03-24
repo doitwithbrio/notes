@@ -1,0 +1,129 @@
+/* ── Fonts ── */
+
+@font-face {
+  font-family: 'Riccione-Xlight';
+  src: url('/fonts/Riccione-Xlight-Regular.otf') format('opentype');
+  font-weight: 300;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Inter';
+  src: url('/fonts/Inter-Variable.woff2') format('woff2-variations');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ── Design Tokens ── */
+
+:root {
+  /* Colors — 3 core + accent is swappable */
+  --white: #FFFFFF;
+  --black: #000000;
+  --accent: #2AC994;
+
+  /* Cursor colors — remote peers only */
+  --cursor-1: #FF0000;
+  --cursor-2: #0000FF;
+  --cursor-3: #FF00FF;
+  --cursor-4: #FF8800;
+  --cursor-5: #8800FF;
+
+  /* Typography */
+  --font-display: 'Riccione-Xlight', sans-serif;
+  --font-body: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-mono: 'SF Mono', 'Cascadia Code', 'Fira Code', ui-monospace, monospace;
+
+  /* Sizing */
+  --sidebar-width: 240px;
+  --titlebar-height: 40px;
+  --statusbar-height: 28px;
+  --toolbar-height: 36px;
+
+  /* Borders */
+  --border: 1px solid var(--black);
+}
+
+/* ── Reset ── */
+
+*,
+*::before,
+*::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--black);
+  background: var(--white);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#app {
+  height: 100%;
+  width: 100%;
+}
+
+/* ── Selection ── */
+
+::selection {
+  background: var(--accent);
+  color: var(--white);
+}
+
+/* ── Scrollbar (minimal) ── */
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--white);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--black);
+}
+
+/* ── Focus ── */
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* ── Buttons reset ── */
+
+button {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: default;
+}
+
+/* ── Input reset ── */
+
+input, textarea {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  background: var(--white);
+  border: var(--border);
+}
