@@ -15,6 +15,8 @@
   --white: #FDFBF7;
   --black: #000000;
   --accent: #B68D5E;
+  --accent-contrast: #FDFBF7;
+  --app-color-scheme: light;
 
   /* Background tint — warm parchment */
   --bg-tint: #FAF7F2;
@@ -39,6 +41,33 @@
   --shadow-md: 0 2px 6px rgba(46, 42, 37, 0.04);
   --shadow-lg: 0 4px 12px rgba(46, 42, 37, 0.06);
   --shadow-overlay: 0 12px 40px rgba(46, 42, 37, 0.10), 0 2px 8px rgba(46, 42, 37, 0.04);
+
+  /* Semantic tokens for theme engine */
+  --overlay-backdrop: rgba(250, 247, 242, 0.6);
+  --menu-shadow: 0 4px 16px rgba(0, 0, 0, 0.08), 0 1px 4px rgba(0, 0, 0, 0.04);
+  --focus-ring: color-mix(in srgb, var(--accent) 40%, transparent);
+  --selection-bg: color-mix(in srgb, var(--accent) 25%, transparent);
+  --danger-fg: #c0392b;
+  --danger-solid: #c44;
+  --danger-bg: rgba(192, 57, 43, 0.08);
+  --danger-border: rgba(192, 57, 43, 0.3);
+  --banner-action-bg: rgba(255, 255, 255, 0.2);
+  --banner-action-hover: rgba(255, 255, 255, 0.35);
+  --banner-dismiss-fg: rgba(255, 255, 255, 0.7);
+  --banner-dismiss-hover: rgba(255, 255, 255, 0.15);
+  --progress-track: rgba(255, 255, 255, 0.2);
+  --progress-fill: white;
+
+  /* Diff colors */
+  --diff-added: #6BAA8A;
+  --diff-added-bg: rgba(106, 170, 138, 0.10);
+  --diff-removed: #C4836A;
+  --diff-removed-bg: rgba(196, 131, 106, 0.08);
+  --diff-removed-text: rgba(0, 0, 0, 0.35);
+  --diff-removed-decoration: rgba(196, 131, 106, 0.4);
+  --diff-changed: #C4A64E;
+  --diff-changed-bg: rgba(196, 166, 78, 0.10);
+  --diff-neutral-text: rgba(0, 0, 0, 0.30);
 
   /* Cursor colors — remote peers */
   --cursor-1: #C4836A;
@@ -65,6 +94,54 @@
   --transition-slow: 400ms var(--ease-out-expo);
 }
 
+:root[data-theme='dark'] {
+  --white: #e8e4df;
+  --black: #111214;
+  --accent-contrast: #181a1e;
+  --app-color-scheme: dark;
+
+  --bg-tint: #161819;
+  --surface: #1c1e21;
+  --surface-hover: #252830;
+  --surface-active: #2e323c;
+  --surface-sidebar: #19191c;
+
+  --text-primary: #e8e4df;
+  --text-secondary: rgba(232, 228, 223, 0.68);
+  --text-tertiary: rgba(232, 228, 223, 0.40);
+
+  --border-subtle: #2c2f36;
+  --border-default: #393d47;
+
+  --overlay-backdrop: rgba(10, 10, 12, 0.65);
+  --menu-shadow: 0 8px 24px rgba(0, 0, 0, 0.32), 0 2px 8px rgba(0, 0, 0, 0.22);
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.28);
+  --shadow-md: 0 2px 8px rgba(0, 0, 0, 0.22);
+  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.22);
+  --shadow-overlay: 0 16px 48px rgba(0, 0, 0, 0.38), 0 4px 12px rgba(0, 0, 0, 0.24);
+
+  --danger-fg: #ff8f84;
+  --danger-solid: #e56858;
+  --danger-bg: rgba(255, 143, 132, 0.12);
+  --danger-border: rgba(255, 143, 132, 0.3);
+  --banner-action-bg: rgba(255, 255, 255, 0.15);
+  --banner-action-hover: rgba(255, 255, 255, 0.28);
+  --banner-dismiss-fg: rgba(255, 255, 255, 0.65);
+  --banner-dismiss-hover: rgba(255, 255, 255, 0.12);
+  --progress-track: rgba(255, 255, 255, 0.18);
+  --progress-fill: rgba(255, 255, 255, 0.9);
+
+  --diff-added: #7ed7ab;
+  --diff-added-bg: rgba(126, 215, 171, 0.12);
+  --diff-removed: #f2a285;
+  --diff-removed-bg: rgba(242, 162, 133, 0.10);
+  --diff-removed-text: rgba(232, 228, 223, 0.45);
+  --diff-removed-decoration: rgba(242, 162, 133, 0.45);
+  --diff-changed: #ebcb68;
+  --diff-changed-bg: rgba(235, 203, 104, 0.12);
+  --diff-neutral-text: rgba(232, 228, 223, 0.35);
+}
+
 /* ── Reset ── */
 
 *,
@@ -87,6 +164,7 @@ html, body {
   letter-spacing: 0.01em;
   color: var(--text-primary);
   background: var(--bg-tint);
+  color-scheme: var(--app-color-scheme, light);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
@@ -99,7 +177,7 @@ html, body {
 /* ── Selection ── */
 
 ::selection {
-  background: color-mix(in srgb, var(--accent) 25%, transparent);
+  background: var(--selection-bg);
   color: var(--text-primary);
 }
 
@@ -116,7 +194,7 @@ html, body {
 /* ── Focus ── */
 
 :focus-visible {
-  outline: 2px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
 }
 

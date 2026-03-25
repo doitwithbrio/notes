@@ -117,3 +117,39 @@ pub struct ActorInfo {
     /// Assigned color index (0..N for N distinct actors).
     pub color_index: usize,
 }
+
+// ── Todo Types ───────────────────────────────────────────────────────
+
+/// A project-level todo item (stored in manifest, synced via CRDT).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TodoItem {
+    /// UUID of this todo.
+    pub id: String,
+    /// The todo text.
+    pub text: String,
+    /// Whether the todo is done.
+    pub done: bool,
+    /// Peer ID of who created this todo.
+    pub created_by: String,
+    /// ISO 8601 timestamp.
+    pub created_at: String,
+    /// Optional link to a specific document.
+    pub linked_doc_id: Option<String>,
+}
+
+/// Project metadata returned to the frontend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectMetadata {
+    pub name: String,
+    pub project_id: String,
+    pub emoji: Option<String>,
+    pub description: Option<String>,
+    pub color: Option<String>,
+    pub archived: bool,
+    pub created: Option<String>,
+    pub owner: Option<String>,
+    pub peer_count: usize,
+    pub file_count: usize,
+}

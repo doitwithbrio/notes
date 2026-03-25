@@ -1,7 +1,7 @@
 <script lang="ts">
   import { getActiveDoc } from '../../state/documents.svelte.js';
   import { editorSessionState } from '../../session/editor-session.svelte.js';
-  import { uiState, toggleBlame } from '../../state/ui.svelte.js';
+  import { uiState } from '../../state/ui.svelte.js';
   import {
     versionState,
     getSignificantVersions,
@@ -9,7 +9,7 @@
   } from '../../state/versions.svelte.js';
   import { groupByDate } from '../../utils/time.js';
   import { formatShortTime } from '../../utils/time.js';
-  import { GitCommitHorizontal } from 'lucide-svelte';
+
 
   const activeDoc = $derived(getActiveDoc());
   const significant = $derived(getSignificantVersions());
@@ -46,22 +46,19 @@
     {#if versionCount > 0}
       <span class="section-count">{versionCount}</span>
     {/if}
-    <div class="header-spacer"></div>
-    <button
-      class="blame-toggle"
-      class:active={uiState.blameVisible}
-      onclick={toggleBlame}
-      title="toggle author blame (⌘⇧B)"
-      type="button"
-    >
-      <GitCommitHorizontal size={13} strokeWidth={1.5} />
-      <span>blame</span>
-    </button>
   </div>
 
   <div class="section-body">
     {#if activeDoc}
-      {#if versionState.loading}
+      {#if !versionState.supported}
+        <p class="empty-text">
+          {#if versionState.availabilityReason === 'temporarily-unavailable'}
+            version history is temporarily unavailable while notes preserves an older history database
+          {:else}
+            restart the desktop app to reload the updated version-history backend
+          {/if}
+        </p>
+      {:else if versionState.loading}
         <p class="empty-text">loading versions...</p>
       {:else if versionState.error}
         <p class="empty-text">{versionState.error}</p>
@@ -113,6 +110,7 @@
     flex-direction: column;
     min-height: 0;
     flex: 1;
+
   }
 
   .section-header {
@@ -145,34 +143,6 @@
     padding: 0 5px;
     border-radius: 8px;
     line-height: 16px;
-  }
-
-  .header-spacer {
-    flex: 1;
-  }
-
-  .blame-toggle {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    font-size: 11px;
-    font-weight: 500;
-    color: var(--text-tertiary);
-    padding: 2px 8px;
-    border-radius: 6px;
-    transition: color var(--transition-fast), background var(--transition-fast);
-    cursor: pointer;
-    flex-shrink: 0;
-  }
-
-  .blame-toggle:hover {
-    color: var(--text-primary);
-    background: var(--surface-hover);
-  }
-
-  .blame-toggle.active {
-    color: var(--accent);
-    background: var(--surface-active);
   }
 
   .empty-text {

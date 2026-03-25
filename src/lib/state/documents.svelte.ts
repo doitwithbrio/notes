@@ -7,7 +7,57 @@ export const documentState = $state({
   activeDocId: null as string | null,
   docs: [] as Document[],
   loading: false,
+  loadingProjectIds: [] as string[],
+  hydratedProjectIds: [] as string[],
 });
+
+type ProjectLoadState = {
+  promise: Promise<void> | null;
+  reloadRequested: boolean;
+  connectPeersRequested: boolean;
+};
+
+const projectLoadStates = new Map<string, ProjectLoadState>();
+
+function getProjectLoadState(projectId: string): ProjectLoadState {
+  let state = projectLoadStates.get(projectId);
+  if (!state) {
+    state = {
+      promise: null,
+      reloadRequested: false,
+      connectPeersRequested: false,
+    };
+    projectLoadStates.set(projectId, state);
+  }
+  return state;
+}
+
+function setProjectLoading(projectId: string, loading: boolean) {
+  if (loading) {
+    if (!documentState.loadingProjectIds.includes(projectId)) {
+      documentState.loadingProjectIds = [...documentState.loadingProjectIds, projectId];
+    }
+    return;
+  }
+
+  if (documentState.loadingProjectIds.includes(projectId)) {
+    documentState.loadingProjectIds = documentState.loadingProjectIds.filter((id) => id !== projectId);
+  }
+}
+
+function markProjectHydrated(projectId: string) {
+  if (!documentState.hydratedProjectIds.includes(projectId)) {
+    documentState.hydratedProjectIds = [...documentState.hydratedProjectIds, projectId];
+  }
+}
+
+export function isProjectLoading(projectId: string) {
+  return documentState.loadingProjectIds.includes(projectId);
+}
+
+export function hasHydratedProject(projectId: string) {
+  return documentState.hydratedProjectIds.includes(projectId);
+}
 
 function titleFromPath(path: string) {
   const leaf = path.split('/').pop() ?? path;
@@ -35,6 +85,18 @@ function mapDoc(projectId: string, doc: BackendDocInfo, unseenMap: Map<string, B
   };
 }
 
+async function fetchProjectDocs(projectId: string): Promise<Document[]> {
+  const [docs, unseenDocs] = await Promise.all([
+    tauriApi.listFiles(projectId),
+    tauriApi.getUnseenDocs(projectId),
+  ]);
+  const unseenMap = new Map(unseenDocs.map((entry) => [entry.docId, entry]));
+  return applyDocOrder(
+    projectId,
+    docs.map((doc) => mapDoc(projectId, doc, unseenMap)),
+  );
+}
+
 export function getActiveDoc(): Document | null {
   return documentState.docs.find((doc) => doc.id === documentState.activeDocId) ?? null;
 }
@@ -49,34 +111,68 @@ export function setActiveDoc(docId: string | null) {
   if (!docId) return;
   const doc = getDocById(docId);
   if (!doc) return;
-  // Don't overwrite history-review mode — only switch to editor from other views
-  if (uiState.view !== 'history-review') {
-    uiState.view = 'editor';
-  }
+  uiState.view = 'editor';
   uiState.activeProjectId = doc.projectId;
 }
 
-export async function loadProjectDocs(projectId: string) {
-  const [docs, unseenDocs] = await Promise.all([
-    tauriApi.listFiles(projectId),
-    tauriApi.getUnseenDocs(projectId),
-  ]);
-  const unseenMap = new Map(unseenDocs.map((entry) => [entry.docId, entry]));
-  const nextDocs = docs.map((doc) => mapDoc(projectId, doc, unseenMap));
-  const orderedDocs = applyDocOrder(projectId, nextDocs);
-  documentState.docs = [
-    ...documentState.docs.filter((doc) => doc.projectId !== projectId),
-    ...orderedDocs,
-  ];
+export async function loadProjectDocs(
+  projectId: string,
+  options?: { force?: boolean; connectPeers?: boolean },
+) {
+  if (!options?.force && !options?.connectPeers && hasHydratedProject(projectId)) {
+    return;
+  }
+
+  const loadState = getProjectLoadState(projectId);
+  loadState.reloadRequested = loadState.reloadRequested || !!options?.force || !hasHydratedProject(projectId);
+  loadState.connectPeersRequested = loadState.connectPeersRequested || !!options?.connectPeers;
+
+  if (loadState.promise) {
+    return loadState.promise;
+  }
+
+  loadState.promise = (async () => {
+    setProjectLoading(projectId, true);
+    try {
+      do {
+        const shouldReload = loadState.reloadRequested;
+        const shouldConnectPeers = loadState.connectPeersRequested;
+        loadState.reloadRequested = false;
+        loadState.connectPeersRequested = false;
+
+        if (shouldReload) {
+          await tauriApi.openProject(projectId, shouldConnectPeers);
+          const orderedDocs = await fetchProjectDocs(projectId);
+          documentState.docs = [
+            ...documentState.docs.filter((doc) => doc.projectId !== projectId),
+            ...orderedDocs,
+          ];
+          markProjectHydrated(projectId);
+        } else if (shouldConnectPeers) {
+          await tauriApi.openProject(projectId, true);
+        }
+      } while (loadState.reloadRequested || loadState.connectPeersRequested);
+    } finally {
+      setProjectLoading(projectId, false);
+      loadState.promise = null;
+    }
+  })();
+
+  return loadState.promise;
 }
 
-export async function loadAllProjectDocs(projectIds: string[]) {
+export async function loadAllProjectDocs(projectIds: string[], concurrency = 2) {
   documentState.loading = true;
   try {
-    for (const projectId of projectIds) {
-      await tauriApi.openProject(projectId);
-      await loadProjectDocs(projectId);
-    }
+    const queue = [...projectIds];
+    const workers = Array.from({ length: Math.max(1, concurrency) }, async () => {
+      while (queue.length > 0) {
+        const projectId = queue.shift();
+        if (!projectId) continue;
+        await loadProjectDocs(projectId);
+      }
+    });
+    await Promise.all(workers);
   } finally {
     documentState.loading = false;
   }

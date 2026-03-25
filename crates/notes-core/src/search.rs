@@ -3,7 +3,9 @@
 //! Maintains a search index alongside the Automerge documents.
 //! The index is updated when documents are saved.
 
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection};
 use uuid::Uuid;
@@ -46,6 +48,35 @@ impl SearchIndex {
         .map_err(|e| CoreError::InvalidData(format!("failed to create FTS table: {e}")))?;
 
         Ok(Self { conn })
+    }
+
+    /// Open a search index, automatically rotating aside a legacy or corrupt
+    /// database if it cannot be read with the current encryption key.
+    ///
+    /// Search indexes are rebuildable caches, so recovering by recreating the
+    /// database is safe. The original files are preserved with a timestamped
+    /// `.broken-*` suffix for debugging.
+    pub fn open_with_recovery(
+        db_path: &Path,
+        encryption_key: Option<&[u8; 32]>,
+    ) -> Result<Self, CoreError> {
+        match Self::open(db_path, encryption_key) {
+            Ok(index) => Ok(index),
+            Err(err) if should_recover_from_open_error(&err) && db_path.exists() => {
+                log::warn!(
+                    "Search index at {} could not be opened ({}). Rotating it aside and rebuilding.",
+                    db_path.display(),
+                    err
+                );
+                rotate_search_db_family(db_path)?;
+                Self::open(db_path, encryption_key).map_err(|reopen_err| {
+                    CoreError::InvalidData(format!(
+                        "failed to recreate search db after recovery: {reopen_err}"
+                    ))
+                })
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Open an in-memory search index (for testing).
@@ -198,6 +229,67 @@ impl SearchIndex {
             .map_err(|e| CoreError::InvalidData(format!("count query failed: {e}")))?;
         Ok(count as usize)
     }
+}
+
+fn should_recover_from_open_error(err: &CoreError) -> bool {
+    match err {
+        CoreError::InvalidData(message) => {
+            let lower = message.to_ascii_lowercase();
+            lower.contains("not a database")
+                || lower.contains("file is encrypted")
+                || lower.contains("sqlcipher")
+                || lower.contains("database disk image is malformed")
+        }
+        _ => false,
+    }
+}
+
+fn rotate_search_db_family(db_path: &Path) -> Result<(), CoreError> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| CoreError::InvalidData(format!("system clock error: {e}")))?
+        .as_secs();
+
+    rotate_if_exists(db_path, timestamp)?;
+
+    let wal = sidecar_path(db_path, "-wal");
+    rotate_if_exists(&wal, timestamp)?;
+
+    let shm = sidecar_path(db_path, "-shm");
+    rotate_if_exists(&shm, timestamp)?;
+
+    Ok(())
+}
+
+fn rotate_if_exists(path: &Path, timestamp: u64) -> Result<(), CoreError> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let backup = broken_backup_path(path, timestamp);
+    fs::rename(path, &backup).map_err(CoreError::Io)?;
+    log::warn!(
+        "Moved broken search index file {} -> {}",
+        path.display(),
+        backup.display()
+    );
+    Ok(())
+}
+
+fn broken_backup_path(path: &Path, timestamp: u64) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "search.db".to_string());
+    path.with_file_name(format!("{file_name}.broken-{timestamp}"))
+}
+
+fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "search.db".to_string());
+    path.with_file_name(format!("{file_name}{suffix}"))
 }
 
 /// A search result with relevance-ranked snippet.

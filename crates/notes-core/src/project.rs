@@ -89,6 +89,11 @@ impl ProjectManager {
         }
     }
 
+    /// Get the project name for a document (if known).
+    pub fn get_project_for_doc(&self, doc_id: &DocId) -> Option<String> {
+        self.doc_projects.get(doc_id).map(|e| e.value().clone())
+    }
+
     /// Get the epoch key manager for a project (if loaded).
     pub fn get_epoch_keys(
         &self,
@@ -289,7 +294,7 @@ impl ProjectManager {
 
         // Open per-project search index
         let search_path = p2p_dir.join("search.db");
-        let search = SearchIndex::open(&search_path, key_ref)?;
+        let search = SearchIndex::open_with_recovery(&search_path, key_ref)?;
         self.project_search.insert(
             project_name.to_string(),
             Arc::new(std::sync::Mutex::new(search)),
@@ -421,9 +426,8 @@ impl ProjectManager {
         let mut summaries = Vec::new();
 
         for name in self.list_projects().await? {
-            self.open_project(&name).await?;
-            let manifest_arc = self.get_manifest(&name)?;
-            let manifest = manifest_arc.read().await;
+            let data = self.persistence.load_manifest(&name).await?;
+            let manifest = ProjectManifest::load(&data)?;
             let peers = manifest.list_peers()?;
             let owner = manifest.get_owner().unwrap_or_default();
             let shared = !owner.is_empty() || !peers.is_empty();
@@ -436,11 +440,7 @@ impl ProjectManager {
                     .unwrap_or(PeerRole::Viewer)
             };
 
-            let file_count = self
-                .list_files(&name)
-                .await
-                .map(|f| f.len())
-                .unwrap_or(0);
+            let file_count = manifest.list_files().map(|f| f.len()).unwrap_or(0);
 
             summaries.push(ProjectSummary {
                 name: name.clone(),
@@ -454,6 +454,173 @@ impl ProjectManager {
 
         summaries.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(summaries)
+    }
+
+    // ── Project management ───────────────────────────────────────────
+
+    /// Rename a project: renames the directory, updates the manifest, and re-keys all caches.
+    pub async fn rename_project(
+        &self,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<(), CoreError> {
+        validation::validate_project_name(old_name)?;
+        validation::validate_project_name(new_name)?;
+
+        if old_name == new_name {
+            return Ok(());
+        }
+
+        let old_dir = self.persistence.project_dir(old_name);
+        let new_dir = self.persistence.project_dir(new_name);
+
+        if !old_dir.exists() {
+            return Err(CoreError::ProjectNotFound(old_name.to_string()));
+        }
+        if new_dir.exists() {
+            return Err(CoreError::ProjectAlreadyExists(new_name.to_string()));
+        }
+
+        // Close all open docs for this project first
+        let doc_ids: Vec<DocId> = self
+            .doc_projects
+            .iter()
+            .filter(|e| e.value() == old_name)
+            .map(|e| *e.key())
+            .collect();
+
+        for doc_id in &doc_ids {
+            self.close_doc(old_name, doc_id).await?;
+        }
+
+        // Rename the filesystem directory
+        tokio::fs::rename(&old_dir, &new_dir).await?;
+
+        // Update the manifest name
+        if let Some(manifest_entry) = self.manifests.remove(old_name) {
+            let (_, manifest_arc) = manifest_entry;
+            {
+                let mut manifest = manifest_arc.write().await;
+                let _ = manifest.set_name(new_name);
+                let data = manifest.save();
+                self.persistence.save_manifest(new_name, &data).await?;
+            }
+            self.manifests
+                .insert(new_name.to_string(), manifest_arc);
+        }
+
+        // Re-key epoch keys
+        if let Some(entry) = self.epoch_keys.remove(old_name) {
+            self.epoch_keys.insert(new_name.to_string(), entry.1);
+        }
+
+        // Re-key project search indexes
+        if let Some(entry) = self.project_search.remove(old_name) {
+            self.project_search.insert(new_name.to_string(), entry.1);
+        }
+
+        // Update doc_projects mappings
+        for doc_id in &doc_ids {
+            self.doc_projects.insert(*doc_id, new_name.to_string());
+        }
+
+        // Update search index: collect data first (async), then lock and index (sync)
+        if let Some(ref search) = self.search_index {
+            let mut file_contents: Vec<(DocId, String, String)> = Vec::new();
+            if let Ok(manifest_arc) = self.get_manifest(new_name) {
+                let manifest = manifest_arc.read().await;
+                if let Ok(files) = manifest.list_files() {
+                    for file in files {
+                        let md_path = new_dir.join(&file.path);
+                        if let Ok(content) = tokio::fs::read_to_string(&md_path).await {
+                            file_contents.push((file.id, file.path.clone(), content));
+                        }
+                    }
+                }
+            }
+            // Now lock and index without holding across await
+            if let Ok(index) = search.lock() {
+                for (doc_id, path, content) in &file_contents {
+                    let _ = index.index_document(doc_id, new_name, path, content);
+                }
+            }
+        }
+
+        log::info!("Renamed project: {old_name} -> {new_name}");
+        Ok(())
+    }
+
+    /// Delete a project: removes all docs, the directory, and all associated state.
+    pub async fn delete_project(&self, name: &str) -> Result<(), CoreError> {
+        validation::validate_project_name(name)?;
+
+        let project_dir = self.persistence.project_dir(name);
+        if !project_dir.exists() {
+            return Err(CoreError::ProjectNotFound(name.to_string()));
+        }
+
+        // Close all open docs
+        let doc_ids: Vec<DocId> = self
+            .doc_projects
+            .iter()
+            .filter(|e| e.value() == name)
+            .map(|e| *e.key())
+            .collect();
+
+        for doc_id in &doc_ids {
+            // Cancel save loops and remove from memory
+            if let Some((_, token)) = self.save_tokens.remove(doc_id) {
+                token.cancel();
+            }
+            self.doc_store.remove_doc(doc_id);
+            self.doc_projects.remove(doc_id);
+        }
+
+        // Remove from manifests cache
+        self.manifests.remove(name);
+
+        // Remove epoch keys
+        self.epoch_keys.remove(name);
+
+        // Remove project search index
+        self.project_search.remove(name);
+
+        // Remove from global search index
+        if let Some(ref search) = self.search_index {
+            if let Ok(index) = search.lock() {
+                for doc_id in &doc_ids {
+                    let _ = index.remove_document(doc_id);
+                }
+            }
+        }
+
+        // Delete the entire project directory tree
+        if project_dir.exists() {
+            tokio::fs::remove_dir_all(&project_dir).await?;
+        }
+
+        log::info!("Deleted project: {name}");
+        Ok(())
+    }
+
+    /// Get a tree view of files in a project, grouped by subfolder.
+    pub async fn list_project_tree(
+        &self,
+        project_name: &str,
+    ) -> Result<std::collections::BTreeMap<String, Vec<DocInfo>>, CoreError> {
+        let files = self.list_files(project_name).await?;
+        let mut tree: std::collections::BTreeMap<String, Vec<DocInfo>> = std::collections::BTreeMap::new();
+
+        for file in files {
+            let folder = if let Some(pos) = file.path.rfind('/') {
+                file.path[..pos].to_string()
+            } else {
+                String::new() // Root level
+            };
+            tree.entry(folder).or_default().push(file);
+        }
+
+        Ok(tree)
     }
 
     // ── Document operations ──────────────────────────────────────────

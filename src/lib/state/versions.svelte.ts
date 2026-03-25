@@ -16,6 +16,8 @@ export const versionState = $state({
   loading: false,
   error: null as string | null,
   activeDocId: null as string | null,
+  supported: true,
+  availabilityReason: null as null | 'restart-required' | 'temporarily-unavailable',
 
   // Version review mode
   selectedVersionId: null as string | null,
@@ -32,6 +34,61 @@ export const versionState = $state({
   deviceActorId: '' as string,
 });
 
+const refreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
+let warnedUnsupportedVersionApi = false;
+
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return ((error as Record<string, unknown>)?.message as string | undefined) ?? String(error);
+}
+
+function isMissingVersionCommand(error: unknown): boolean {
+  const message = getErrorMessage(error);
+  return message.includes('Command get_device_actor_id not found')
+    || message.includes('Command get_doc_versions not found')
+    || message.includes('Command create_version not found')
+    || message.includes('Command get_version_text not found')
+    || message.includes('Command restore_to_version_cmd not found');
+}
+
+function isTemporarilyUnavailable(error: unknown): boolean {
+  return getErrorMessage(error).includes('version history is temporarily unavailable');
+}
+
+function disableVersionFeatures(
+  message: string,
+  reason?: unknown,
+  availabilityReason: 'restart-required' | 'temporarily-unavailable' = 'temporarily-unavailable',
+) {
+  versionState.supported = false;
+  versionState.availabilityReason = availabilityReason;
+  versionState.loading = false;
+  versionState.error = message;
+  versionState.versions = [];
+  versionState.savePromptVisible = false;
+  versionState.previewLoading = false;
+  versionState.previewError = message;
+  versionState.previewText = null;
+  if (reason) {
+    console.warn(message, getErrorMessage(reason));
+  }
+}
+
+function disableVersionApi(reason: unknown) {
+  disableVersionFeatures(
+    'Version history requires a desktop app restart so the Rust backend can pick up the new commands.',
+    reason,
+    'restart-required',
+  );
+  if (!warnedUnsupportedVersionApi) {
+    warnedUnsupportedVersionApi = true;
+    console.warn(
+      'Version history API unavailable in current backend build. Fully restart the desktop app after rebuilding the Tauri backend:',
+      getErrorMessage(reason),
+    );
+  }
+}
+
 /** Get only significant versions (skip trivial ones). */
 export function getSignificantVersions(): BackendVersion[] {
   return versionState.versions.filter(
@@ -46,32 +103,81 @@ export function getNamedVersions(): BackendVersion[] {
 
 /** Load the device actor ID on startup. */
 export async function loadDeviceActorId() {
+  if (!versionState.supported) return;
   try {
     versionState.deviceActorId = await tauriApi.getDeviceActorId();
   } catch (error) {
-    if (!(error instanceof TauriRuntimeUnavailableError)) {
-      console.warn('Failed to load device actor ID:', error);
+    if (error instanceof TauriRuntimeUnavailableError) return;
+    if (isMissingVersionCommand(error)) {
+      disableVersionApi(error);
+      return;
     }
+    if (isTemporarilyUnavailable(error)) {
+      disableVersionFeatures(
+        'Version history is temporarily unavailable while notes preserves an older history database.',
+        error,
+        'temporarily-unavailable',
+      );
+      return;
+    }
+    console.warn('Failed to load device actor ID:', error);
   }
 }
 
 /** Load all versions for a document. */
 export async function loadVersions(docId: string) {
+  if (!versionState.supported) return;
   versionState.loading = true;
   versionState.error = null;
   versionState.activeDocId = docId;
   try {
-    versionState.versions = await tauriApi.getDocVersions(docId);
+    const versions = await tauriApi.getDocVersions(docId);
+    if (versionState.activeDocId === docId) {
+      versionState.versions = versions;
+    }
   } catch (error) {
     if (error instanceof TauriRuntimeUnavailableError) return;
-    versionState.error =
-      error instanceof Error
-        ? error.message
-        : (error as Record<string, unknown>)?.message as string ?? 'Failed to load versions';
-    versionState.versions = [];
+    if (isMissingVersionCommand(error)) {
+      disableVersionApi(error);
+      return;
+    }
+    if (isTemporarilyUnavailable(error)) {
+      disableVersionFeatures(
+        'Version history is temporarily unavailable while notes preserves an older history database.',
+        error,
+        'temporarily-unavailable',
+      );
+      return;
+    }
+    if (versionState.activeDocId === docId) {
+      versionState.error =
+        getErrorMessage(error) || 'Failed to load versions';
+      versionState.versions = [];
+    }
   } finally {
-    versionState.loading = false;
+    if (versionState.activeDocId === docId) {
+      versionState.loading = false;
+    }
   }
+}
+
+export function scheduleVersionRefresh(docId: string, delayMs = 300) {
+  if (!versionState.supported) return;
+  const existing = refreshTimers.get(docId);
+  if (existing) {
+    clearTimeout(existing);
+  }
+
+  refreshTimers.set(
+    docId,
+    setTimeout(() => {
+      refreshTimers.delete(docId);
+      if (versionState.activeDocId && versionState.activeDocId !== docId) {
+        return;
+      }
+      void loadVersions(docId);
+    }, delayMs),
+  );
 }
 
 /** Create a new version (auto or named). */
@@ -80,16 +186,30 @@ export async function createVersion(
   docId: string,
   label?: string,
 ): Promise<BackendVersion | null> {
+  if (!versionState.supported) return null;
   try {
     const version = await tauriApi.createVersion(project, docId, label);
     // Reload versions to get the updated list
-    await loadVersions(docId);
+    scheduleVersionRefresh(docId, 0);
     return version;
   } catch (error) {
     if (error instanceof TauriRuntimeUnavailableError) return null;
+    if (isMissingVersionCommand(error)) {
+      disableVersionApi(error);
+      return null;
+    }
+    if (isTemporarilyUnavailable(error)) {
+      disableVersionFeatures(
+        'Version history is temporarily unavailable while notes preserves an older history database.',
+        error,
+        'temporarily-unavailable',
+      );
+      return null;
+    }
     // "no significant changes" is expected for auto-versions — don't log as error
-    const msg = error instanceof Error ? error.message : String(error);
+    const msg = getErrorMessage(error);
     if (msg.includes('no significant changes')) return null;
+    versionState.error = msg || 'Failed to create version';
     console.warn('Failed to create version:', error);
     return null;
   }
@@ -101,6 +221,7 @@ export async function selectVersion(
   docId: string,
   versionId: string,
 ) {
+  if (!versionState.supported) return;
   versionState.selectedVersionId = versionId;
   versionState.previewLoading = true;
   versionState.previewError = null;
@@ -121,10 +242,20 @@ export async function selectVersion(
       versionState.previewText = '';
       return;
     }
+    if (isMissingVersionCommand(error)) {
+      disableVersionApi(error);
+      return;
+    }
+    if (isTemporarilyUnavailable(error)) {
+      disableVersionFeatures(
+        'Version history is temporarily unavailable while notes preserves an older history database.',
+        error,
+        'temporarily-unavailable',
+      );
+      return;
+    }
     versionState.previewError =
-      error instanceof Error
-        ? error.message
-        : (error as Record<string, unknown>)?.message as string ?? 'Failed to load version';
+      getErrorMessage(error) || 'Failed to load version';
   } finally {
     versionState.previewLoading = false;
   }
@@ -159,9 +290,27 @@ export async function restoreVersion(
   docId: string,
   versionId: string,
 ) {
-  await tauriApi.restoreToVersion(project, docId, versionId);
-  exitVersionReview();
-  await loadVersions(docId);
+  if (!versionState.supported) return;
+  try {
+    await tauriApi.restoreToVersion(project, docId, versionId);
+    exitVersionReview();
+    await loadVersions(docId);
+  } catch (error) {
+    if (error instanceof TauriRuntimeUnavailableError) return;
+    if (isMissingVersionCommand(error)) {
+      disableVersionApi(error);
+      return;
+    }
+    if (isTemporarilyUnavailable(error)) {
+      disableVersionFeatures(
+        'Version history is temporarily unavailable while notes preserves an older history database.',
+        error,
+        'temporarily-unavailable',
+      );
+      return;
+    }
+    throw error;
+  }
 }
 
 /** Exit version review mode. */
@@ -175,6 +324,7 @@ export function exitVersionReview() {
 
 /** Show the Cmd+S save version prompt. */
 export function showSavePrompt() {
+  if (!versionState.supported) return;
   versionState.savePromptVisible = true;
 }
 
@@ -185,9 +335,14 @@ export function hideSavePrompt() {
 
 /** Clear all version state (e.g., when switching projects). */
 export function clearVersions() {
+  for (const timer of refreshTimers.values()) {
+    clearTimeout(timer);
+  }
+  refreshTimers.clear();
   versionState.versions = [];
   versionState.activeDocId = null;
   versionState.error = null;
+  versionState.availabilityReason = null;
   versionState.savePromptVisible = false;
   exitVersionReview();
 }

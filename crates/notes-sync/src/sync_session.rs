@@ -57,6 +57,8 @@ pub struct SyncSession {
     /// Known Automerge actor hex IDs that are authorized for this document.
     /// Used for actor-ID-based verification of incoming changes.
     known_actor_ids: HashSet<String>,
+    /// Shared reference to the signature store for Ed25519 verification.
+    signatures: Option<Arc<dashmap::DashMap<([u8; 32], String), crate::protocol::ChangeSignature>>>,
     /// The remote peer's iroh identity (for logging).
     remote_peer: Option<iroh::EndpointId>,
 }
@@ -68,6 +70,7 @@ impl SyncSession {
             sync_state: SyncState::new(),
             allowed_peers: None,
             known_actor_ids: HashSet::new(),
+            signatures: None,
             remote_peer: None,
         }
     }
@@ -79,6 +82,7 @@ impl SyncSession {
             sync_state: state.unwrap_or_else(SyncState::new),
             allowed_peers: None,
             known_actor_ids: HashSet::new(),
+            signatures: None,
             remote_peer: None,
         }
     }
@@ -94,6 +98,15 @@ impl SyncSession {
     /// These are the hex-encoded actor IDs of authorized peers.
     pub fn with_known_actors(mut self, actors: HashSet<String>) -> Self {
         self.known_actor_ids = actors;
+        self
+    }
+
+    /// Set the signature store for Ed25519 verification of incoming changes.
+    pub fn with_signatures(
+        mut self,
+        sigs: Arc<dashmap::DashMap<([u8; 32], String), crate::protocol::ChangeSignature>>,
+    ) -> Self {
+        self.signatures = Some(sigs);
         self
     }
 
@@ -297,6 +310,46 @@ impl SyncSession {
                     return Err(SyncError::SignatureError(format!(
                         "change from unknown actor {}", &actor[..8.min(actor.len())]
                     )));
+                }
+
+                // If we have a signature store, try to verify the Ed25519 signature
+                if let Some(ref sig_store) = self.signatures {
+                    let hash_hex = hash.to_string();
+                    if let Some(sig_entry) = sig_store.get(&(self.doc_id, hash_hex.clone())) {
+                        let sig = sig_entry.value();
+                        // Verify the signature using notes-crypto
+                        if let Some(signed) = notes_crypto::SignedChange::from_parts(
+                            &sig.author,
+                            change.raw_bytes(),
+                            &sig.signature,
+                        ) {
+                            match signed.verify() {
+                                Ok(_) => {
+                                    log::debug!(
+                                        "Signature verified for change {} from {}",
+                                        &hash_hex[..8],
+                                        &sig.author[..8.min(sig.author.len())]
+                                    );
+                                }
+                                Err(e) => {
+                                    log::error!(
+                                        "INVALID signature for change {}: {e}",
+                                        &hash_hex[..8]
+                                    );
+                                    return Err(SyncError::SignatureError(format!(
+                                        "invalid signature for change {}",
+                                        &hash_hex[..8]
+                                    )));
+                                }
+                            }
+                        } else {
+                            log::warn!(
+                                "Malformed signature entry for change {}, accepting without verification",
+                                &hash_hex[..8]
+                            );
+                        }
+                    }
+                    // No signature found — accept (graceful degradation for pre-signing peers)
                 }
 
                 log::debug!(

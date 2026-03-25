@@ -8,6 +8,8 @@
   let {
     project,
     docs,
+    loading = false,
+    hydrated = false,
     collapsed: sidebarCollapsed = false,
     editing = false,
     editingDocId = null,
@@ -25,6 +27,8 @@
   }: {
     project: Project;
     docs: Document[];
+    loading?: boolean;
+    hydrated?: boolean;
     collapsed?: boolean;
     editing?: boolean;
     editingDocId?: string | null;
@@ -150,6 +154,11 @@
         enabled: !sidebarCollapsed && editMode && !!onreorderdocs,
       }}
     >
+      {#if loading && !sidebarCollapsed}
+        <p class="project-meta">loading notes...</p>
+      {:else if hydrated && docs.length === 0 && !sidebarCollapsed}
+        <p class="project-meta">no notes yet</p>
+      {/if}
       {#each docs as doc (doc.id)}
         <FileItem
           {doc}
@@ -271,6 +280,12 @@
   .file-list {
     display: flex;
     flex-direction: column;
+  }
+
+  .project-meta {
+    padding: 2px 10px 6px 14px;
+    font-size: 12px;
+    color: var(--text-tertiary);
   }
 
   /* Inline editing input */

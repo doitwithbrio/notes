@@ -38,13 +38,21 @@ export function createEditor(
   initialText: string,
   onTextChange: (text: string) => void,
 ): Editor {
-  return new Editor({
+  let pendingFrame: number | null = null;
+
+  const flushTextChange = (editor: Editor) => {
+    pendingFrame = null;
+    onTextChange(editorToPlainText(editor));
+  };
+
+  const editor = new Editor({
     element,
     extensions: [
       StarterKit.configure({
         codeBlock: false,
         dropcursor: false,
         gapcursor: false,
+        link: false,
         // Disable undo/redo — Automerge handles this
         undoRedo: false,
       }),
@@ -75,7 +83,7 @@ export function createEditor(
       }),
       Typography,
       Dropcursor.configure({
-        color: '#B68D5E',
+        color: 'var(--accent)',
         width: 2,
       }),
       Gapcursor,
@@ -86,8 +94,22 @@ export function createEditor(
         class: 'editor-content',
       },
     },
-    onUpdate: ({ editor }) => {
-      onTextChange(editorToPlainText(editor));
+    onUpdate: ({ editor, transaction }) => {
+      if (!transaction.docChanged) return;
+
+      if (pendingFrame !== null) {
+        cancelAnimationFrame(pendingFrame);
+      }
+
+      pendingFrame = requestAnimationFrame(() => flushTextChange(editor));
+    },
+    onDestroy: () => {
+      if (pendingFrame !== null) {
+        cancelAnimationFrame(pendingFrame);
+        flushTextChange(editor);
+      }
     },
   });
+
+  return editor;
 }

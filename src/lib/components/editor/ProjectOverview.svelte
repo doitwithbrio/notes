@@ -4,7 +4,8 @@
   import { todoState, addTodo, toggleTodo, removeTodo } from '../../state/todos.svelte.js';
   import { presenceState } from '../../state/presence.svelte.js';
   import { openEditorSession } from '../../session/editor-session.svelte.js';
-  import { FileText, X } from 'lucide-svelte';
+  import { openShareDialog } from '../../state/invite.svelte.js';
+  import { FileText, X, Share2 } from 'lucide-svelte';
 
   let { project }: { project: Project } = $props();
 
@@ -69,7 +70,15 @@
     <div class="overview-content">
       <!-- Project header -->
       <div class="project-header">
-        <h1 class="project-title">{project.name}</h1>
+        <div class="project-title-row">
+          <h1 class="project-title">{project.name}</h1>
+          {#if project.role === 'owner'}
+            <button class="share-btn" onclick={() => openShareDialog(project.id)}>
+              <Share2 size={13} strokeWidth={1.5} />
+              share
+            </button>
+          {/if}
+        </div>
         <p class="project-meta">{metaLine()}</p>
       </div>
 
@@ -231,6 +240,31 @@
 
   .project-header {
     margin-bottom: 40px;
+  }
+
+  .project-title-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .share-btn {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--accent);
+    padding: 5px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--border-subtle);
+    transition: background var(--transition-fast);
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+
+  .share-btn:hover {
+    background: var(--surface-hover);
   }
 
   .project-title {

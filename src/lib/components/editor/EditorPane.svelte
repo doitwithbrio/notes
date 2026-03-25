@@ -12,8 +12,7 @@
   import TimelineScrubber from './TimelineScrubber.svelte';
   import SaveVersionBar from './SaveVersionBar.svelte';
   import ChangeMinibar from './ChangeMinibar.svelte';
-  import BlameGutter from './BlameGutter.svelte';
-  import { blameState, loadBlame, clearBlame } from '../../state/blame.svelte.js';
+
 
   let editorElement = $state<HTMLDivElement | null>(null);
   let editor = $state<Editor | null>(null);
@@ -32,14 +31,17 @@
       : syncState.connection === 'slow'
         ? 'syncing'
         : syncState.connection === 'local'
-          ? ''
+          ? 'local'
           : 'offline',
   );
 
   // Compute diff blocks when in history review mode
+  // Use untrack on editorSessionState.text to avoid reactive feedback loops —
+  // the user can't type during history review, so the text is static.
   const diffBlocks = $derived.by(() => {
     if (isHistoryReview && versionState.previewText != null) {
-      return computeBlockDiff(versionState.previewText, editorSessionState.text);
+      const currentText = untrack(() => editorSessionState.text);
+      return computeBlockDiff(versionState.previewText, currentText);
     }
     return [];
   });
@@ -50,7 +52,7 @@
   );
 
   function syncEditorContent(text: string) {
-    if (!editor || isHistoryReview) return; // Don't sync live text while reviewing history
+    if (!editor || isHistoryReview) return; // Don't sync while reviewing history
     const current = editorToPlainText(editor);
     if (current === text) return;
 
@@ -66,7 +68,7 @@
     const initialText = untrack(() => editorSessionState.text);
     const ed = createEditor(el, initialText, (text) => {
       if (applyingRemoteText) return;
-      if (isHistoryReview) return; // Block edits in review mode
+      if (untrack(() => isHistoryReview)) return; // Block edits in review mode
       updateEditorText(text);
     });
     editor = ed;
@@ -79,21 +81,26 @@
 
   $effect(() => {
     editorSessionState.revision;
-    syncEditorContent(editorSessionState.text);
+    const text = editorSessionState.text;
+    untrack(() => syncEditorContent(text));
   });
 
-  // When entering/leaving history review mode, toggle editor editability
+  // When entering/leaving review mode, toggle editor editability
   $effect(() => {
-    if (editor) {
-      editor.setEditable(!isHistoryReview);
+    const reviewing = isHistoryReview;
+    const ed = untrack(() => editor);
+    if (ed) {
+      ed.setEditable(!reviewing);
     }
   });
 
   // When version preview text loads, show it in the editor
   $effect(() => {
-    if (isHistoryReview && versionState.previewText != null && editor) {
+    if (isHistoryReview && versionState.previewText != null) {
+      const ed = untrack(() => editor);
+      if (!ed) return;
       applyingRemoteText = true;
-      editor.commands.setContent(textToEditorHtml(versionState.previewText), { emitUpdate: false });
+      ed.commands.setContent(textToEditorHtml(versionState.previewText), { emitUpdate: false });
       applyingRemoteText = false;
     }
   });
@@ -116,24 +123,11 @@
   function handleGlobalKeydown(e: KeyboardEvent) {
     if ((e.metaKey || e.ctrlKey) && e.key === 's') {
       e.preventDefault();
-      if (!isHistoryReview && editorSessionState.projectId && editorSessionState.docId) {
+      if (!isHistoryReview && versionState.supported && editorSessionState.projectId && editorSessionState.docId) {
         showSavePrompt();
       }
     }
   }
-
-  // Fetch blame data when blame gutter is toggled on (or doc changes while active)
-  $effect(() => {
-    const visible = uiState.blameVisible;
-    const projectId = editorSessionState.projectId;
-    const docId = editorSessionState.docId;
-
-    if (visible && projectId && docId) {
-      void loadBlame(projectId, docId);
-    } else if (!visible) {
-      clearBlame();
-    }
-  });
 
   async function handleRestore() {
     // Reload the active session to reflect restored content
@@ -163,43 +157,57 @@
   <SaveVersionBar />
 
   {#if activeDoc}
-    <div class="editor-scroll" style="position: relative;">
+    <div class="editor-scroll">
       {#if isHistoryReview}
         <ChangeMinibar {diffBlocks} {totalLines} />
       {/if}
 
-      <div class="editor-content-wrap">
+      <!-- Diff overlay (covers editor during version review) -->
+      {#if isHistoryReview && diffBlocks.length > 0}
+        <div class="diff-overlay">
+          <div class="editor-content-wrap">
+            <h1 class="doc-title">{activeDoc.title}</h1>
+            <div class="diff-view">
+              {#each diffBlocks as block}
+                <div class="diff-block diff-{block.type}">
+                  {@html textToEditorHtml(block.content)}
+                </div>
+              {/each}
+            </div>
+          </div>
+        </div>
+      {:else if isHistoryReview && !versionState.previewLoading && !versionState.previewError && versionState.previewText != null}
+        <div class="diff-overlay">
+          <div class="editor-content-wrap">
+            <h1 class="doc-title">{activeDoc.title}</h1>
+            <div class="diff-identical">
+              <p>this version is identical to the current document</p>
+            </div>
+          </div>
+        </div>
+      {:else if isHistoryReview && versionState.previewLoading}
+        <div class="diff-overlay">
+          <div class="editor-content-wrap">
+            <h1 class="doc-title">{activeDoc.title}</h1>
+            <p class="history-loading">loading version...</p>
+          </div>
+        </div>
+      {:else if isHistoryReview && versionState.previewError}
+        <div class="diff-overlay">
+          <div class="editor-content-wrap">
+            <h1 class="doc-title">{activeDoc.title}</h1>
+            <p class="editor-error">{versionState.previewError}</p>
+          </div>
+        </div>
+      {/if}
+
+      <!-- Editor (always mounted, never moves) -->
+      <div class="editor-content-wrap" class:editor-hidden={isHistoryReview}>
         <h1 class="doc-title">{activeDoc.title}</h1>
         {#if editorSessionState.lastError && !isHistoryReview}
           <p class="editor-error">{editorSessionState.lastError}</p>
         {/if}
-        {#if isHistoryReview && versionState.previewLoading}
-          <p class="history-loading">loading version...</p>
-        {:else if isHistoryReview && versionState.previewError}
-          <p class="editor-error">{versionState.previewError}</p>
-        {/if}
-
-        {#if isHistoryReview && diffBlocks.length > 0}
-          <div class="diff-view">
-            {#each diffBlocks as block}
-              <div class="diff-block diff-{block.type}">
-                {@html textToEditorHtml(block.content)}
-              </div>
-            {/each}
-          </div>
-        {:else if isHistoryReview && !versionState.previewLoading && !versionState.previewError && versionState.previewText != null}
-          <div class="diff-identical">
-            <p>this version is identical to the current document</p>
-          </div>
-          <div class="editor-mount" bind:this={editorElement}></div>
-        {:else}
-          <div class="editor-body" class:blame-active={uiState.blameVisible && !isHistoryReview}>
-            {#if uiState.blameVisible && !isHistoryReview && blameState.data}
-              <BlameGutter {editor} blame={blameState.data} />
-            {/if}
-            <div class="editor-mount" bind:this={editorElement}></div>
-          </div>
-        {/if}
+        <div class="editor-mount" bind:this={editorElement}></div>
       </div>
     </div>
 
@@ -209,9 +217,7 @@
       {:else}
         <span class="md-hints">**bold  _italic_  # heading  - list  [] task  > quote  `code`</span>
       {/if}
-      {#if syncState.connection !== 'local'}
-        <span class="connection-status" class:connected={syncState.connection === 'connected'} class:slow={syncState.connection === 'slow'} class:offline={syncState.connection === 'offline'}>{connectionLabel}</span>
-      {/if}
+      <span class="connection-status" class:connected={syncState.connection === 'connected'} class:slow={syncState.connection === 'slow'} class:offline={syncState.connection === 'offline'} class:local={syncState.connection === 'local'}>{connectionLabel}</span>
     </div>
   {:else}
     <div class="empty-state">
@@ -277,6 +283,7 @@
     flex: 1;
     overflow-y: auto;
     padding: 0 48px 100px;
+    position: relative;
   }
 
   .editor-content-wrap {
@@ -285,18 +292,21 @@
     min-height: 100%;
   }
 
-  .editor-content-wrap:has(.blame-active) {
-    max-width: 820px;
+  .editor-content-wrap.editor-hidden {
+    visibility: hidden;
+    pointer-events: none;
   }
 
-  .editor-body {
-    display: flex;
-    gap: 0;
-  }
-
-  .editor-body .editor-mount {
-    flex: 1;
-    min-width: 0;
+  .diff-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 2;
+    background: var(--surface);
+    overflow-y: auto;
+    padding: 0 48px 100px;
   }
 
   .doc-title {
@@ -311,7 +321,7 @@
 
   .editor-error {
     margin-bottom: 12px;
-    color: #a04130;
+    color: var(--danger-fg);
     font-size: 13px;
   }
 
@@ -379,21 +389,21 @@
   .diff-unchanged { opacity: 1; }
 
   .diff-added {
-    background: rgba(106, 170, 138, 0.10);
-    border-left-color: #6BAA8A;
+    background: var(--diff-added-bg);
+    border-left-color: var(--diff-added);
   }
 
   .diff-removed {
-    background: rgba(196, 131, 106, 0.08);
-    border-left-color: #C4836A;
+    background: var(--diff-removed-bg);
+    border-left-color: var(--diff-removed);
     text-decoration: line-through;
-    text-decoration-color: rgba(196, 131, 106, 0.4);
-    color: rgba(0, 0, 0, 0.35);
+    text-decoration-color: var(--diff-removed-decoration);
+    color: var(--diff-removed-text);
   }
 
   .diff-changed {
-    background: rgba(196, 166, 78, 0.10);
-    border-left-color: #C4A64E;
+    background: var(--diff-changed-bg);
+    border-left-color: var(--diff-changed);
   }
 
   .diff-identical {
@@ -401,7 +411,7 @@
     text-align: center;
     font-size: 13px;
     font-style: italic;
-    color: rgba(0, 0, 0, 0.30);
+    color: var(--diff-neutral-text);
   }
 
   /* ── Bottom Bar ── */
@@ -451,6 +461,10 @@
     color: var(--text-tertiary);
   }
 
+  .connection-status.local {
+    color: var(--text-tertiary);
+  }
+
   .empty-state {
     flex: 1;
     display: flex;
@@ -466,4 +480,5 @@
     font-size: 22px;
     font-weight: 600;
   }
+
 </style>

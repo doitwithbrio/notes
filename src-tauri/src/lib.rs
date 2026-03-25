@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use automerge::ReadDoc;
 use iroh::endpoint::Endpoint;
 use iroh::protocol::Router;
 use notes_core::{
@@ -13,8 +12,9 @@ use notes_sync::peer_manager::PeerManager;
 use notes_sync::sync_engine::{SyncEngine, NOTES_SYNC_ALPN};
 use notes_sync::SyncStateStore;
 use serde::{Deserialize, Serialize};
-use tauri::ipc::{InvokeResponseBody, Response};
-use tauri::{Emitter, Manager, RunEvent, State};
+use tauri::ipc::{Channel, InvokeResponseBody, Response};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
+use tauri_plugin_updater::UpdaterExt;
 
 /// Shared app state accessible from all Tauri commands.
 struct AppState {
@@ -25,7 +25,8 @@ struct AppState {
     #[allow(dead_code)] // Used by sync sessions — wired via SyncEngine in Phase 2+
     sync_state_store: Arc<SyncStateStore>,
     search_index: Arc<std::sync::Mutex<notes_core::SearchIndex>>,
-    version_store: Arc<std::sync::Mutex<notes_core::VersionStore>>,
+    version_store: Option<Arc<std::sync::Mutex<notes_core::VersionStore>>>,
+    blob_store: Arc<notes_sync::blobs::BlobStore>,
     /// Stable device actor ID (hex string) for the frontend to use.
     device_actor_hex: String,
     /// Channel to trigger auto-sync when documents change.
@@ -33,6 +34,16 @@ struct AppState {
     endpoint: Endpoint,
     router: Router,
     app_handle: tauri::AppHandle,
+}
+
+fn require_version_store(
+    state: &AppState,
+) -> Result<Arc<std::sync::Mutex<notes_core::VersionStore>>, CoreError> {
+    state.version_store.as_ref().cloned().ok_or_else(|| {
+        CoreError::InvalidData(
+            "version history is temporarily unavailable; existing version data was preserved".into(),
+        )
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,7 +136,23 @@ async fn create_project(
     state: State<'_, AppState>,
     name: String,
 ) -> Result<(), CoreError> {
-    state.project_manager.create_project(&name).await
+    state.project_manager.create_project(&name).await?;
+
+    let my_peer_id = state.endpoint.id().to_string();
+    let manifest_arc = state.project_manager.get_manifest_for_ui(&name)?;
+    let manifest_data = {
+        let mut manifest = manifest_arc.write().await;
+        manifest.set_owner(&my_peer_id)?;
+        manifest.save()
+    };
+
+    state
+        .project_manager
+        .persistence()
+        .save_manifest(&name, &manifest_data)
+        .await?;
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -133,57 +160,23 @@ async fn list_project_summaries(
     state: State<'_, AppState>,
 ) -> Result<Vec<ProjectSummary>, CoreError> {
     let my_peer_id = state.endpoint.id().to_string();
-    let projects = state.project_manager.list_projects().await?;
-    let mut summaries = Vec::new();
-
-    for name in projects {
-        let _ = state.project_manager.open_project(&name).await;
-        let file_count = state
-            .project_manager
-            .list_files(&name)
-            .await
-            .map(|f| f.len())
-            .unwrap_or(0);
-
-        let peer_count = state.peer_manager.get_project_peers(&name).len();
-        let shared = peer_count > 0;
-
-        // Check ownership from manifest
-        let role = if let Ok(owner) = state.project_manager.get_project_owner(&name).await {
-            if owner == my_peer_id { PeerRole::Owner } else { PeerRole::Editor }
-        } else {
-            PeerRole::Owner // Local-only project, user is owner
-        };
-
-        let path = state
-            .project_manager
-            .persistence()
-            .project_dir(&name)
-            .to_string_lossy()
-            .to_string();
-
-        summaries.push(ProjectSummary {
-            name,
-            path,
-            shared,
-            role,
-            peer_count,
-            file_count,
-        });
-    }
-
-    Ok(summaries)
+    state.project_manager.list_project_summaries(&my_peer_id).await
 }
 
 #[tauri::command]
 async fn open_project(
     state: State<'_, AppState>,
     name: String,
+    connect_peers: Option<bool>,
 ) -> Result<(), CoreError> {
     // Load epoch keys FIRST so open_project_databases() can derive SQLCipher keys
     let _ = state.project_manager.load_epoch_keys(&name).await;
 
     state.project_manager.open_project(&name).await?;
+
+    if !connect_peers.unwrap_or(false) {
+        return Ok(());
+    }
 
     // Restore peers from manifest into PeerManager and connect immediately
     if let Ok(peers) = state.project_manager.get_project_peers(&name).await {
@@ -230,6 +223,274 @@ async fn open_project(
     }
 
     Ok(())
+}
+
+#[tauri::command]
+async fn rename_project(
+    state: State<'_, AppState>,
+    old_name: String,
+    new_name: String,
+) -> Result<(), CoreError> {
+    // Unregister all docs from sync engine
+    if let Ok(files) = state.project_manager.list_files(&old_name).await {
+        for file in &files {
+            state.sync_engine.unregister_doc(&file.id);
+        }
+    }
+    state
+        .project_manager
+        .rename_project(&old_name, &new_name)
+        .await
+}
+
+#[tauri::command]
+async fn delete_project(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<(), CoreError> {
+    // Unregister all docs from sync engine
+    if let Ok(files) = state.project_manager.list_files(&name).await {
+        for file in &files {
+            state.sync_engine.unregister_doc(&file.id);
+        }
+    }
+    // Remove all peers for this project from peer manager
+    let peers = state.peer_manager.get_project_peers(&name);
+    for peer_id in &peers {
+        state
+            .peer_manager
+            .remove_peer_from_project(&name, peer_id);
+    }
+    state.project_manager.delete_project(&name).await
+}
+
+#[tauri::command]
+async fn get_project_metadata(
+    state: State<'_, AppState>,
+    project: String,
+) -> Result<notes_core::ProjectMetadata, CoreError> {
+    state.project_manager.open_project(&project).await?;
+    let manifest_arc = state.project_manager.get_manifest_for_ui(&project)?;
+    let manifest = manifest_arc.read().await;
+
+    let files = state.project_manager.list_files(&project).await.unwrap_or_default();
+    let peers = state.project_manager.get_project_peers(&project).await.unwrap_or_default();
+
+    Ok(notes_core::ProjectMetadata {
+        name: manifest.name().unwrap_or_default(),
+        project_id: manifest.project_id().unwrap_or_default(),
+        emoji: manifest.emoji(),
+        description: manifest.description(),
+        color: manifest.color(),
+        archived: manifest.is_archived(),
+        created: manifest.created(),
+        owner: manifest.get_owner().ok(),
+        peer_count: peers.len(),
+        file_count: files.len(),
+    })
+}
+
+#[tauri::command]
+async fn update_project_metadata(
+    state: State<'_, AppState>,
+    project: String,
+    emoji: Option<String>,
+    description: Option<String>,
+    color: Option<String>,
+) -> Result<(), CoreError> {
+    let manifest_arc = state.project_manager.get_manifest_for_ui(&project)?;
+    let data = {
+        let mut manifest = manifest_arc.write().await;
+        if let Some(ref e) = emoji {
+            manifest.set_emoji(e)?;
+        }
+        if let Some(ref d) = description {
+            manifest.set_description(d)?;
+        }
+        if let Some(ref c) = color {
+            manifest.set_color(c)?;
+        }
+        manifest.save()
+    };
+    state
+        .project_manager
+        .persistence()
+        .save_manifest(&project, &data)
+        .await
+}
+
+#[tauri::command]
+async fn archive_project(
+    state: State<'_, AppState>,
+    project: String,
+    archived: bool,
+) -> Result<(), CoreError> {
+    let manifest_arc = state.project_manager.get_manifest_for_ui(&project)?;
+    let data = {
+        let mut manifest = manifest_arc.write().await;
+        manifest.set_archived(archived)?;
+        manifest.save()
+    };
+    state
+        .project_manager
+        .persistence()
+        .save_manifest(&project, &data)
+        .await
+}
+
+#[tauri::command]
+async fn list_project_tree(
+    state: State<'_, AppState>,
+    project: String,
+) -> Result<std::collections::BTreeMap<String, Vec<DocInfo>>, CoreError> {
+    state.project_manager.list_project_tree(&project).await
+}
+
+// ── Todo Commands ────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn add_project_todo(
+    state: State<'_, AppState>,
+    project: String,
+    text: String,
+    linked_doc_id: Option<String>,
+) -> Result<String, CoreError> {
+    check_role(&state, &project, MinRole::Editor).await?;
+    let my_peer_id = state.endpoint.id().to_string();
+    let manifest_arc = state.project_manager.get_manifest_for_ui(&project)?;
+    let (todo_id, data) = {
+        let mut manifest = manifest_arc.write().await;
+        let id = manifest.add_todo(&text, &my_peer_id, linked_doc_id.as_deref())?;
+        let data = manifest.save();
+        (id, data)
+    };
+    state
+        .project_manager
+        .persistence()
+        .save_manifest(&project, &data)
+        .await?;
+    Ok(todo_id.to_string())
+}
+
+#[tauri::command]
+async fn toggle_project_todo(
+    state: State<'_, AppState>,
+    project: String,
+    todo_id: String,
+) -> Result<bool, CoreError> {
+    check_role(&state, &project, MinRole::Editor).await?;
+    let manifest_arc = state.project_manager.get_manifest_for_ui(&project)?;
+    let (new_done, data) = {
+        let mut manifest = manifest_arc.write().await;
+        let done = manifest.toggle_todo(&todo_id)?;
+        let data = manifest.save();
+        (done, data)
+    };
+    state
+        .project_manager
+        .persistence()
+        .save_manifest(&project, &data)
+        .await?;
+    Ok(new_done)
+}
+
+#[tauri::command]
+async fn remove_project_todo(
+    state: State<'_, AppState>,
+    project: String,
+    todo_id: String,
+) -> Result<(), CoreError> {
+    let manifest_arc = state.project_manager.get_manifest_for_ui(&project)?;
+    let data = {
+        let mut manifest = manifest_arc.write().await;
+        manifest.remove_todo(&todo_id)?;
+        manifest.save()
+    };
+    state
+        .project_manager
+        .persistence()
+        .save_manifest(&project, &data)
+        .await
+}
+
+#[tauri::command]
+async fn update_project_todo(
+    state: State<'_, AppState>,
+    project: String,
+    todo_id: String,
+    text: String,
+) -> Result<(), CoreError> {
+    let manifest_arc = state.project_manager.get_manifest_for_ui(&project)?;
+    let data = {
+        let mut manifest = manifest_arc.write().await;
+        manifest.update_todo_text(&todo_id, &text)?;
+        manifest.save()
+    };
+    state
+        .project_manager
+        .persistence()
+        .save_manifest(&project, &data)
+        .await
+}
+
+#[tauri::command]
+async fn list_project_todos(
+    state: State<'_, AppState>,
+    project: String,
+) -> Result<Vec<notes_core::TodoItem>, CoreError> {
+    let manifest_arc = state.project_manager.get_manifest_for_ui(&project)?;
+    let manifest = manifest_arc.read().await;
+    manifest.list_todos()
+}
+
+// ── Image Commands ───────────────────────────────────────────────────
+
+/// Import an image into the blob store. Returns the blob metadata (hash, size, mime).
+/// The frontend should use the hash to construct the image URL for TipTap.
+#[tauri::command]
+async fn import_image(
+    state: State<'_, AppState>,
+    project: String,
+    data: Vec<u8>,
+    filename: String,
+) -> Result<notes_sync::blobs::BlobMeta, CoreError> {
+    notes_core::validate_project_name(&project)?;
+    check_role(&state, &project, MinRole::Editor).await?;
+    let assets_dir = state
+        .project_manager
+        .persistence()
+        .project_dir(&project)
+        .join("assets");
+
+    state
+        .blob_store
+        .import(&data, Some(&assets_dir), Some(&filename))
+        .await
+        .map_err(|e| CoreError::InvalidData(format!("image import failed: {e}")))
+}
+
+/// Get the raw bytes of a blob by its hash.
+/// Used by the frontend to display images via object URLs.
+#[tauri::command]
+async fn get_image(
+    state: State<'_, AppState>,
+    hash: String,
+) -> Result<Response, CoreError> {
+    let data = state
+        .blob_store
+        .read(&hash)
+        .await
+        .map_err(|e| CoreError::InvalidData(format!("image read failed: {e}")))?;
+    Ok(Response::new(InvokeResponseBody::Raw(data)))
+}
+
+/// Check if a blob exists locally.
+#[tauri::command]
+async fn has_image(
+    state: State<'_, AppState>,
+    hash: String,
+) -> Result<bool, CoreError> {
+    Ok(state.blob_store.has(&hash).await)
 }
 
 // ── Document Commands ────────────────────────────────────────────────
@@ -357,46 +618,35 @@ async fn apply_changes(
 ) -> Result<(), CoreError> {
     notes_core::validate_project_name(&project)?;
     check_role(&state, &project, MinRole::Editor).await?;
-    // Capture heads before applying so we can sign new changes
-    let heads_before = {
-        let doc_arc = state.project_manager.doc_store().get_doc(&doc_id)?;
-        let mut doc = doc_arc.write().await;
-        doc.get_heads().to_vec()
-    };
-
-    state
+    let applied = state
         .project_manager
-        .apply_changes(&project, &doc_id, &data)
+        .doc_store()
+        .apply_incremental_and_collect(&doc_id, &data)
         .await?;
 
     // Sign locally-created changes with the device's Ed25519 key.
     // These signatures are stored in the SyncEngine and transmitted
     // as sidecar SignatureBatch messages during sync.
     {
-        let doc_arc = state.project_manager.doc_store().get_doc(&doc_id)?;
-        let mut doc = doc_arc.write().await;
         let secret_key = state.endpoint.secret_key();
-        let new_changes = doc.get_changes(&heads_before);
-        for change in &new_changes {
-            let hash = change.hash();
-            let raw_bytes = change.raw_bytes();
+        for (hash, raw_bytes) in &applied.new_changes {
             let signed = notes_crypto::SignedChange::sign(&secret_key, raw_bytes);
             let sig = notes_sync::protocol::ChangeSignature {
-                change_hash: hash.to_string(),
+                change_hash: hash.clone(),
                 author: signed.author,
                 signature: signed.signature,
             };
             state
                 .sync_engine
-                .store_signature(doc_id, hash.to_string(), sig);
+                .store_signature(doc_id, hash.clone(), sig);
         }
-
-        // Mark doc as seen after local edits
-        let project_dir = state.project_manager.persistence().project_dir(&project);
-        let mut seen_state = notes_core::SeenStateManager::load(&project_dir).await?;
-        seen_state.mark_seen(&doc_id, &mut doc);
-        notes_core::SeenStateManager::save(&project_dir, &seen_state).await?;
     }
+
+    // Mark doc as seen after local edits, but keep disk I/O outside the doc lock.
+    let project_dir = state.project_manager.persistence().project_dir(&project);
+    let mut seen_state = notes_core::SeenStateManager::load(&project_dir).await?;
+    seen_state.mark_seen_heads(&doc_id, applied.current_heads);
+    notes_core::SeenStateManager::save(&project_dir, &seen_state).await?;
 
     // Trigger auto-sync with peers (debounced by the receiver)
     let _ = state.sync_trigger.send((project.clone(), doc_id)).await;
@@ -425,8 +675,9 @@ async fn compact_doc(
         .project_manager
         .compact_doc(&project, &doc_id)
         .await?;
-    // Invalidate persisted sync states for this doc (compaction changes internal state)
+    // Invalidate persisted sync states and signatures for this doc (compaction changes internal state)
     state.sync_state_store.delete_all_for_doc(&doc_id).await;
+    state.sync_engine.evict_signatures(doc_id);
     Ok(())
 }
 
@@ -505,16 +756,22 @@ async fn mark_doc_seen(
 ) -> Result<(), CoreError> {
     state.project_manager.open_doc(&project, &doc_id).await?;
 
-    let doc_arc = state.project_manager.doc_store().get_doc(&doc_id)?;
-    let mut doc = doc_arc.write().await;
-
     let project_dir = state
         .project_manager
         .persistence()
         .project_dir(&project);
 
+    let current_heads = {
+        let doc_arc = state.project_manager.doc_store().get_doc(&doc_id)?;
+        let mut doc = doc_arc.write().await;
+        doc.get_heads()
+            .iter()
+            .map(|head| head.to_string())
+            .collect::<Vec<_>>()
+    };
+
     let mut seen_state = notes_core::SeenStateManager::load(&project_dir).await?;
-    seen_state.mark_seen(&doc_id, &mut doc);
+    seen_state.mark_seen_heads(&doc_id, current_heads);
     notes_core::SeenStateManager::save(&project_dir, &seen_state).await?;
 
     Ok(())
@@ -578,8 +835,8 @@ async fn get_doc_versions(
     state: State<'_, AppState>,
     doc_id: DocId,
 ) -> Result<Vec<notes_core::Version>, CoreError> {
-    let store = state
-        .version_store
+    let store = require_version_store(&state)?;
+    let store = store
         .lock()
         .map_err(|_| CoreError::InvalidData("version store lock poisoned".into()))?;
     store.get_versions(&doc_id)
@@ -602,15 +859,20 @@ async fn create_version(
     let heads_strings = notes_core::version::heads_to_strings(&current_heads);
 
     // Get the previous version's heads for significance scoring
-    let store = state
-        .version_store
-        .lock()
-        .map_err(|_| CoreError::InvalidData("version store lock poisoned".into()))?;
+    let (prev_heads, used_names, seq) = {
+        let store = require_version_store(&state)?;
+        let store = store
+            .lock()
+            .map_err(|_| CoreError::InvalidData("version store lock poisoned".into()))?;
 
-    let prev_heads = store
-        .get_latest_version(&doc_id)?
-        .map(|v| notes_core::version::strings_to_heads(&v.heads))
-        .unwrap_or_default();
+        let prev_heads = store
+            .get_latest_version(&doc_id)?
+            .map(|v| notes_core::version::strings_to_heads(&v.heads))
+            .unwrap_or_default();
+        let used_names = store.get_used_names(&doc_id)?;
+        let seq = store.next_seq(&doc_id)?;
+        (prev_heads, used_names, seq)
+    };
 
     let is_named = label.is_some();
 
@@ -630,10 +892,8 @@ async fn create_version(
 
     // Generate unique creature name
     let version_id = uuid::Uuid::new_v4().to_string();
-    let used_names = store.get_used_names(&doc_id)?;
     let name = notes_core::version::unique_creature_name(&version_id, &used_names);
 
-    let seq = store.next_seq(&doc_id)?;
     let actor = state.device_actor_hex.clone();
 
     let version = notes_core::Version {
@@ -658,13 +918,37 @@ async fn create_version(
         seq,
     };
 
-    // Save an Automerge snapshot for rich text restore
-    let snapshot = {
+    // Save an Automerge snapshot for rich text restore (encrypted when epoch keys available)
+    let snapshot_raw = {
         let mut snapshot_doc = doc.clone();
         snapshot_doc.save()
     };
 
-    store.store_version(&version, Some(&snapshot))?;
+    let snapshot_to_store = if let Ok(epoch_mgr_arc) = state.project_manager.get_epoch_keys(&project) {
+        let mgr = epoch_mgr_arc.read().await;
+        if let Ok(key) = mgr.current_key() {
+            let doc_id_bytes = *doc_id.as_bytes();
+            match notes_crypto::encrypt_snapshot(key.as_bytes(), &doc_id_bytes, mgr.current_epoch(), &snapshot_raw) {
+                Ok(encrypted) => encrypted,
+                Err(e) => {
+                    log::warn!("Snapshot encryption failed, storing plaintext: {e}");
+                    snapshot_raw
+                }
+            }
+        } else {
+            snapshot_raw
+        }
+    } else {
+        snapshot_raw
+    };
+
+    {
+        let store = require_version_store(&state)?;
+        let store = store
+            .lock()
+            .map_err(|_| CoreError::InvalidData("version store lock poisoned".into()))?;
+        store.store_version(&version, Some(&snapshot_to_store))?;
+    }
 
     Ok(version)
 }
@@ -679,8 +963,8 @@ async fn get_version_text(
 ) -> Result<String, CoreError> {
     // Get version info and snapshot from store (short lock, no await)
     let (heads, snapshot_data) = {
-        let store = state
-            .version_store
+        let store = require_version_store(&state)?;
+        let store = store
             .lock()
             .map_err(|_| CoreError::InvalidData("version store lock poisoned".into()))?;
 
@@ -704,9 +988,25 @@ async fn get_version_text(
         }
     }
 
-    // Fall back to snapshot
+    // Fall back to snapshot (try decrypting if it's encrypted)
     if let Some(data) = snapshot_data {
-        if let Ok(snapshot_doc) = automerge::AutoCommit::load(&data) {
+        // Try to decrypt the snapshot if epoch keys are available
+        let snapshot_bytes = if let Ok(epoch_mgr_arc) = state.project_manager.get_epoch_keys(&project) {
+            let mgr = epoch_mgr_arc.read().await;
+            if let Ok(key) = mgr.current_key() {
+                let doc_id_bytes = *doc_id.as_bytes();
+                notes_crypto::decrypt_snapshot(key.as_bytes(), &doc_id_bytes, &data)
+                    .map(|(_, plaintext)| plaintext)
+                    .unwrap_or(data) // Fall back to raw (pre-encryption snapshot)
+            } else {
+                data
+            }
+        } else {
+            data
+        };
+
+        if let Ok(snapshot_doc) = automerge::AutoCommit::load(&snapshot_bytes) {
+            use automerge::ReadDoc as _;
             if let Some((automerge::Value::Object(automerge::ObjType::Text), text_id)) =
                 snapshot_doc.get(automerge::ROOT, "text")?
             {
@@ -729,8 +1029,8 @@ async fn restore_to_version_cmd(
     check_role(&state, &project, MinRole::Editor).await?;
 
     let (heads, snapshot_data) = {
-        let store = state
-            .version_store
+        let store = require_version_store(&state)?;
+        let store = store
             .lock()
             .map_err(|_| CoreError::InvalidData("version store lock poisoned".into()))?;
 
@@ -743,6 +1043,27 @@ async fn restore_to_version_cmd(
         (heads, snapshot_data)
     };
 
+    // Decrypt snapshot if encrypted
+    let decrypted_snapshot = if let Some(ref data) = snapshot_data {
+        if let Ok(epoch_mgr_arc) = state.project_manager.get_epoch_keys(&project) {
+            let mgr = epoch_mgr_arc.read().await;
+            if let Ok(key) = mgr.current_key() {
+                let doc_id_bytes = *doc_id.as_bytes();
+                Some(
+                    notes_crypto::decrypt_snapshot(key.as_bytes(), &doc_id_bytes, data)
+                        .map(|(_, plaintext)| plaintext)
+                        .unwrap_or_else(|_| data.clone()), // fallback to raw
+                )
+            } else {
+                snapshot_data.clone()
+            }
+        } else {
+            snapshot_data.clone()
+        }
+    } else {
+        None
+    };
+
     state.project_manager.open_doc(&project, &doc_id).await?;
     let doc_arc = state.project_manager.doc_store().get_doc(&doc_id)?;
     let mut doc = doc_arc.write().await;
@@ -750,13 +1071,23 @@ async fn restore_to_version_cmd(
     notes_core::version::restore_to_version(
         &mut doc,
         &heads,
-        snapshot_data.as_deref(),
+        decrypted_snapshot.as_deref(),
     )?;
+    drop(doc);
 
     // Mark seen so restore doesn't appear as "unseen changes"
     let project_dir = state.project_manager.persistence().project_dir(&project);
+    let current_heads = {
+        let doc_arc = state.project_manager.doc_store().get_doc(&doc_id)?;
+        let mut doc = doc_arc.write().await;
+        doc.get_heads()
+            .iter()
+            .map(|head| head.to_string())
+            .collect::<Vec<_>>()
+    };
+
     let mut seen_state = notes_core::SeenStateManager::load(&project_dir).await?;
-    seen_state.mark_seen(&doc_id, &mut doc);
+    seen_state.mark_seen_heads(&doc_id, current_heads);
     notes_core::SeenStateManager::save(&project_dir, &seen_state).await?;
 
     state.project_manager.doc_store().mark_dirty(&doc_id);
@@ -1082,7 +1413,7 @@ async fn update_settings(
     settings: notes_core::AppSettings,
 ) -> Result<(), CoreError> {
     let notes_dir = state.project_manager.persistence().base_dir().to_path_buf();
-    settings.save(&notes_dir).await
+    settings.normalized().save(&notes_dir).await
 }
 
 /// Get the degradation level for a document based on word count.
@@ -1105,8 +1436,14 @@ async fn get_doc_degradation(
 async fn generate_invite(
     state: State<'_, AppState>,
     project: String,
+    role: String,
 ) -> Result<GenerateInviteResult, CoreError> {
     notes_core::validate_project_name(&project)?;
+    if role != "editor" && role != "viewer" {
+        return Err(CoreError::InvalidInput(
+            "invite role must be 'editor' or 'viewer'".into(),
+        ));
+    }
     // Only the owner (or first sharer) can generate invites
     check_role(&state, &project, MinRole::Owner).await?;
     let _files = state.project_manager.list_files(&project).await?;
@@ -1181,7 +1518,7 @@ async fn generate_invite(
         project_name: project.clone(),
         project_id,
         manifest_data,
-        invite_role: "editor".to_string(),
+        invite_role: role,
         owner_x25519_public: Some(*owner_x25519_public.as_bytes()),
         epoch_key: epoch_key_bytes,
         current_epoch,
@@ -1272,6 +1609,13 @@ async fn accept_invite(
 
         let plaintext = invite::decrypt_payload(&shared_key, &encrypted)
             .map_err(|e| CoreError::InvalidData(format!("decrypt failed — wrong code: {e}")))?;
+
+        // Zeroize the SPAKE2 shared key after decryption
+        {
+            use zeroize::Zeroize;
+            let mut key_to_zeroize = shared_key;
+            key_to_zeroize.zeroize();
+        }
 
         let payload: invite::InvitePayload = serde_json::from_slice(&plaintext)
             .map_err(|e| CoreError::InvalidData(format!("invalid payload: {e}")))?;
@@ -1415,6 +1759,131 @@ async fn populate_doc_acl(state: &AppState, project: &str, doc_id: DocId) {
             }
         }
     }
+
+    // Populate known actor IDs for actor-based verification during sync.
+    // This enables verify_new_changes() to reject changes from unknown actors.
+    if let Ok(manifest_arc) = state.project_manager.get_manifest_for_ui(project) {
+        let manifest = manifest_arc.read().await;
+        if let Ok(aliases) = manifest.get_actor_aliases() {
+            let mut known_actors: std::collections::HashSet<String> =
+                aliases.keys().cloned().collect();
+
+            // Also include the local device's actor ID
+            if let Some(actor) = state.project_manager.doc_store().device_actor_hex() {
+                known_actors.insert(actor);
+            }
+
+            if !known_actors.is_empty() {
+                state.sync_engine.set_known_actors(doc_id, known_actors);
+            }
+        }
+    }
+}
+
+// ── Update Commands ──────────────────────────────────────────────────
+
+/// Holds a checked update between the "check" and "install" steps.
+/// The frontend calls check_for_update first, which stores the Update
+/// object here. Then install_update takes it and runs the download+install.
+struct PendingUpdate(std::sync::Mutex<Option<tauri_plugin_updater::Update>>);
+
+/// Metadata about an available update, sent to the frontend.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateInfo {
+    version: String,
+    current_version: String,
+    body: Option<String>,
+    date: Option<String>,
+}
+
+/// Progress events streamed to the frontend during download via a Channel.
+#[derive(Clone, Serialize)]
+#[serde(tag = "event", content = "data")]
+enum DownloadEvent {
+    /// First chunk received — includes total download size if known.
+    #[serde(rename_all = "camelCase")]
+    Started { content_length: Option<u64> },
+    /// A chunk of bytes was downloaded.
+    #[serde(rename_all = "camelCase")]
+    Progress { chunk_length: usize },
+    /// Download complete, install starting.
+    Finished,
+}
+
+/// Check if a newer version is available on GitHub Releases.
+/// Returns Some(UpdateInfo) if an update exists, None if up to date.
+/// The Update object is stored in PendingUpdate for install_update to use.
+#[tauri::command]
+async fn check_for_update(
+    app: AppHandle,
+    pending: State<'_, PendingUpdate>,
+) -> Result<Option<UpdateInfo>, String> {
+    let update = app
+        .updater_builder()
+        .build()
+        .map_err(|e| format!("updater init failed: {e}"))?
+        .check()
+        .await
+        .map_err(|e| format!("update check failed: {e}"))?;
+
+    let info = update.as_ref().map(|u| UpdateInfo {
+        version: u.version.clone(),
+        current_version: u.current_version.clone(),
+        body: u.body.clone(),
+        date: u.date.map(|d| d.to_string()),
+    });
+
+    // Store the Update object so install_update can consume it later
+    *pending.0.lock().unwrap() = update;
+    Ok(info)
+}
+
+/// Download and install a previously-checked update.
+/// Streams progress events (Started, Progress, Finished) to the frontend
+/// via a Tauri Channel so the UI can show a progress bar.
+#[tauri::command]
+async fn install_update(
+    pending: State<'_, PendingUpdate>,
+    on_event: Channel<DownloadEvent>,
+) -> Result<(), String> {
+    // Take the pending Update — this consumes it so it can't be installed twice
+    let update = pending
+        .0
+        .lock()
+        .unwrap()
+        .take()
+        .ok_or_else(|| "no pending update — call check_for_update first".to_string())?;
+
+    // Track whether we've sent the Started event (only on first chunk)
+    let started = std::sync::atomic::AtomicBool::new(false);
+
+    let on_chunk = {
+        let on_event = on_event.clone();
+        move |chunk_length: usize, content_length: Option<u64>| {
+            if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let _ = on_event.send(DownloadEvent::Started { content_length });
+            }
+            let _ = on_event.send(DownloadEvent::Progress { chunk_length });
+        }
+    };
+
+    let on_finished = {
+        let on_event = on_event.clone();
+        move || {
+            let _ = on_event.send(DownloadEvent::Finished);
+        }
+    };
+
+    // Downloads the .app.tar.gz, verifies the minisign signature
+    // against the pubkey in tauri.conf.json, extracts it, and replaces
+    // the running .app bundle on macOS.
+    update
+        .download_and_install(on_chunk, on_finished)
+        .await
+        .map_err(|e| format!("install failed: {e}"))?;
+
+    Ok(())
 }
 
 // ── App Setup ────────────────────────────────────────────────────────
@@ -1485,6 +1954,8 @@ fn load_or_create_secret_key(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -1493,6 +1964,9 @@ pub fn run() {
                         .build(),
                 )?;
             }
+
+            // Register the PendingUpdate state for the update commands
+            app.manage(PendingUpdate(std::sync::Mutex::new(None)));
 
             let notes_dir =
                 resolve_notes_dir().map_err(|e| anyhow::anyhow!(e))?;
@@ -1523,29 +1997,63 @@ pub fn run() {
 
             log::info!("Peer ID: {}", secret_key.public());
 
-            // Initialize the full-text search index
+            // Derive a device-level SQLCipher key from the iroh identity key.
+            // This protects global databases (search index, version store) against
+            // disk theft without requiring per-project epoch keys.
+            let device_db_key: [u8; 32] = {
+                use hkdf::Hkdf;
+                use sha2::Sha256;
+                let hk = Hkdf::<Sha256>::new(None, secret_key.to_bytes().as_ref());
+                let mut key = [0u8; 32];
+                hk.expand(b"p2p-notes/v1/device-db-encryption", &mut key)
+                    .expect("HKDF expand should not fail");
+                key
+            };
+
+            // Initialize the full-text search index (encrypted with device key)
             let search_db_path = notes_dir.join(".p2p").join("search.db");
             std::fs::create_dir_all(search_db_path.parent().unwrap()).ok();
-            // Note: encryption_key=None for initial open. When a shared project
-            // with epoch keys is loaded, the DBs should be re-keyed with
-            // PRAGMA rekey. For v1, SQLCipher provides the infrastructure;
-            // per-project key derivation is wired when projects are opened.
-            let search_index = notes_core::SearchIndex::open(&search_db_path, None)
+            let search_index = notes_core::SearchIndex::open_with_recovery(&search_db_path, Some(&device_db_key))
                 .map_err(|e| anyhow::anyhow!("Failed to open search index: {e}"))?;
-            log::info!("Search index opened at {}", search_db_path.display());
+            log::info!("Search index opened (encrypted)");
 
-            // Initialize the version store (SQLite)
+            // Initialize the version store (encrypted with device key).
+            // Preserve-first behavior: if an existing versions.db is legacy plaintext,
+            // keyed with a different device identity, or otherwise unreadable, keep the
+            // file untouched and continue startup with version history disabled.
             let version_db_path = notes_dir.join(".p2p").join("versions.db");
-            let version_store = notes_core::VersionStore::open(&version_db_path, None)
-                .map_err(|e| anyhow::anyhow!("Failed to open version store: {e}"))?;
-            log::info!("Version store opened at {}", version_db_path.display());
-
-            // Migrate old history data to new version store (one-time)
-            match version_store.migrate_from_old_history() {
-                Ok(count) if count > 0 => log::info!("Migrated {count} old history sessions to versions"),
-                Ok(_) => {},
-                Err(e) => log::warn!("History migration failed (non-fatal): {e}"),
-            }
+            let legacy_history_db_path = notes_dir.join(".p2p").join("history.db");
+            let version_store = match notes_core::VersionStore::open(&version_db_path, Some(&device_db_key)) {
+                Ok(store) => {
+                    log::info!("Version store opened (encrypted)");
+                    match store.migrate_from_legacy_history_db(&legacy_history_db_path) {
+                        Ok(count) if count > 0 => log::info!("Migrated {count} old history sessions to versions"),
+                        Ok(_) => {},
+                        Err(e) => log::warn!("History migration failed (non-fatal): {e}"),
+                    }
+                    Some(Arc::new(std::sync::Mutex::new(store)))
+                }
+                Err(e) => {
+                    if version_db_path.exists()
+                        && notes_core::VersionStore::looks_like_plaintext_sqlite(&version_db_path)
+                    {
+                        log::error!(
+                            "Version history database at {} appears to be a legacy plaintext SQLite file. \
+                             Preserving it and starting with version history disabled until a migration is added. Error: {}",
+                            version_db_path.display(),
+                            e
+                        );
+                    } else {
+                        log::error!(
+                            "Failed to open version store at {}. Preserving existing files and starting with \
+                             version history disabled. Error: {}",
+                            version_db_path.display(),
+                            e
+                        );
+                    }
+                    None
+                }
+            };
 
             // Load or create stable device actor ID
             let p2p_dir = notes_dir.join(".p2p");
@@ -1555,7 +2063,6 @@ pub fn run() {
             log::info!("Device actor ID: {}", device_actor_hex);
 
             let search_index = Arc::new(std::sync::Mutex::new(search_index));
-            let version_store = Arc::new(std::sync::Mutex::new(version_store));
             let project_manager = Arc::new(ProjectManager::with_full_config(
                 notes_dir.clone(),
                 Arc::clone(&search_index),
@@ -1563,6 +2070,13 @@ pub fn run() {
             ));
             // Create SyncStateStore for persistent sync states
             let sync_state_store = Arc::new(SyncStateStore::new(notes_dir.join(".p2p")));
+
+            // Create BlobStore for content-addressed image storage
+            let blob_store = Arc::new(
+                tauri::async_runtime::block_on(
+                    notes_sync::blobs::BlobStore::new(notes_dir.join(".p2p").join("blobs"))
+                ).map_err(|e| anyhow::anyhow!("Failed to create blob store: {e}"))?,
+            );
 
             let mut sync_engine_raw = SyncEngine::new();
             sync_engine_raw.set_sync_state_store(Arc::clone(&sync_state_store));
@@ -1598,25 +2112,21 @@ pub fn run() {
                 endpoint.clone(),
                 Arc::clone(&sync_engine),
             ));
-            // Start peer monitoring (15s interval, first tick immediate)
-            let _monitor_handle = peer_manager.start_monitoring(Duration::from_secs(15));
-
             // Auto-sync trigger: debounced channel that syncs with peers on local changes
             let (sync_tx, mut sync_rx) =
                 tokio::sync::mpsc::channel::<(String, DocId)>(256);
 
-            // ── Supervised background tasks ──────────────────────────────
-            // All long-running tasks are tracked in a JoinSet. A supervisor
-            // task monitors for panics/exits and logs them. Restart on panic
-            // is not implemented yet (requires factory closures for channel
-            // re-subscription), but monitoring ensures failures are visible.
-            let mut task_set = tokio::task::JoinSet::new();
+            tauri::async_runtime::spawn({
+                let peer_mgr = Arc::clone(&peer_manager);
+                async move {
+                    peer_mgr.monitoring_loop(Duration::from_secs(15)).await;
+                }
+            });
 
-            // Task 1: Auto-sync debounce loop
-            {
+            tauri::async_runtime::spawn({
                 let peer_mgr = Arc::clone(&peer_manager);
                 let handle = app_handle.clone();
-                task_set.spawn(async move {
+                async move {
                     loop {
                         let first = match sync_rx.recv().await {
                             Some(v) => v,
@@ -1638,9 +2148,7 @@ pub fn run() {
                                 },
                             );
 
-                            let results = peer_mgr
-                                .sync_doc_with_project_peers(&project, doc_id)
-                                .await;
+                            let results = peer_mgr.sync_doc_with_project_peers(&project, doc_id).await;
                             let ok = results.iter().filter(|(_, r)| r.is_ok()).count();
                             let fail = results.iter().filter(|(_, r)| r.is_err()).count();
 
@@ -1666,15 +2174,14 @@ pub fn run() {
                             }
                         }
                     }
-                });
-            }
+                }
+            });
 
-            // Task 2: Invite accepted handler
-            {
+            tauri::async_runtime::spawn({
                 let mut rx = invite_handler.subscribe_accepted();
                 let pm = Arc::clone(&project_manager);
                 let peer_mgr = Arc::clone(&peer_manager);
-                task_set.spawn(async move {
+                async move {
                     loop {
                         match rx.recv().await {
                             Ok(accepted) => {
@@ -1683,9 +2190,7 @@ pub fn run() {
                                     accepted.invitee_peer_id,
                                     accepted.project_name
                                 );
-                                if let Ok(manifest_arc) =
-                                    pm.get_manifest_for_ui(&accepted.project_name)
-                                {
+                                if let Ok(manifest_arc) = pm.get_manifest_for_ui(&accepted.project_name) {
                                     let mut manifest = manifest_arc.write().await;
                                     let _ = manifest.add_peer(
                                         &accepted.invitee_peer_id,
@@ -1699,13 +2204,8 @@ pub fn run() {
                                         .save_manifest(&accepted.project_name, &data)
                                         .await;
                                 }
-                                if let Ok(peer_id) =
-                                    accepted.invitee_peer_id.parse::<iroh::EndpointId>()
-                                {
-                                    peer_mgr.add_peer_to_project(
-                                        &accepted.project_name,
-                                        peer_id,
-                                    );
+                                if let Ok(peer_id) = accepted.invitee_peer_id.parse::<iroh::EndpointId>() {
+                                    peer_mgr.add_peer_to_project(&accepted.project_name, peer_id);
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -1714,14 +2214,13 @@ pub fn run() {
                             }
                         }
                     }
-                });
-            }
+                }
+            });
 
-            // Task 3: Peer status event forwarder (from PeerManager monitoring loop)
-            {
+            tauri::async_runtime::spawn({
                 let mut rx = peer_manager.subscribe_peer_status();
                 let handle = app_handle.clone();
-                task_set.spawn(async move {
+                async move {
                     loop {
                         match rx.recv().await {
                             Ok(status_event) => {
@@ -1730,10 +2229,7 @@ pub fn run() {
                                     status_event.peer_id,
                                     status_event.state
                                 );
-                                let _ = handle.emit(
-                                    events::event_names::PEER_STATUS,
-                                    status_event,
-                                );
+                                let _ = handle.emit(events::event_names::PEER_STATUS, status_event);
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -1741,18 +2237,44 @@ pub fn run() {
                             }
                         }
                     }
-                });
-            }
+                }
+            });
 
-            // Task 4: Remote change event forwarder
-            {
+            tauri::async_runtime::spawn({
                 let mut rx = sync_engine.subscribe_remote_changes();
                 let handle = app_handle.clone();
-                task_set.spawn(async move {
+                let pm = Arc::clone(&project_manager);
+                async move {
                     loop {
                         match rx.recv().await {
                             Ok(doc_id) => {
                                 log::debug!("Remote change detected for doc {doc_id}");
+
+                                if let Some(project_name) = pm.get_project_for_doc(&doc_id) {
+                                    if let Ok(owner) = pm.get_project_owner(&project_name).await {
+                                        if !owner.is_empty() {
+                                            if let Ok(manifest_arc) = pm.get_manifest_for_ui(&project_name) {
+                                                let manifest = manifest_arc.read().await;
+                                                if let Ok(aliases) = manifest.get_actor_aliases() {
+                                                    let owner_actor = aliases
+                                                        .iter()
+                                                        .find(|(_, alias)| alias.as_str() == owner)
+                                                        .map(|(actor, _)| actor.clone());
+                                                    drop(manifest);
+                                                    if let Some(actor_hex) = owner_actor {
+                                                        if let Err(e) = pm
+                                                            .validate_manifest_after_sync(&project_name, &[], &actor_hex)
+                                                            .await
+                                                        {
+                                                            log::error!("Manifest validation failed for {project_name}: {e}");
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
                                 let _ = handle.emit(
                                     events::event_names::REMOTE_CHANGE,
                                     events::RemoteChangeEvent {
@@ -1770,31 +2292,7 @@ pub fn run() {
                             }
                         }
                     }
-                });
-            }
-
-            // Task supervisor: monitors all background tasks for panics/exits
-            tauri::async_runtime::spawn(async move {
-                while let Some(result) = task_set.join_next().await {
-                    match result {
-                        Ok(()) => {
-                            log::warn!("Background task exited normally (unexpected)");
-                        }
-                        Err(e) => {
-                            if e.is_panic() {
-                                log::error!(
-                                    "Background task panicked: {}. \
-                                     The corresponding subsystem (sync/presence/invite) \
-                                     may no longer function until app restart.",
-                                    e
-                                );
-                            } else {
-                                log::error!("Background task cancelled: {e}");
-                            }
-                        }
-                    }
                 }
-                log::info!("All supervised background tasks have exited");
             });
 
             app.manage(AppState {
@@ -1804,7 +2302,8 @@ pub fn run() {
                 invite_handler,
                 sync_state_store,
                 search_index: Arc::clone(&search_index),
-                version_store: Arc::clone(&version_store),
+                version_store,
+                blob_store: Arc::clone(&blob_store),
                 device_actor_hex,
                 sync_trigger: sync_tx,
                 endpoint,
@@ -1827,6 +2326,22 @@ pub fn run() {
             list_project_summaries,
             create_project,
             open_project,
+            rename_project,
+            delete_project,
+            get_project_metadata,
+            update_project_metadata,
+            archive_project,
+            list_project_tree,
+            // Project todos
+            add_project_todo,
+            toggle_project_todo,
+            remove_project_todo,
+            update_project_todo,
+            list_project_todos,
+            // Image commands
+            import_image,
+            get_image,
+            has_image,
             list_files,
             create_note,
             open_doc,
@@ -1866,6 +2381,9 @@ pub fn run() {
             update_settings,
             get_doc_degradation,
             broadcast_presence,
+            // Auto-update
+            check_for_update,
+            install_update,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

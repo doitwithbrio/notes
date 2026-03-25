@@ -4,6 +4,78 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Notes</title>
+    <script>
+      (() => {
+        const STORAGE_KEY = 'p2p-notes-theme-bootstrap';
+        const defaults = { mode: 'system', accent: 'amber' };
+        const accents = {
+          amber: '#B68D5E',
+          slate: '#7B8FA3',
+          clay: '#B87A6A',
+          olive: '#8A9A6B',
+        };
+        const tints = {
+          amber: {
+            light: { bgTint:'#FAF7F2', surface:'#FDFBF7', surfaceHover:'#F7F3EC', surfaceActive:'#F0EBE3', surfaceSidebar:'#F5F1EA', borderSubtle:'#EBE5DC', borderDefault:'#DED7CC', overlayBackdrop:'rgba(250,247,242,0.6)' },
+            dark:  { bgTint:'#161413', surface:'#1e1b18', surfaceHover:'#2a2621', surfaceActive:'#35302a', surfaceSidebar:'#1a1714', borderSubtle:'#332e28', borderDefault:'#403a33', overlayBackdrop:'rgba(14,12,10,0.65)' },
+          },
+          slate: {
+            light: { bgTint:'#F4F6F8', surface:'#F9FAFB', surfaceHover:'#EFF2F5', surfaceActive:'#E5EAF0', surfaceSidebar:'#EDF0F4', borderSubtle:'#DDE2E9', borderDefault:'#CED5DE', overlayBackdrop:'rgba(244,246,248,0.6)' },
+            dark:  { bgTint:'#131518', surface:'#191c21', surfaceHover:'#22272e', surfaceActive:'#2b323b', surfaceSidebar:'#15181d', borderSubtle:'#2c3340', borderDefault:'#3a4250', overlayBackdrop:'rgba(10,11,14,0.65)' },
+          },
+          clay: {
+            light: { bgTint:'#FAF5F3', surface:'#FDF9F7', surfaceHover:'#F7F0ED', surfaceActive:'#F0E7E3', surfaceSidebar:'#F5EEEB', borderSubtle:'#EBE1DD', borderDefault:'#DED3CD', overlayBackdrop:'rgba(250,245,243,0.6)' },
+            dark:  { bgTint:'#171413', surface:'#1e1a18', surfaceHover:'#2b2522', surfaceActive:'#362e2a', surfaceSidebar:'#1b1715', borderSubtle:'#342d29', borderDefault:'#423a34', overlayBackdrop:'rgba(14,11,10,0.65)' },
+          },
+          olive: {
+            light: { bgTint:'#F7F8F2', surface:'#FBFCF7', surfaceHover:'#F1F4EA', surfaceActive:'#E6ECDA', surfaceSidebar:'#EEF1E7', borderSubtle:'#E0E5D2', borderDefault:'#D3DAC3', overlayBackdrop:'rgba(247,248,242,0.6)' },
+            dark:  { bgTint:'#141614', surface:'#1a1d19', surfaceHover:'#252922', surfaceActive:'#2e342a', surfaceSidebar:'#161915', borderSubtle:'#2d332a', borderDefault:'#3b4236', overlayBackdrop:'rgba(10,12,10,0.65)' },
+          },
+        };
+        const prefersDark = () =>
+          typeof window.matchMedia === 'function' && window.matchMedia('(prefers-color-scheme: dark)').matches;
+
+        function applyTints(accent, resolved) {
+          const t = tints[accent]?.[resolved] || tints.amber.light;
+          const el = document.documentElement;
+          el.style.setProperty('--bg-tint', t.bgTint);
+          el.style.setProperty('--surface', t.surface);
+          el.style.setProperty('--surface-hover', t.surfaceHover);
+          el.style.setProperty('--surface-active', t.surfaceActive);
+          el.style.setProperty('--surface-sidebar', t.surfaceSidebar);
+          el.style.setProperty('--border-subtle', t.borderSubtle);
+          el.style.setProperty('--border-default', t.borderDefault);
+          el.style.setProperty('--overlay-backdrop', t.overlayBackdrop);
+        }
+
+        try {
+          const raw = localStorage.getItem(STORAGE_KEY);
+          const parsed = raw ? JSON.parse(raw) : { v: 1, ...defaults };
+          if (parsed?.v !== 1) throw new Error('stale theme snapshot');
+          const mode = parsed?.mode === 'light' || parsed?.mode === 'dark' || parsed?.mode === 'system'
+            ? parsed.mode
+            : defaults.mode;
+          const accent = parsed?.accent && accents[parsed.accent] ? parsed.accent : defaults.accent;
+          const resolved = mode === 'system'
+            ? (prefersDark() ? 'dark' : 'light')
+            : mode;
+          document.documentElement.dataset.theme = resolved;
+          document.documentElement.dataset.themeMode = mode;
+          document.documentElement.dataset.accent = accent;
+          document.documentElement.style.setProperty('--accent', accents[accent]);
+          document.documentElement.style.colorScheme = resolved;
+          applyTints(accent, resolved);
+        } catch {
+          const resolved = prefersDark() ? 'dark' : 'light';
+          document.documentElement.dataset.theme = resolved;
+          document.documentElement.dataset.themeMode = 'system';
+          document.documentElement.dataset.accent = defaults.accent;
+          document.documentElement.style.setProperty('--accent', accents[defaults.accent]);
+          document.documentElement.style.colorScheme = resolved;
+          applyTints(defaults.accent, resolved);
+        }
+      })();
+    </script>
     <link rel="stylesheet" href="/src/app.css" />
   </head>
   <body>

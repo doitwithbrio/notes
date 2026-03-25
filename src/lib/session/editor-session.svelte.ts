@@ -3,7 +3,8 @@ import * as Automerge from '@automerge/automerge';
 import { tauriApi } from '../api/tauri.js';
 import { TauriRuntimeUnavailableError } from '../runtime/tauri.js';
 import { getDocById, markDocUnread, setActiveDoc, setDocWordCount } from '../state/documents.svelte.js';
-import { createVersion, loadVersions, versionState } from '../state/versions.svelte.js';
+import { createVersion, exitVersionReview, loadVersions, versionState } from '../state/versions.svelte.js';
+import { uiState } from '../state/ui.svelte.js';
 
 type NotesDoc = {
   schemaVersion?: number;
@@ -40,6 +41,7 @@ let pendingChunks: Uint8Array[] = [];
 let applyTimer: ReturnType<typeof setTimeout> | null = null;
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let idleVersionTimer: ReturnType<typeof setTimeout> | null = null;
+let wordCountTimer: ReturnType<typeof setTimeout> | null = null;
 
 /** 15 minutes idle = auto-create a version. */
 const IDLE_VERSION_TIMEOUT_MS = 15 * 60 * 1000;
@@ -57,6 +59,25 @@ function clearTimers() {
     clearTimeout(idleVersionTimer);
     idleVersionTimer = null;
   }
+  if (wordCountTimer) {
+    clearTimeout(wordCountTimer);
+    wordCountTimer = null;
+  }
+}
+
+function scheduleWordCount(docId: string, text: string) {
+  clearTimeout(wordCountTimer ?? undefined);
+  wordCountTimer = setTimeout(() => {
+    setDocWordCount(docId, text);
+    wordCountTimer = null;
+  }, 200);
+}
+
+function flushWordCount() {
+  if (!editorSessionState.docId) return;
+  clearTimeout(wordCountTimer ?? undefined);
+  wordCountTimer = null;
+  setDocWordCount(editorSessionState.docId, editorSessionState.text);
 }
 
 function scheduleFlush() {
@@ -105,6 +126,7 @@ export async function openEditorSession(projectId: string, docId: string) {
   if (editorSessionState.projectId === projectId && editorSessionState.docId === docId) {
     // Session already loaded — just ensure the UI view is restored
     // (user may have navigated to project-overview or settings and come back)
+    exitVersionReview();
     setActiveDoc(docId);
     return;
   }
@@ -115,6 +137,7 @@ export async function openEditorSession(projectId: string, docId: string) {
   editorSessionState.lastError = null;
 
   try {
+    await tauriApi.openProject(projectId, true);
     await tauriApi.openDoc(projectId, docId);
     await tauriApi.markDocSeen(projectId, docId);
     await loadBinary(projectId, docId);
@@ -152,8 +175,7 @@ export function updateEditorText(nextText: string) {
   if (!currentDoc || !editorSessionState.docId) return;
   if (nextText === editorSessionState.text) return;
 
-  const base = Automerge.clone(currentDoc);
-  const nextDoc = Automerge.change(base, (doc) => {
+  const nextDoc = Automerge.change(currentDoc, (doc) => {
     doc.text = nextText;
     if (doc.schemaVersion === undefined) {
       doc.schemaVersion = 1;
@@ -164,7 +186,7 @@ export function updateEditorText(nextText: string) {
   currentDoc = nextDoc;
   editorSessionState.text = nextText;
   editorSessionState.revision += 1;
-  setDocWordCount(editorSessionState.docId, nextText);
+  scheduleWordCount(editorSessionState.docId, nextText);
 
   if (incremental.length > 0) {
     pendingChunks.push(incremental);
@@ -210,6 +232,14 @@ export async function saveNow() {
 }
 
 export async function closeEditorSession() {
+  // Exit any review modes immediately (before async work)
+  exitVersionReview();
+  if (uiState.view === 'history-review') {
+    uiState.view = 'editor';
+    uiState.historyReviewSessionId = null;
+  }
+
+  flushWordCount();
   clearTimers();
 
   if (!editorSessionState.projectId || !editorSessionState.docId) {

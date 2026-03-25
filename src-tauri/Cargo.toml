@@ -1,6 +1,6 @@
 [package]
-name = "p2p-notes"
-version = "0.1.0"
+name = "notes"
+version = "0.1.1"
 description = "A local-first, peer-to-peer, end-to-end encrypted markdown notes app"
 authors = ["you"]
 license = "MIT"
@@ -27,7 +27,12 @@ uuid.workspace = true
 tokio.workspace = true
 tauri = { version = "2", features = [] }
 tauri-plugin-log = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
 dirs = "6"
 anyhow = "1"
 getrandom = "0.3"
 chrono = "0.4"
+hkdf = "0.12"
+sha2 = "0.10"
+zeroize = "1.8"

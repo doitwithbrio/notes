@@ -6,13 +6,15 @@ export const presenceState = $state({
   cursors: [] as CursorPosition[],
 });
 
+const peersById = new Map<string, Peer>();
+
 function colorForPeer(peerId: string) {
   const hash = Array.from(peerId).reduce((acc, char) => acc + char.charCodeAt(0), 0);
   return CURSOR_COLORS[hash % CURSOR_COLORS.length] ?? CURSOR_COLORS[0];
 }
 
 function upsertPeerBase(peerId: string, alias: string | null, online: boolean, role?: PeerRole | null) {
-  const existing = presenceState.peers.find((peer) => peer.id === peerId);
+  const existing = peersById.get(peerId);
   if (existing) {
     existing.alias = alias ?? existing.alias ?? 'peer';
     existing.online = online;
@@ -29,7 +31,12 @@ function upsertPeerBase(peerId: string, alias: string | null, online: boolean, r
     activeDoc: null,
   };
   presenceState.peers.push(peer);
+  peersById.set(peerId, peer);
   return peer;
+}
+
+export function getPeerById(peerId: string): Peer | null {
+  return peersById.get(peerId) ?? null;
 }
 
 export function getOnlinePeers(): Peer[] {

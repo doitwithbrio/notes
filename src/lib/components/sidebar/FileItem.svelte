@@ -2,7 +2,7 @@
   import type { Document } from '../../types/index.js';
   import { documentState } from '../../state/documents.svelte.js';
   import { uiState } from '../../state/ui.svelte.js';
-  import { presenceState } from '../../state/presence.svelte.js';
+  import { getPeerById } from '../../state/presence.svelte.js';
 
   let {
     doc,
@@ -26,8 +26,11 @@
 
   const isActive = $derived(documentState.activeDocId === doc.id && uiState.view === 'editor');
 
-  const peersHere = $derived(
-    presenceState.peers.filter((p) => doc.activePeers.includes(p.id) && p.online),
+  const peersHere = $derived.by(() =>
+    doc.activePeers
+      .map((peerId) => getPeerById(peerId))
+      .filter((peer): peer is NonNullable<typeof peer> => !!peer?.online)
+      .slice(0, 3),
   );
 
   let inputValue = $state('');

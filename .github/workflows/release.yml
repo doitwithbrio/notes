@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: --target aarch64-apple-darwin
+          - platform: macos-latest
+            args: --target x86_64-apple-darwin
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Rust artifacts
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Verify tag matches app version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+          
+          ref = os.environ['REF_NAME']
+          tag_version = ref[1:] if ref.startswith('v') else ref
+          cargo_toml = pathlib.Path('src-tauri/Cargo.toml').read_text()
+          cargo_match = re.search(r'^version\s*=\s*"([^"]+)"', cargo_toml, re.MULTILINE)
+          if not cargo_match:
+              raise SystemExit('Could not read version from src-tauri/Cargo.toml')
+          cargo_version = cargo_match.group(1)
+          conf_version = json.loads(pathlib.Path('src-tauri/tauri.conf.json').read_text())['version']
+          if len({tag_version, cargo_version, conf_version}) != 1:
+              raise SystemExit(
+                  f'Version mismatch: tag={tag_version}, cargo={cargo_version}, tauri.conf={conf_version}'
+              )
+          print(f'Version check passed: {tag_version}')
+          PY
+
+      - name: Build and create release draft
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        with:
+          tagName: v__VERSION__
+          releaseName: 'notes v__VERSION__'
+          releaseBody: |
+            Signed updater artifacts for notes.
+
+            After publishing this draft release, installed apps will discover it
+            automatically during their background update check and via the
+            Settings > Updates manual check flow.
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}

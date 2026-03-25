@@ -1,13 +1,24 @@
 <script lang="ts">
-  import { PanelLeftClose, PanelLeftOpen, PenLine, Check } from 'lucide-svelte';
+  import { PanelLeftClose, PanelLeftOpen, PenLine, Check, UserPlus } from 'lucide-svelte';
 
   import { sortable } from '../../actions/sortable.js';
   import { isMac, modKey } from '../../utils/platform.js';
-  import { documentState, loadProjectDocs, reorderDocs, deleteDoc, removeDoc, getDocById, setDocPath } from '../../state/documents.svelte.js';
+  import {
+    documentState,
+    loadProjectDocs,
+    reorderDocs,
+    deleteDoc,
+    removeDoc,
+    getDocById,
+    hasHydratedProject,
+    isProjectLoading,
+    setDocPath,
+  } from '../../state/documents.svelte.js';
   import { createProject, projectState, reorderProject, removeProject } from '../../state/projects.svelte.js';
   import { uiState, openProjectOverview, toggleSidebar } from '../../state/ui.svelte.js';
   import { openEditorSession, closeEditorSession, editorSessionState, renameActiveDoc } from '../../session/editor-session.svelte.js';
   import { tauriApi } from '../../api/tauri.js';
+  import { openJoinDialog } from '../../state/invite.svelte.js';
   import ProjectGroup from './ProjectGroup.svelte';
   import ContextMenu from './ContextMenu.svelte';
   import type { MenuItem } from './ContextMenu.svelte';
@@ -21,6 +32,19 @@
   let contextMenu = $state<{ type: 'doc' | 'project'; x: number; y: number; projectId: string; docId?: string } | null>(null);
   let renamingDocId = $state<string | null>(null);
   let renamingProjectId = $state<string | null>(null);
+
+  const docsByProject = $derived.by(() => {
+    const grouped = new Map<string, typeof documentState.docs>();
+    for (const doc of documentState.docs) {
+      const docs = grouped.get(doc.projectId);
+      if (docs) {
+        docs.push(doc);
+      } else {
+        grouped.set(doc.projectId, [doc]);
+      }
+    }
+    return grouped;
+  });
 
   function closeContextMenu() {
     contextMenu = null;
@@ -162,8 +186,8 @@
       await deleteDoc(sourceProjectId, docId);
 
       // Reload both projects
-      await loadProjectDocs(sourceProjectId);
-      await loadProjectDocs(targetProjectId);
+      await loadProjectDocs(sourceProjectId, { force: true });
+      await loadProjectDocs(targetProjectId, { force: true });
     } catch (err) {
       console.error('Failed to move doc:', err);
     }
@@ -183,7 +207,7 @@
     try {
       const project = await createProject(trimmed);
       if (project) {
-        await loadProjectDocs(project.id);
+        await loadProjectDocs(project.id, { force: true });
         documentState.activeDocId = null;
         openProjectOverview(project.id);
       }
@@ -206,7 +230,7 @@
     try {
       const leaf = trimmed.endsWith('.md') ? trimmed : `${trimmed}.md`;
       const docId = await tauriApi.createNote(projectId, leaf);
-      await loadProjectDocs(projectId);
+      await loadProjectDocs(projectId, { force: true, connectPeers: true });
       await openEditorSession(projectId, docId);
     } catch (err) {
       console.error('Failed to create note:', err);
@@ -331,15 +355,26 @@
       <div class="project-group-wrapper">
         <ProjectGroup
           {project}
-          docs={documentState.docs.filter((doc) => doc.projectId === project.id)}
+          docs={docsByProject.get(project.id) ?? []}
           collapsed={!uiState.sidebarOpen}
           editing={renamingProjectId === project.id}
+          loading={isProjectLoading(project.id)}
+          hydrated={hasHydratedProject(project.id)}
           editingDocId={renamingDocId ?? (creatingNoteProjectId ? '__creating__' : null)}
           {editMode}
           oncommit={(name) => { renamingProjectId = null; /* project rename is local-only for now */ }}
           oncancel={() => { renamingProjectId = null; cancelNewProject(); }}
           onnewnote={() => startNewNote(project.id)}
-          onprojectclick={() => { documentState.activeDocId = null; openProjectOverview(project.id); }}
+          onprojectclick={() => {
+            void closeEditorSession();
+            documentState.activeDocId = null;
+            openProjectOverview(project.id);
+            if (!hasHydratedProject(project.id)) {
+              void loadProjectDocs(project.id, { connectPeers: true });
+            } else {
+              void tauriApi.openProject(project.id, true);
+            }
+          }}
           ondocopen={(docId) => openEditorSession(project.id, docId)}
           ondoccommit={(title) => {
             if (renamingDocId) {
@@ -387,7 +422,7 @@
     {#if projectState.projects.length === 0 && !creatingProject}
       <div class="empty">
         {#if uiState.sidebarOpen}
-          <p>no projects yet</p>
+          <p>{projectState.loading ? 'loading projects...' : 'no projects yet'}</p>
         {/if}
       </div>
     {/if}
@@ -409,7 +444,11 @@
           <span class="edit-mode-label">drag to reorder</span>
           <button class="footer-done-btn" onclick={() => (editMode = false)}>done</button>
         {:else}
-          <button class="footer-new-project" onclick={startNewProject}>+ new project</button>
+          <button class="footer-new-project" onclick={startNewProject}>+ new</button>
+          <button class="footer-join" onclick={openJoinDialog}>
+            <UserPlus size={13} strokeWidth={1.5} />
+            <span>join</span>
+          </button>
           <button class="footer-edit-toggle" onclick={() => (editMode = true)} aria-label="edit order">
             <PenLine size={13} strokeWidth={1.5} />
           </button>
@@ -610,6 +649,21 @@
 
   .footer-new-project:hover {
     color: var(--text-primary);
+  }
+
+  .footer-join {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 0;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-primary);
+    transition: opacity var(--transition-fast);
+  }
+
+  .footer-join:hover {
+    opacity: 0.7;
   }
 
   .collapsed-btn {

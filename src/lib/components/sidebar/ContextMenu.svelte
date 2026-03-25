@@ -116,7 +116,7 @@
     border-radius: 10px;
     background: var(--surface);
     border: 1px solid var(--border-subtle);
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08), 0 1px 4px rgba(0, 0, 0, 0.04);
+    box-shadow: var(--menu-shadow);
     animation: menuIn 100ms ease;
   }
 
@@ -155,11 +155,11 @@
   }
 
   .menu-item.danger {
-    color: #c0392b;
+    color: var(--danger-fg);
   }
 
   .menu-item.danger:hover {
-    background: rgba(192, 57, 43, 0.08);
+    background: var(--danger-bg);
   }
 
   .submenu-arrow {
@@ -177,7 +177,7 @@
     border-radius: 10px;
     background: var(--surface);
     border: 1px solid var(--border-subtle);
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08), 0 1px 4px rgba(0, 0, 0, 0.04);
+    box-shadow: var(--menu-shadow);
     margin-left: 2px;
   }
 </style>

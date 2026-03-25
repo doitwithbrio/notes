@@ -1,8 +1,27 @@
 <script lang="ts">
   import { presenceState } from '../../state/presence.svelte.js';
+  import { uiState } from '../../state/ui.svelte.js';
+  import { getProject } from '../../state/projects.svelte.js';
+  import { openShareDialog, removePeer } from '../../state/invite.svelte.js';
+  import PeerItem from './PeerItem.svelte';
 
   const onlinePeers = $derived(presenceState.peers.filter((p) => p.online));
   const offlinePeers = $derived(presenceState.peers.filter((p) => !p.online));
+
+  const activeProject = $derived(getProject(uiState.activeProjectId));
+  const isOwner = $derived(activeProject?.role === 'owner');
+
+  function handleInvite() {
+    if (activeProject) {
+      openShareDialog(activeProject.id);
+    }
+  }
+
+  function handleRemovePeer(peerId: string) {
+    if (activeProject) {
+      void removePeer(activeProject.id, peerId);
+    }
+  }
 </script>
 
 <section class="section">
@@ -16,23 +35,21 @@
   <div class="section-body">
     <div class="peer-list">
       {#each onlinePeers as peer (peer.id)}
-        <div class="peer-row" title="{peer.alias} · online">
-          <span class="peer-dot" style="background: {peer.cursorColor}"></span>
-          <span class="peer-name">{peer.alias}</span>
-        </div>
+        <PeerItem {peer} {isOwner} onremove={() => handleRemovePeer(peer.id)} />
       {/each}
 
       {#each offlinePeers as peer (peer.id)}
-        <div class="peer-row offline" title="{peer.alias} · offline">
-          <span class="peer-dot offline-dot"></span>
-          <span class="peer-name">{peer.alias}</span>
-        </div>
+        <PeerItem {peer} {isOwner} onremove={() => handleRemovePeer(peer.id)} />
       {/each}
 
       {#if presenceState.peers.length === 0}
         <p class="empty-text">no peers connected</p>
       {/if}
     </div>
+
+    {#if isOwner}
+      <button class="invite-btn" onclick={handleInvite}>+ invite</button>
+    {/if}
   </div>
 </section>
 
@@ -81,49 +98,26 @@
     display: flex;
     flex-direction: column;
     gap: 2px;
-  }
-
-  .peer-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 5px 6px;
-    border-radius: 6px;
-    transition: background var(--transition-fast);
-    cursor: default;
-  }
-
-  .peer-row:hover {
-    background: var(--surface-hover);
-  }
-
-  .peer-dot {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    flex-shrink: 0;
-  }
-
-  .offline-dot {
-    background: var(--text-tertiary);
-  }
-
-  .peer-name {
-    font-size: 13px;
-    font-weight: 450;
-    color: var(--text-primary);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .peer-row.offline .peer-name {
-    color: var(--text-tertiary);
+    margin-bottom: 8px;
   }
 
   .empty-text {
     font-size: 13px;
     color: var(--text-tertiary);
     padding: 4px 6px;
+    margin-bottom: 8px;
+  }
+
+  .invite-btn {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--accent);
+    padding: 4px 6px;
+    border-radius: 6px;
+    transition: background var(--transition-fast);
+  }
+
+  .invite-btn:hover {
+    background: var(--surface-hover);
   }
 </style>

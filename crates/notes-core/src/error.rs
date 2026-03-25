@@ -63,7 +63,26 @@ impl serde::Serialize for CoreError {
         };
 
         map.serialize_entry("code", code)?;
-        map.serialize_entry("message", &self.to_string())?;
+
+        // Sanitize error messages before sending to frontend.
+        // Raw IO/Automerge/Serde errors can contain filesystem paths, internal state,
+        // or peer addresses that should not be exposed to the webview.
+        let message = match self {
+            CoreError::Io(e) => {
+                log::error!("IO error (sanitized for frontend): {e}");
+                "A file system error occurred".to_string()
+            }
+            CoreError::Automerge(e) => {
+                log::error!("Automerge error (sanitized for frontend): {e}");
+                "A document processing error occurred".to_string()
+            }
+            CoreError::Serde(e) => {
+                log::error!("Serialization error (sanitized for frontend): {e}");
+                "A data format error occurred".to_string()
+            }
+            other => other.to_string(),
+        };
+        map.serialize_entry("message", &message)?;
         map.end()
     }
 }

@@ -34,11 +34,11 @@
   function colorForType(type: string): string {
     switch (type) {
       case 'added':
-        return 'var(--diff-added, #6BAA8A)';
+        return 'var(--diff-added)';
       case 'removed':
-        return 'var(--diff-removed, #C4836A)';
+        return 'var(--diff-removed)';
       case 'changed':
-        return 'var(--diff-changed, #C4A64E)';
+        return 'var(--diff-changed)';
       default:
         return 'transparent';
     }

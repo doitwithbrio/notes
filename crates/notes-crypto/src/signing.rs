@@ -58,6 +58,19 @@ impl SignedChange {
         Ok(data)
     }
 
+    /// Construct a SignedChange from individual parts (for verification of received signatures).
+    /// `data` is the raw bytes (not hex-encoded) — it will be hex-encoded internally.
+    pub fn from_parts(author: &str, data: &[u8], signature: &str) -> Option<Self> {
+        if author.is_empty() || signature.is_empty() {
+            return None;
+        }
+        Some(Self {
+            author: author.to_string(),
+            signature: signature.to_string(),
+            data: hex_encode(data),
+        })
+    }
+
     /// Get the author's EndpointId.
     pub fn author_id(&self) -> Result<EndpointId, CryptoError> {
         self.author

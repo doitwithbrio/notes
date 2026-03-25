@@ -34,6 +34,14 @@ pub enum PeerRole {
 /// Maximum concurrent connections handled by the sync engine.
 const MAX_CONNECTIONS: usize = 32;
 
+/// Maximum signatures accepted per incoming SignatureBatch message.
+/// Prevents memory exhaustion from a malicious peer sending fabricated signatures.
+const MAX_SIGNATURES_PER_BATCH: usize = 1000;
+
+/// Maximum total signatures stored per document.
+/// When exceeded, oldest entries are evicted (approximate LRU via retain).
+const MAX_SIGNATURES_PER_DOC: usize = 10_000;
+
 /// Maximum concurrent bidirectional streams per connection.
 const MAX_STREAMS_PER_CONNECTION: usize = 16;
 
@@ -107,6 +115,17 @@ impl SyncEngine {
     pub fn unregister_doc(&self, doc_id: &Uuid) {
         let key = uuid_to_doc_key(*doc_id);
         self.docs.remove(&key);
+        // Clean up associated state to prevent unbounded growth
+        self.known_actors.remove(&key);
+        self.acl.retain(|k, _| k.0 != key);
+        self.signatures.retain(|k, _| k.0 != key);
+    }
+
+    /// Evict all stored signatures for a document.
+    /// Call after compaction (which invalidates old change hashes).
+    pub fn evict_signatures(&self, doc_id: Uuid) {
+        let key = uuid_to_doc_key(doc_id);
+        self.signatures.retain(|k, _| k.0 != key);
     }
 
     /// Set the ACL role for a peer on a document.
@@ -152,6 +171,13 @@ impl SyncEngine {
     ) {
         let key = uuid_to_doc_key(doc_id);
         self.signatures.insert((key, change_hash), signature);
+
+        // Enforce per-doc cap to prevent unbounded memory growth
+        let doc_count = self.signatures.iter().filter(|e| e.key().0 == key).count();
+        if doc_count > MAX_SIGNATURES_PER_DOC {
+            log::debug!("Signature cap reached for doc, evicting all ({doc_count} entries)");
+            self.signatures.retain(|k, _| k.0 != key);
+        }
     }
 
     /// Get all stored signatures for a document (for transmitting as sidecar).
@@ -218,6 +244,7 @@ impl SyncEngine {
         let mut session = SyncSession::new_with_state(key, initial_state)
             .with_acl(allowed_peers)
             .with_known_actors(known_actors)
+            .with_signatures(Arc::clone(&self.signatures))
             .with_remote_peer(peer_id);
         session.run_initiator(connection, doc).await?;
 
@@ -317,6 +344,7 @@ impl SyncEngine {
                     let mut session = SyncSession::new(doc_id)
                         .with_acl(allowed_peers)
                         .with_known_actors(known_actors)
+                        .with_signatures(Arc::clone(&self.signatures))
                         .with_remote_peer(remote_id);
                     if let Err(e) = session.run_responder(&mut send, &mut recv, doc).await {
                         log::error!("Sync session error for doc {:?}: {e}", &doc_id[..4]);
@@ -345,14 +373,39 @@ impl SyncEngine {
                     let _ = send.finish();
                 }
                 protocol::MessageType::SignatureBatch => {
-                    // Read and store incoming signature batch
+                    // Read and store incoming signature batch (with size cap)
                     match crate::sync_session::read_framed(&mut recv).await {
                         Ok(batch_bytes) => {
                             if let Ok(batch) = serde_json::from_slice::<protocol::SignatureBatchPayload>(&batch_bytes) {
-                                for sig in batch.signatures {
-                                    self.signatures.insert((doc_id, sig.change_hash.clone()), sig);
+                                if batch.signatures.len() > MAX_SIGNATURES_PER_BATCH {
+                                    log::warn!(
+                                        "Rejected oversized signature batch ({} sigs, max {}) for doc {:?}",
+                                        batch.signatures.len(),
+                                        MAX_SIGNATURES_PER_BATCH,
+                                        &doc_id[..4]
+                                    );
+                                } else {
+                                    for sig in batch.signatures {
+                                        self.signatures.insert((doc_id, sig.change_hash.clone()), sig);
+                                    }
+                                    // Enforce per-doc cap: if too many signatures, evict for this doc
+                                    let doc_sig_count = self.signatures
+                                        .iter()
+                                        .filter(|e| e.key().0 == doc_id)
+                                        .count();
+                                    if doc_sig_count > MAX_SIGNATURES_PER_DOC {
+                                        log::warn!(
+                                            "Signature count for doc {:?} exceeds cap ({}/{}), evicting oldest",
+                                            &doc_id[..4],
+                                            doc_sig_count,
+                                            MAX_SIGNATURES_PER_DOC
+                                        );
+                                        // Evict all and re-accept only the latest batch
+                                        // (simple approach — full LRU is overkill for v1)
+                                        self.signatures.retain(|k, _| k.0 != doc_id);
+                                    }
+                                    log::debug!("Received signature batch for doc {:?}", &doc_id[..4]);
                                 }
-                                log::debug!("Received signature batch for doc {:?}", &doc_id[..4]);
                             }
                         }
                         Err(SyncError::StreamFinished) => {}

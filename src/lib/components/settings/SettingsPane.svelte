@@ -1,29 +1,149 @@
 <script lang="ts">
-  import { X } from 'lucide-svelte';
+  import { onDestroy, tick } from 'svelte';
+  import { Download, LoaderCircle, RefreshCw, X } from 'lucide-svelte';
   import { settingsState, loadSettings, saveSettings } from '../../state/settings.svelte.js';
+  import { getEffectiveThemeLabel, syncAppearancePreference } from '../../state/appearance.svelte.js';
+  import {
+    checkForUpdate,
+    ensureCurrentVersion,
+    installUpdate,
+    updateState,
+  } from '../../state/updates.svelte.js';
   import { uiState } from '../../state/ui.svelte.js';
-  import type { AppSettings } from '../../types/index.js';
+  import { ACCENT_COLORS, type AppSettings, type ThemeMode } from '../../types/index.js';
 
   let relayInput = $state('');
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
+  let pendingSettings = $state<AppSettings | null>(null);
+  const MODE_OPTIONS: ThemeMode[] = ['system', 'light', 'dark'];
+
+  onDestroy(() => {
+    if (saveTimer) {
+      clearTimeout(saveTimer);
+      saveTimer = null;
+    }
+    if (pendingSettings) {
+      void saveSettings(pendingSettings);
+      pendingSettings = null;
+    }
+  });
 
   // Load settings on mount
   $effect(() => {
     if (!settingsState.settings && !settingsState.loading) {
       void loadSettings();
     }
+    void ensureCurrentVersion();
   });
+
+  const updateStatus = $derived(updateState.status);
+  const updateInfo = $derived(updateState.info);
+  const currentVersion = $derived(updateState.currentVersion);
+  const updateProgress = $derived(updateState.progress);
+  const lastCheckResult = $derived(updateState.lastCheckResult);
+
+  function formatCheckedAt(timestamp: number | null) {
+    if (!timestamp) return 'never';
+    return new Date(timestamp).toLocaleString([], {
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+    });
+  }
+
+  function handleManualUpdateCheck() {
+    void checkForUpdate(false);
+  }
+
+  function handleInstallUpdate() {
+    void installUpdate();
+  }
 
   function update(patch: Partial<AppSettings>) {
     if (!settingsState.settings) return;
     const next = { ...settingsState.settings, ...patch };
     settingsState.settings = next;
+    pendingSettings = next;
+    syncAppearancePreference(next.appearance, false);
 
     // Debounced save
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
       void saveSettings(next);
+      pendingSettings = null;
+      saveTimer = null;
     }, 400);
+  }
+
+  function updateAppearance(patch: Partial<AppSettings['appearance']>) {
+    if (!settingsState.settings) return;
+    update({
+      appearance: {
+        ...settingsState.settings.appearance,
+        ...patch,
+      },
+    });
+  }
+
+  function setThemeMode(mode: ThemeMode) {
+    updateAppearance({ mode });
+  }
+
+  function moveThemeMode(step: number) {
+    if (!settingsState.settings) return;
+    const currentIndex = MODE_OPTIONS.indexOf(settingsState.settings.appearance.mode);
+    const nextIndex = (currentIndex + step + MODE_OPTIONS.length) % MODE_OPTIONS.length;
+    setThemeMode(MODE_OPTIONS[nextIndex]!);
+  }
+
+  async function handleModeKeydown(event: KeyboardEvent) {
+    if (event.key === 'ArrowRight' || event.key === 'ArrowDown') {
+      event.preventDefault();
+      moveThemeMode(1);
+      await tick();
+      (event.currentTarget as HTMLButtonElement)
+        .parentElement
+        ?.querySelector<HTMLButtonElement>('[role="radio"][aria-checked="true"]')
+        ?.focus();
+    }
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      moveThemeMode(-1);
+      await tick();
+      (event.currentTarget as HTMLButtonElement)
+        .parentElement
+        ?.querySelector<HTMLButtonElement>('[role="radio"][aria-checked="true"]')
+        ?.focus();
+    }
+  }
+
+  function moveAccent(step: number) {
+    if (!settingsState.settings) return;
+    const currentIndex = ACCENT_COLORS.findIndex((accent) => accent.id === settingsState.settings?.appearance.accent);
+    const nextIndex = (currentIndex + step + ACCENT_COLORS.length) % ACCENT_COLORS.length;
+    updateAppearance({ accent: ACCENT_COLORS[nextIndex]!.id });
+  }
+
+  async function handleAccentKeydown(event: KeyboardEvent) {
+    if (event.key === 'ArrowRight' || event.key === 'ArrowDown') {
+      event.preventDefault();
+      moveAccent(1);
+      await tick();
+      (event.currentTarget as HTMLButtonElement)
+        .parentElement
+        ?.querySelector<HTMLButtonElement>('[role="radio"][aria-checked="true"]')
+        ?.focus();
+    }
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      moveAccent(-1);
+      await tick();
+      (event.currentTarget as HTMLButtonElement)
+        .parentElement
+        ?.querySelector<HTMLButtonElement>('[role="radio"][aria-checked="true"]')
+        ?.focus();
+    }
   }
 
   function addRelay() {
@@ -59,6 +179,10 @@
     <div class="settings-scroll">
       <div class="settings-content">
         <h1 class="settings-title">settings</h1>
+
+        {#if settingsState.error}
+          <div class="settings-error" role="status">{settingsState.error}</div>
+        {/if}
 
         <section class="section">
           <h2 class="section-title">profile</h2>
@@ -121,6 +245,8 @@
               class="toggle"
               class:on={s.autoSave}
               onclick={() => update({ autoSave: !s.autoSave })}
+              role="switch"
+              aria-checked={s.autoSave}
               aria-label="toggle auto-save"
             >
               <span class="toggle-thumb"></span>
@@ -142,17 +268,135 @@
         </section>
 
         <section class="section">
-          <h2 class="section-title">theme</h2>
-          <div class="theme-picker">
-            {#each ['system', 'light', 'dark'] as theme (theme)}
+          <h2 class="section-title">appearance</h2>
+          <div class="field">
+            <span class="field-label">mode</span>
+            <div class="theme-picker" role="radiogroup" aria-label="theme mode">
+              {#each [
+                { id: 'system', label: 'system' },
+                { id: 'light', label: 'light' },
+                { id: 'dark', label: 'dark' },
+              ] as option (option.id)}
+                <button
+                  class="theme-option"
+                  class:active={s.appearance.mode === option.id}
+                  type="button"
+                  role="radio"
+                  aria-checked={s.appearance.mode === option.id}
+                  tabindex={s.appearance.mode === option.id ? 0 : -1}
+                  onkeydown={handleModeKeydown}
+                  onclick={() => setThemeMode(option.id as ThemeMode)}
+                >
+                  {option.label}
+                </button>
+              {/each}
+            </div>
+            {#if s.appearance.mode === 'system'}
+              <span class="field-hint">currently using {getEffectiveThemeLabel()} from your system</span>
+            {/if}
+          </div>
+
+          <div class="field">
+            <span class="field-label">accent</span>
+            <div class="accent-picker" role="radiogroup" aria-label="accent color">
+              {#each ACCENT_COLORS as accent (accent.id)}
+                <button
+                  class="accent-option"
+                  class:active={s.appearance.accent === accent.id}
+                  type="button"
+                  role="radio"
+                  aria-checked={s.appearance.accent === accent.id}
+                  aria-label={accent.label}
+                  title={accent.label}
+                  tabindex={s.appearance.accent === accent.id ? 0 : -1}
+                  onkeydown={handleAccentKeydown}
+                  onclick={() => updateAppearance({ accent: accent.id })}
+                >
+                  <span class="accent-swatch" style="--swatch: {accent.hex}"></span>
+                  <span class="accent-name">{accent.label}</span>
+                </button>
+              {/each}
+            </div>
+          </div>
+        </section>
+
+        <section class="section">
+          <h2 class="section-title">updates</h2>
+          <div class="update-card">
+            <div class="update-row">
+              <div>
+                <div class="field-label">current version</div>
+                <div class="update-meta">{currentVersion || 'loading...'}</div>
+              </div>
               <button
-                class="theme-option"
-                class:active={s.theme === theme}
-                onclick={() => update({ theme })}
+                class="update-check-btn"
+                type="button"
+                disabled={updateStatus === 'checking' || updateStatus === 'downloading' || updateStatus === 'installing'}
+                onclick={handleManualUpdateCheck}
               >
-                {theme}
+                {#if updateStatus === 'checking'}
+                  <LoaderCircle size={13} strokeWidth={1.8} class="spinning" />
+                  checking...
+                {:else}
+                  <RefreshCw size={13} strokeWidth={1.8} />
+                  check for updates
+                {/if}
               </button>
-            {/each}
+            </div>
+
+            <div class="update-subtle">last checked: {formatCheckedAt(updateState.lastCheckedAt)}</div>
+
+            {#if updateStatus === 'available' && updateInfo}
+              <div class="update-panel success" role="status" aria-live="polite">
+                <div class="update-panel-head">
+                  <div>
+                    <div class="update-panel-title">update v{updateInfo.version} is available</div>
+                    <div class="update-subtle">you are on v{updateInfo.currentVersion}</div>
+                  </div>
+                  <button class="update-install-btn" type="button" onclick={handleInstallUpdate}>
+                    <Download size={13} strokeWidth={1.8} />
+                    install & restart
+                  </button>
+                </div>
+                {#if updateInfo.body}
+                  <div class="update-notes">{updateInfo.body}</div>
+                {/if}
+              </div>
+            {:else if updateStatus === 'downloading'}
+              <div class="update-panel" role="status" aria-live="polite">
+                <div class="update-panel-title">downloading update... {updateProgress}%</div>
+                <div
+                  class="settings-progress-bar"
+                  role="progressbar"
+                  aria-label="settings update download progress"
+                  aria-valuemin="0"
+                  aria-valuemax="100"
+                  aria-valuenow={updateProgress}
+                >
+                  <div class="settings-progress-fill" style={`width: ${updateProgress}%`}></div>
+                </div>
+              </div>
+            {:else if updateStatus === 'installing'}
+              <div class="update-panel" role="status" aria-live="polite">
+                <div class="update-panel-title">installing update...</div>
+                <div class="update-subtle">the app will relaunch when finished</div>
+              </div>
+            {:else if updateStatus === 'ready'}
+              <div class="update-panel success" role="status" aria-live="polite">
+                <div class="update-panel-title">update installed</div>
+                <div class="update-subtle">relaunching now...</div>
+              </div>
+            {:else if updateStatus === 'error' && updateState.error}
+              <div class="update-panel error" role="status" aria-live="polite">
+                <div class="update-panel-title">could not update the app</div>
+                <div class="update-notes">{updateState.error}</div>
+              </div>
+            {:else if lastCheckResult === 'up-to-date'}
+              <div class="update-panel success" role="status" aria-live="polite">
+                <div class="update-panel-title">you’re up to date</div>
+                <div class="update-subtle">no newer release was found on GitHub</div>
+              </div>
+            {/if}
           </div>
         </section>
 
@@ -240,6 +484,16 @@
     line-height: 1.15;
   }
 
+  .settings-error {
+    margin-bottom: 20px;
+    padding: 10px 12px;
+    border: 1px solid var(--danger-border);
+    border-radius: 12px;
+    background: var(--danger-bg);
+    color: var(--danger-fg);
+    font-size: 13px;
+  }
+
   .section {
     margin-bottom: 36px;
   }
@@ -270,6 +524,11 @@
     font-size: 13px;
     font-weight: 450;
     color: var(--text-primary);
+  }
+
+  .field-hint {
+    font-size: 12px;
+    color: var(--text-tertiary);
   }
 
   .field-input {
@@ -360,8 +619,115 @@
   }
 
   .relay-remove:hover {
-    color: #c0392b;
-    background: rgba(192, 57, 43, 0.08);
+    color: var(--danger-fg);
+    background: var(--danger-bg);
+  }
+
+  .update-card {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 16px;
+    background: var(--surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: 16px;
+  }
+
+  .update-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .update-meta,
+  .update-subtle {
+    font-size: 12px;
+    color: var(--text-tertiary);
+  }
+
+  .update-check-btn,
+  .update-install-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 9px 14px;
+    border-radius: 10px;
+    border: 1px solid var(--border-subtle);
+    background: var(--surface-sidebar);
+    color: var(--text-primary);
+    font-size: 13px;
+    font-weight: 500;
+    white-space: nowrap;
+    transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
+  }
+
+  .update-check-btn:hover,
+  .update-install-btn:hover {
+    background: var(--surface-hover);
+    border-color: var(--accent);
+  }
+
+  .update-check-btn:disabled,
+  .update-install-btn:disabled {
+    opacity: 0.6;
+    cursor: default;
+  }
+
+  .update-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 14px;
+    border-radius: 12px;
+    background: var(--surface-sidebar);
+    border: 1px solid var(--border-subtle);
+  }
+
+  .update-panel.success {
+    border-color: color-mix(in srgb, var(--accent) 35%, var(--border-subtle));
+    background: color-mix(in srgb, var(--accent) 10%, var(--surface-sidebar));
+  }
+
+  .update-panel.error {
+    border-color: var(--danger-border);
+    background: var(--danger-bg);
+  }
+
+  .update-panel-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .update-panel-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .update-notes {
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+  }
+
+  .settings-progress-bar {
+    width: 100%;
+    height: 6px;
+    border-radius: 999px;
+    background: var(--border-subtle);
+    overflow: hidden;
+  }
+
+  .settings-progress-fill {
+    height: 100%;
+    background: var(--accent);
+    border-radius: inherit;
+    transition: width 0.25s ease;
   }
 
   /* Toggle switch */
@@ -386,9 +752,9 @@
     width: 16px;
     height: 16px;
     border-radius: 50%;
-    background: white;
+    background: var(--accent-contrast);
     transition: transform var(--transition-fast);
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+    box-shadow: var(--shadow-sm);
   }
 
   .toggle.on .toggle-thumb {
@@ -427,5 +793,61 @@
     background: var(--surface-active);
     color: var(--accent);
     font-weight: 500;
+  }
+
+  .accent-picker {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+  }
+
+  .accent-option {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    border: 1px solid var(--border-subtle);
+    border-radius: 12px;
+    background: var(--surface);
+    transition: border-color var(--transition-fast), background var(--transition-fast), transform var(--transition-fast);
+  }
+
+  .accent-option:hover {
+    background: var(--surface-hover);
+  }
+
+  .accent-option.active {
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 10%, var(--surface));
+  }
+
+  .accent-swatch {
+    width: 18px;
+    height: 18px;
+    border-radius: 999px;
+    background: var(--swatch);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--surface) 72%, transparent);
+    flex-shrink: 0;
+  }
+
+  .accent-name {
+    font-size: 13px;
+    color: var(--text-primary);
+  }
+
+  @media (max-width: 720px) {
+    .settings-scroll {
+      padding: 0 20px 64px;
+    }
+
+    .update-row,
+    .update-panel-head {
+      flex-direction: column;
+      align-items: stretch;
+    }
+
+    .accent-picker {
+      grid-template-columns: 1fr;
+    }
   }
 </style>

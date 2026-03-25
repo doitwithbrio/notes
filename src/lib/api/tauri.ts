@@ -13,7 +13,7 @@ import type {
   BackendSyncStatusEvent,
   BackendUnseenDocInfo,
   BackendVersion,
-  BackendDocBlame,
+  UpdateInfo,
 } from '../types/index.js';
 import { assertTauriRuntime } from '../runtime/tauri.js';
 
@@ -34,7 +34,8 @@ export const tauriApi = {
   listProjects: () => guardedInvoke<string[]>('list_projects'),
   listProjectSummaries: () => guardedInvoke<BackendProjectSummary[]>('list_project_summaries'),
   createProject: (name: string) => guardedInvoke<void>('create_project', { name }),
-  openProject: (name: string) => guardedInvoke<void>('open_project', { name }),
+  openProject: (name: string, connectPeers = false) =>
+    guardedInvoke<void>('open_project', { name, connectPeers }),
   listFiles: (project: string) => guardedInvoke<BackendDocInfo[]>('list_files', { project }),
   createNote: (project: string, path: string) =>
     guardedInvoke<string>('create_note', { project, path }),
@@ -58,6 +59,16 @@ export const tauriApi = {
     guardedInvoke<void>('compact_doc', { project, docId }),
   getPeerStatus: (project: string) =>
     guardedInvoke<BackendPeerStatusSummary[]>('get_peer_status', { project }),
+  // Invite & peer management
+  generateInvite: (project: string, role: 'editor' | 'viewer') =>
+    guardedInvoke<import('../types/index.js').GenerateInviteResult>('generate_invite', { project, role }),
+  acceptInvite: (passphrase: string, ownerPeerId: string) =>
+    guardedInvoke<import('../types/index.js').AcceptInviteResult>('accept_invite', { passphrase, ownerPeerId }),
+  addPeer: (project: string, peerIdStr: string) =>
+    guardedInvoke<void>('add_peer', { project, peerIdStr }),
+  removePeer: (project: string, peerIdStr: string) =>
+    guardedInvoke<void>('remove_peer', { project, peerIdStr }),
+  getPeerId: () => guardedInvoke<string>('get_peer_id'),
   getActorAliases: (project: string) =>
     guardedInvoke<Record<string, string>>('get_actor_aliases', { project }),
   // Version system
@@ -70,8 +81,6 @@ export const tauriApi = {
     guardedInvoke<string>('get_version_text', { project, docId, versionId }),
   restoreToVersion: (project: string, docId: string, versionId: string) =>
     guardedInvoke<void>('restore_to_version_cmd', { project, docId, versionId }),
-  getDocBlame: (project: string, docId: string) =>
-    guardedInvoke<BackendDocBlame>('get_doc_blame', { project, docId }),
   searchNotes: (query: string, limit?: number) =>
     guardedInvoke<BackendSearchResult[]>('search_notes', { query, limit }),
   searchProjectNotes: (query: string, project: string, limit?: number) =>
@@ -90,4 +99,8 @@ export const tauriApi = {
     guardedListen<BackendPeerStatusEvent>('p2p:peer-status', handler),
   onPresenceUpdate: (handler: (payload: BackendPresenceEvent) => void): Promise<UnlistenFn> =>
     guardedListen<BackendPresenceEvent>('p2p:presence-update', handler),
+
+  // ── Auto-update ──────────────────────────────────────────────────
+  /** Ask the Rust backend to fetch latest.json and compare versions. */
+  checkForUpdate: () => guardedInvoke<UpdateInfo | null>('check_for_update'),
 };

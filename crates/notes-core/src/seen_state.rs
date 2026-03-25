@@ -33,14 +33,21 @@ pub struct ProjectSeenState {
 }
 
 impl ProjectSeenState {
-    /// Mark a document as "seen" by recording its current heads.
-    pub fn mark_seen(&mut self, doc_id: &DocId, doc: &mut AutoCommit) {
-        let heads: Vec<String> = doc
-            .get_heads()
+    fn collect_heads(doc: &mut AutoCommit) -> Vec<String> {
+        doc.get_heads()
             .iter()
             .map(|h| hex_encode(h.as_ref()))
-            .collect();
+            .collect()
+    }
 
+    /// Mark a document as "seen" by recording its current heads.
+    pub fn mark_seen(&mut self, doc_id: &DocId, doc: &mut AutoCommit) {
+        let heads = Self::collect_heads(doc);
+        self.mark_seen_heads(doc_id, heads);
+    }
+
+    pub fn mark_seen_heads(&mut self, doc_id: &DocId, heads: Vec<String>) {
+        
         self.docs.insert(
             doc_id.to_string(),
             DocSeenState {
@@ -53,16 +60,16 @@ impl ProjectSeenState {
     /// Check if a document has unseen changes.
     /// Returns true if the doc's current heads differ from the last-seen heads.
     pub fn has_unseen_changes(&self, doc_id: &DocId, doc: &mut AutoCommit) -> bool {
-        let current_heads: Vec<String> = doc
-            .get_heads()
-            .iter()
-            .map(|h| hex_encode(h.as_ref()))
-            .collect();
+        let current_heads = Self::collect_heads(doc);
+        self.has_unseen_changes_from_heads(doc_id, &current_heads)
+    }
+
+    pub fn has_unseen_changes_from_heads(&self, doc_id: &DocId, current_heads: &[String]) -> bool {
 
         match self.docs.get(&doc_id.to_string()) {
             Some(seen) => {
                 // Compare head sets (order-independent)
-                let mut current_sorted = current_heads.clone();
+                let mut current_sorted = current_heads.to_vec();
                 current_sorted.sort();
                 let mut seen_sorted = seen.last_seen_heads.clone();
                 seen_sorted.sort();

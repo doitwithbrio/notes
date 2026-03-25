@@ -6,7 +6,7 @@ use crate::error::CoreError;
 use crate::types::*;
 
 /// Helper to extract a string from an Automerge Value.
-fn value_to_string(val: automerge::Value<'_>) -> Option<String> {
+pub fn value_to_string(val: automerge::Value<'_>) -> Option<String> {
     val.into_string().ok()
 }
 
@@ -75,6 +75,242 @@ impl ProjectManifest {
             .and_then(|(v, _)| value_to_string(v))
             .ok_or_else(|| CoreError::InvalidData("manifest missing projectId".into()))
     }
+
+    /// Get the project creation timestamp.
+    pub fn created(&self) -> Option<String> {
+        self.doc
+            .get(automerge::ROOT, "created")
+            .ok()
+            .flatten()
+            .and_then(|(v, _)| value_to_string(v))
+    }
+
+    // ── Project metadata ──────────────────────────────────────────────
+
+    /// Set the project name.
+    pub fn set_name(&mut self, name: &str) -> Result<(), CoreError> {
+        self.doc.put(automerge::ROOT, "name", name)?;
+        Ok(())
+    }
+
+    /// Get the project emoji (optional).
+    pub fn emoji(&self) -> Option<String> {
+        self.doc
+            .get(automerge::ROOT, "emoji")
+            .ok()
+            .flatten()
+            .and_then(|(v, _)| value_to_string(v))
+    }
+
+    /// Set the project emoji.
+    pub fn set_emoji(&mut self, emoji: &str) -> Result<(), CoreError> {
+        self.doc.put(automerge::ROOT, "emoji", emoji)?;
+        Ok(())
+    }
+
+    /// Get the project description (optional).
+    pub fn description(&self) -> Option<String> {
+        self.doc
+            .get(automerge::ROOT, "description")
+            .ok()
+            .flatten()
+            .and_then(|(v, _)| value_to_string(v))
+    }
+
+    /// Set the project description.
+    pub fn set_description(&mut self, desc: &str) -> Result<(), CoreError> {
+        self.doc.put(automerge::ROOT, "description", desc)?;
+        Ok(())
+    }
+
+    /// Get the project color (from preset palette).
+    pub fn color(&self) -> Option<String> {
+        self.doc
+            .get(automerge::ROOT, "color")
+            .ok()
+            .flatten()
+            .and_then(|(v, _)| value_to_string(v))
+    }
+
+    /// Set the project color (must be one of the preset palette names).
+    pub fn set_color(&mut self, color: &str) -> Result<(), CoreError> {
+        const PALETTE: &[&str] = &[
+            "blue", "red", "green", "purple", "orange", "pink", "teal", "yellow", "gray", "indigo",
+            "amber", "rose",
+        ];
+        if !PALETTE.contains(&color) && !color.is_empty() {
+            return Err(CoreError::InvalidInput(format!(
+                "invalid color '{color}', must be one of: {}",
+                PALETTE.join(", ")
+            )));
+        }
+        self.doc.put(automerge::ROOT, "color", color)?;
+        Ok(())
+    }
+
+    /// Get whether the project is archived.
+    pub fn is_archived(&self) -> bool {
+        self.doc
+            .get(automerge::ROOT, "archived")
+            .ok()
+            .flatten()
+            .and_then(|(v, _)| v.to_bool())
+            .unwrap_or(false)
+    }
+
+    /// Set the archived state.
+    pub fn set_archived(&mut self, archived: bool) -> Result<(), CoreError> {
+        self.doc.put(automerge::ROOT, "archived", archived)?;
+        Ok(())
+    }
+
+    // ── Todo management ──────────────────────────────────────────────
+
+    /// Get or create the `todos` map in the manifest.
+    fn todos_map_id(&mut self) -> Result<automerge::ObjId, CoreError> {
+        if let Some((automerge::Value::Object(ObjType::Map), id)) =
+            self.doc.get(automerge::ROOT, "todos")?
+        {
+            return Ok(id);
+        }
+        // Create the todos map if it doesn't exist
+        let id = self
+            .doc
+            .put_object(automerge::ROOT, "todos", ObjType::Map)?;
+        Ok(id)
+    }
+
+    /// Get the `todos` map ID for reading (returns None if it doesn't exist).
+    fn todos_map_id_read(&self) -> Option<automerge::ObjId> {
+        self.doc
+            .get(automerge::ROOT, "todos")
+            .ok()
+            .flatten()
+            .and_then(|(v, id)| match v {
+                automerge::Value::Object(ObjType::Map) => Some(id),
+                _ => None,
+            })
+    }
+
+    /// Add a todo item. Returns its UUID.
+    pub fn add_todo(
+        &mut self,
+        text: &str,
+        created_by: &str,
+        linked_doc_id: Option<&str>,
+    ) -> Result<uuid::Uuid, CoreError> {
+        let todos_id = self.todos_map_id()?;
+        let todo_id = uuid::Uuid::new_v4();
+        let now = Utc::now().to_rfc3339();
+
+        let entry_id =
+            self.doc
+                .put_object(&todos_id, todo_id.to_string().as_str(), ObjType::Map)?;
+        self.doc.put(&entry_id, "text", text)?;
+        self.doc.put(&entry_id, "done", false)?;
+        self.doc.put(&entry_id, "createdBy", created_by)?;
+        self.doc.put(&entry_id, "createdAt", now.as_str())?;
+        if let Some(doc_id) = linked_doc_id {
+            self.doc.put(&entry_id, "linkedDocId", doc_id)?;
+        }
+
+        Ok(todo_id)
+    }
+
+    /// Toggle a todo's done state.
+    pub fn toggle_todo(&mut self, todo_id: &str) -> Result<bool, CoreError> {
+        let todos_id = self.todos_map_id()?;
+        let entry = self
+            .doc
+            .get(&todos_id, todo_id)?
+            .ok_or_else(|| CoreError::InvalidData(format!("todo not found: {todo_id}")))?;
+        let (_, entry_id) = entry;
+
+        let current_done = self
+            .doc
+            .get(&entry_id, "done")?
+            .and_then(|(v, _)| v.to_bool())
+            .unwrap_or(false);
+
+        let new_done = !current_done;
+        self.doc.put(&entry_id, "done", new_done)?;
+        Ok(new_done)
+    }
+
+    /// Remove a todo.
+    pub fn remove_todo(&mut self, todo_id: &str) -> Result<(), CoreError> {
+        let todos_id = self.todos_map_id()?;
+        self.doc.delete(&todos_id, todo_id)?;
+        Ok(())
+    }
+
+    /// Update a todo's text.
+    pub fn update_todo_text(&mut self, todo_id: &str, text: &str) -> Result<(), CoreError> {
+        let todos_id = self.todos_map_id()?;
+        let entry = self
+            .doc
+            .get(&todos_id, todo_id)?
+            .ok_or_else(|| CoreError::InvalidData(format!("todo not found: {todo_id}")))?;
+        let (_, entry_id) = entry;
+        self.doc.put(&entry_id, "text", text)?;
+        Ok(())
+    }
+
+    /// List all todos in the project.
+    pub fn list_todos(&self) -> Result<Vec<TodoItem>, CoreError> {
+        let todos_id = match self.todos_map_id_read() {
+            Some(id) => id,
+            None => return Ok(vec![]),
+        };
+
+        let mut todos = Vec::new();
+        for key in self.doc.keys(&todos_id) {
+            if let Some((automerge::Value::Object(ObjType::Map), entry_id)) =
+                self.doc.get(&todos_id, key.as_str())?
+            {
+                let text = self
+                    .doc
+                    .get(&entry_id, "text")?
+                    .and_then(|(v, _)| value_to_string(v))
+                    .unwrap_or_default();
+                let done = self
+                    .doc
+                    .get(&entry_id, "done")?
+                    .and_then(|(v, _)| v.to_bool())
+                    .unwrap_or(false);
+                let created_by = self
+                    .doc
+                    .get(&entry_id, "createdBy")?
+                    .and_then(|(v, _)| value_to_string(v))
+                    .unwrap_or_default();
+                let created_at = self
+                    .doc
+                    .get(&entry_id, "createdAt")?
+                    .and_then(|(v, _)| value_to_string(v))
+                    .unwrap_or_default();
+                let linked_doc_id = self
+                    .doc
+                    .get(&entry_id, "linkedDocId")?
+                    .and_then(|(v, _)| value_to_string(v));
+
+                todos.push(TodoItem {
+                    id: key.to_string(),
+                    text,
+                    done,
+                    created_by,
+                    created_at,
+                    linked_doc_id,
+                });
+            }
+        }
+
+        // Sort: undone first, then by created_at
+        todos.sort_by(|a, b| a.done.cmp(&b.done).then(a.created_at.cmp(&b.created_at)));
+
+        Ok(todos)
+    }
+
+    // ── File management ──────────────────────────────────────────────
 
     /// Register a new file in the manifest. Returns the file's UUID.
     pub fn add_file(&mut self, path: &str, file_type: FileType) -> Result<DocId, CoreError> {

@@ -6,18 +6,28 @@
   let query = $state('');
   let inputEl: HTMLInputElement;
 
-  const filtered = $derived(
-    query.trim()
-      ? documentState.docs.filter((d) =>
-          d.title.toLowerCase().includes(query.toLowerCase()),
-        )
-      : documentState.docs,
+  const searchableDocs = $derived(
+    documentState.docs.map((doc) => ({
+      doc,
+      titleLower: doc.title.toLowerCase(),
+    })),
   );
 
+  const filtered = $derived.by(() => {
+    const normalized = query.trim().toLowerCase();
+    const matches = normalized
+      ? searchableDocs.filter(({ titleLower }) => titleLower.includes(normalized))
+      : searchableDocs;
+    return matches.slice(0, 100).map(({ doc }) => doc);
+  });
+
   const selectedIndex = $state({ value: 0 });
+  const loading = $derived(
+    documentState.loading || documentState.loadingProjectIds.length > 0,
+  );
 
   async function select(docId: string) {
-    const doc = documentState.docs.find((entry) => entry.id === docId);
+    const doc = searchableDocs.find((entry) => entry.doc.id === docId)?.doc;
     if (!doc) return;
     await openEditorSession(doc.projectId, doc.id);
     uiState.quickOpenVisible = false;
@@ -73,7 +83,9 @@
       {/each}
 
       {#if filtered.length === 0}
-        <div class="no-results">no matching notes</div>
+        <div class="no-results">
+          {loading && !query.trim() ? 'loading notes...' : 'no matching notes'}
+        </div>
       {/if}
     </div>
   </div>
@@ -87,7 +99,7 @@
     display: flex;
     justify-content: center;
     padding-top: 100px;
-    background: rgba(250, 247, 242, 0.6);
+    background: var(--overlay-backdrop);
     backdrop-filter: blur(2px);
     -webkit-backdrop-filter: blur(2px);
     animation: fadeIn 150ms ease;

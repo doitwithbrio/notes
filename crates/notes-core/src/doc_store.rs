@@ -29,6 +29,11 @@ pub struct DocStore {
     device_actor_id: Option<automerge::ActorId>,
 }
 
+pub struct AppliedIncremental {
+    pub current_heads: Vec<String>,
+    pub new_changes: Vec<(String, Vec<u8>)>,
+}
+
 impl DocStore {
     pub fn new() -> Self {
         Self {
@@ -134,8 +139,24 @@ impl DocStore {
         id: &DocId,
         data: &[u8],
     ) -> Result<(), CoreError> {
+        self.apply_incremental_and_collect(id, data).await?;
+        Ok(())
+    }
+
+    pub async fn apply_incremental_and_collect(
+        &self,
+        id: &DocId,
+        data: &[u8],
+    ) -> Result<AppliedIncremental, CoreError> {
+        let doc_arc = self.get_doc(id)?;
+        let mut doc = doc_arc.write().await;
+        let heads_before = doc.get_heads().to_vec();
+
         if data.is_empty() {
-            return Ok(());
+            return Ok(AppliedIncremental {
+                current_heads: heads_before.iter().map(|head| head.to_string()).collect(),
+                new_changes: Vec::new(),
+            });
         }
         const MAX_INCREMENTAL_SIZE: usize = 16 * 1024 * 1024; // 16 MB
         if data.len() > MAX_INCREMENTAL_SIZE {
@@ -144,11 +165,18 @@ impl DocStore {
                 data.len()
             )));
         }
-        let doc_arc = self.get_doc(id)?;
-        let mut doc = doc_arc.write().await;
         doc.load_incremental(data)?;
+        let new_changes = doc
+            .get_changes(&heads_before)
+            .into_iter()
+            .map(|change| (change.hash().to_string(), change.raw_bytes().to_vec()))
+            .collect();
+        let current_heads = doc.get_heads().iter().map(|head| head.to_string()).collect();
         self.dirty.insert(*id, ());
-        Ok(())
+        Ok(AppliedIncremental {
+            current_heads,
+            new_changes,
+        })
     }
 
     /// Generate a sync message for a peer.

@@ -95,7 +95,7 @@ export function sortable(node: HTMLElement, options: SortableOptions) {
     ghostEl.style.zIndex = '9999';
     ghostEl.style.opacity = '0.85';
     ghostEl.style.transition = 'none';
-    ghostEl.style.boxShadow = '0 4px 12px rgba(0,0,0,0.08)';
+    ghostEl.style.boxShadow = 'var(--shadow-lg)';
     ghostEl.style.borderRadius = '8px';
     ghostEl.style.background = 'var(--surface)';
     document.body.appendChild(ghostEl);

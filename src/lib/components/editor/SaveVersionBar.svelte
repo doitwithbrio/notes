@@ -123,7 +123,7 @@
     font-size: 11px;
     font-weight: 600;
     background: var(--accent);
-    color: var(--white);
+    color: var(--accent-contrast);
     padding: 4px 10px;
     border-radius: 8px;
     transition: opacity var(--transition-fast);

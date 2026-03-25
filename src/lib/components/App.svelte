@@ -2,22 +2,55 @@
   import { onMount } from 'svelte';
 
   import { initializeApp, appSessionState, teardownAppSession } from '../state/app-session.svelte.js';
-  import { closeEditorSession } from '../session/editor-session.svelte.js';
-  import { uiState, toggleBlame } from '../state/ui.svelte.js';
+  import { closeEditorSession, editorSessionState } from '../session/editor-session.svelte.js';
+  import { teardownAppearance } from '../state/appearance.svelte.js';
+  import { uiState } from '../state/ui.svelte.js';
   import { projectState } from '../state/projects.svelte.js';
   import { getActiveDoc } from '../state/documents.svelte.js';
   import { isMac } from '../utils/platform.js';
   import Sidebar from './sidebar/Sidebar.svelte';
-  import EditorPane from './editor/EditorPane.svelte';
   import ProjectOverview from './editor/ProjectOverview.svelte';
-  import QuickOpen from './sidebar/QuickOpen.svelte';
   import RightSidebar from './rightsidebar/RightSidebar.svelte';
-  import SettingsPane from './settings/SettingsPane.svelte';
+  import UpdateBanner from './UpdateBanner.svelte';
+  import { inviteState } from '../state/invite.svelte.js';
 
   const activeDoc = $derived(getActiveDoc());
   const activeProject = $derived(
     projectState.projects.find((project) => project.id === uiState.activeProjectId) ?? null,
   );
+
+  let editorPanePromise = $state<Promise<typeof import('./editor/EditorPane.svelte')> | null>(null);
+  let settingsPanePromise = $state<Promise<typeof import('./settings/SettingsPane.svelte')> | null>(null);
+  let quickOpenPromise = $state<Promise<typeof import('./sidebar/QuickOpen.svelte')> | null>(null);
+  let shareDialogPromise = $state<Promise<typeof import('./dialogs/ShareDialog.svelte')> | null>(null);
+  let joinDialogPromise = $state<Promise<typeof import('./dialogs/JoinDialog.svelte')> | null>(null);
+
+  $effect(() => {
+    if ((activeDoc || editorSessionState.loading) && !editorPanePromise) {
+      editorPanePromise = import('./editor/EditorPane.svelte');
+    }
+  });
+
+  $effect(() => {
+    if (uiState.view === 'settings' && !settingsPanePromise) {
+      settingsPanePromise = import('./settings/SettingsPane.svelte');
+    }
+  });
+
+  $effect(() => {
+    if (uiState.quickOpenVisible && !quickOpenPromise) {
+      quickOpenPromise = import('./sidebar/QuickOpen.svelte');
+    }
+  });
+
+  $effect(() => {
+    if (inviteState.shareDialogOpen && !shareDialogPromise) {
+      shareDialogPromise = import('./dialogs/ShareDialog.svelte');
+    }
+    if (inviteState.joinDialogOpen && !joinDialogPromise) {
+      joinDialogPromise = import('./dialogs/JoinDialog.svelte');
+    }
+  });
 
   onMount(() => {
     void initializeApp();
@@ -29,6 +62,7 @@
     window.addEventListener('beforeunload', handleBeforeUnload);
     return () => {
       window.removeEventListener('beforeunload', handleBeforeUnload);
+      teardownAppearance();
       teardownAppSession();
       void closeEditorSession();
     };
@@ -39,10 +73,6 @@
     if (mod && e.key === 'f') {
       e.preventDefault();
       uiState.quickOpenVisible = !uiState.quickOpenVisible;
-    }
-    if (mod && e.shiftKey && (e.key === 'B' || e.key === 'b')) {
-      e.preventDefault();
-      toggleBlame();
     }
     if (e.key === 'Escape') {
       uiState.quickOpenVisible = false;
@@ -61,21 +91,53 @@
   </div>
 
   <div class="editor-panel">
-    {#if appSessionState.booting}
-      <div class="app-message">
-        <p class="title">loading notes...</p>
-      </div>
-    {:else if appSessionState.error}
+    <UpdateBanner />
+    {#if appSessionState.error}
       <div class="app-message">
         <p class="title">could not load notes</p>
         <p class="body">{appSessionState.error}</p>
       </div>
     {:else}
       {#if uiState.view === 'settings'}
-        <SettingsPane />
+        {#if settingsPanePromise}
+          {#await settingsPanePromise then settingsPaneModule}
+            {@const SettingsPane = settingsPaneModule.default}
+            <SettingsPane />
+          {:catch error}
+            <div class="app-message inline-message">
+              <p class="title">could not load settings</p>
+              <p class="body">{error instanceof Error ? error.message : 'Settings failed to load'}</p>
+            </div>
+          {/await}
+        {/if}
       {:else}
         <div class="main-view" class:hidden={uiState.view === 'project-overview'}>
-          <EditorPane />
+          {#if !appSessionState.ready}
+            <div class="app-message inline-message">
+              <p class="title">loading workspace...</p>
+            </div>
+          {:else if activeDoc}
+            {#if editorPanePromise}
+              {#await editorPanePromise}
+                <div class="app-message inline-message">
+                  <p class="title">loading editor...</p>
+                </div>
+              {:then editorPaneModule}
+                {@const EditorPane = editorPaneModule.default}
+                <EditorPane />
+              {:catch error}
+                <div class="app-message inline-message">
+                  <p class="title">could not load editor</p>
+                  <p class="body">{error instanceof Error ? error.message : 'Editor failed to load'}</p>
+                </div>
+              {/await}
+            {/if}
+          {:else}
+            <div class="empty-state">
+              <p class="title">no document selected</p>
+              <p class="body">pick a note from the sidebar, or create a new one</p>
+            </div>
+          {/if}
         </div>
         {#if uiState.view === 'project-overview' && activeProject}
           <ProjectOverview project={activeProject} />
@@ -93,7 +155,30 @@
 </div>
 
 {#if uiState.quickOpenVisible}
-  <QuickOpen />
+  {#if quickOpenPromise}
+    {#await quickOpenPromise then quickOpenModule}
+      {@const QuickOpen = quickOpenModule.default}
+      <QuickOpen />
+    {/await}
+  {/if}
+{/if}
+
+{#if inviteState.shareDialogOpen}
+  {#if shareDialogPromise}
+    {#await shareDialogPromise then shareDialogModule}
+      {@const ShareDialog = shareDialogModule.default}
+      <ShareDialog />
+    {/await}
+  {/if}
+{/if}
+
+{#if inviteState.joinDialogOpen}
+  {#if joinDialogPromise}
+    {#await joinDialogPromise then joinDialogModule}
+      {@const JoinDialog = joinDialogModule.default}
+      <JoinDialog />
+    {/await}
+  {/if}
 {/if}
 
 <style>
@@ -145,13 +230,20 @@
     color: var(--text-secondary);
   }
 
-  .app-message .title {
+  .inline-message,
+  .empty-state {
+    padding: 24px;
+  }
+
+  .app-message .title,
+  .empty-state .title {
     font-size: 20px;
     font-weight: 600;
     color: var(--text-primary);
   }
 
-  .app-message .body {
+  .app-message .body,
+  .empty-state .body {
     max-width: 420px;
     text-align: center;
   }

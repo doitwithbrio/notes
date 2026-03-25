@@ -172,71 +172,63 @@ impl PeerManager {
             .count()
     }
 
-    /// Start a background task that monitors connections and auto-reconnects.
-    /// Checks every `interval` and reconnects disconnected peers.
-    /// Returns a JoinHandle for the monitoring task.
-    pub fn start_monitoring(
-        self: &Arc<Self>,
-        interval: Duration,
-    ) -> tokio::task::JoinHandle<()> {
-        let this = Arc::clone(self);
-        let cancel = this.cancel.clone();
+    /// Run the background monitoring loop for peer auto-reconnects.
+    pub async fn monitoring_loop(self: Arc<Self>, interval: Duration) {
+        let cancel = self.cancel.clone();
+        let mut ticker = tokio::time::interval(interval);
 
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => {
-                        log::debug!("Peer monitoring task cancelled");
-                        break;
-                    }
-                    _ = ticker.tick() => {
-                        // Collect all registered peers across all projects
-                        let all_peers: Vec<EndpointId> = this
-                            .project_peers
-                            .iter()
-                            .flat_map(|entry| entry.value().clone())
-                            .collect();
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    log::debug!("Peer monitoring task cancelled");
+                    break;
+                }
+                _ = ticker.tick() => {
+                    // Collect all registered peers across all projects
+                    let all_peers: Vec<EndpointId> = self
+                        .project_peers
+                        .iter()
+                        .flat_map(|entry| entry.value().clone())
+                        .collect();
 
-                        for peer_id in all_peers {
-                            if !this.is_peer_connected(&peer_id) {
-                                log::debug!("Auto-reconnecting to peer {peer_id}");
-                                match this.get_or_connect(peer_id).await {
-                                    Ok(_) => {
-                                        log::info!("Auto-reconnected to peer {peer_id}");
-                                        let _ = this.status_tx.send(PeerStatusEvent {
-                                            peer_id: peer_id.to_string(),
-                                            state: PeerConnectionState::Connected,
-                                            alias: None,
-                                        });
-                                    }
-                                    Err(e) => {
-                                        log::debug!("Auto-reconnect failed for {peer_id}: {e}");
-                                    }
+                    for peer_id in all_peers {
+                        if !self.is_peer_connected(&peer_id) {
+                            log::debug!("Auto-reconnecting to peer {peer_id}");
+                            match self.get_or_connect(peer_id).await {
+                                Ok(_) => {
+                                    log::info!("Auto-reconnected to peer {peer_id}");
+                                    let _ = self.status_tx.send(PeerStatusEvent {
+                                        peer_id: peer_id.to_string(),
+                                        state: PeerConnectionState::Connected,
+                                        alias: None,
+                                    });
+                                }
+                                Err(e) => {
+                                    log::debug!("Auto-reconnect failed for {peer_id}: {e}");
                                 }
                             }
                         }
+                    }
 
-                        // Clean up dead connections from the map
-                        let dead_peers: Vec<EndpointId> = this
-                            .connections
-                            .iter()
-                            .filter(|entry| entry.close_reason().is_some())
-                            .map(|entry| *entry.key())
-                            .collect();
+                    // Clean up dead connections from the map
+                    let dead_peers: Vec<EndpointId> = self
+                        .connections
+                        .iter()
+                        .filter(|entry| entry.close_reason().is_some())
+                        .map(|entry| *entry.key())
+                        .collect();
 
-                        for peer_id in dead_peers {
-                            this.connections.remove(&peer_id);
-                            let _ = this.status_tx.send(PeerStatusEvent {
-                                peer_id: peer_id.to_string(),
-                                state: PeerConnectionState::Disconnected,
-                                alias: None,
-                            });
-                        }
+                    for peer_id in dead_peers {
+                        self.connections.remove(&peer_id);
+                        let _ = self.status_tx.send(PeerStatusEvent {
+                            peer_id: peer_id.to_string(),
+                            state: PeerConnectionState::Disconnected,
+                            alias: None,
+                        });
                     }
                 }
             }
-        })
+        }
     }
 
     /// Shut down all connections and cancel background tasks.

@@ -5,13 +5,37 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::error::CoreError;
+
+const SETTINGS_SCHEMA_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ThemeMode {
+    System,
+    Light,
+    Dark,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppearanceSettings {
+    #[serde(default = "default_theme_mode")]
+    pub mode: ThemeMode,
+
+    #[serde(default = "default_accent")]
+    pub accent: String,
+}
 
 /// Application settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+
     /// Display name for this peer (shown to others).
     #[serde(default = "default_display_name")]
     pub display_name: String,
@@ -20,9 +44,9 @@ pub struct AppSettings {
     #[serde(default)]
     pub custom_relays: Vec<String>,
 
-    /// UI theme preference.
-    #[serde(default = "default_theme")]
-    pub theme: String,
+    /// UI appearance preference.
+    #[serde(default)]
+    pub appearance: AppearanceSettings,
 
     /// Editor font size.
     #[serde(default = "default_font_size")]
@@ -48,8 +72,14 @@ pub struct AppSettings {
 fn default_display_name() -> String {
     whoami::fallible::hostname().unwrap_or_else(|_| "Unknown".to_string())
 }
-fn default_theme() -> String {
-    "system".to_string()
+fn default_schema_version() -> u32 {
+    SETTINGS_SCHEMA_VERSION
+}
+fn default_theme_mode() -> ThemeMode {
+    ThemeMode::System
+}
+fn default_accent() -> String {
+    "amber".to_string()
 }
 fn default_font_size() -> u32 {
     16
@@ -67,9 +97,10 @@ fn default_large_doc_threshold() -> u32 {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            schema_version: default_schema_version(),
             display_name: default_display_name(),
             custom_relays: vec![],
-            theme: default_theme(),
+            appearance: AppearanceSettings::default(),
             font_size: default_font_size(),
             auto_save: true,
             save_interval_secs: default_save_interval(),
@@ -79,12 +110,127 @@ impl Default for AppSettings {
     }
 }
 
+impl Default for AppearanceSettings {
+    fn default() -> Self {
+        Self {
+            mode: default_theme_mode(),
+            accent: default_accent(),
+        }
+    }
+}
+
+fn parse_theme_mode(value: Option<&Value>) -> ThemeMode {
+    match value.and_then(Value::as_str) {
+        Some("light") => ThemeMode::Light,
+        Some("dark") => ThemeMode::Dark,
+        _ => ThemeMode::System,
+    }
+}
+
+fn normalize_accent(value: &str) -> String {
+    match value {
+        "amber" | "slate" | "clay" | "olive" => value.to_string(),
+        _ => default_accent(),
+    }
+}
+
+fn parse_accent(value: Option<&Value>) -> String {
+    match value.and_then(Value::as_str) {
+        Some(valid) => normalize_accent(valid),
+        _ => default_accent(),
+    }
+}
+
+impl AppSettings {
+    pub fn normalized(mut self) -> Self {
+        self.schema_version = default_schema_version();
+        self.appearance.accent = normalize_accent(&self.appearance.accent);
+        self
+    }
+
+    fn from_value(value: Value) -> Self {
+        let defaults = Self::default();
+        let default_display_name = defaults.display_name.clone();
+        let default_custom_relays = defaults.custom_relays.clone();
+        let default_font_size = defaults.font_size;
+        let default_auto_save = defaults.auto_save;
+        let default_save_interval = defaults.save_interval_secs;
+        let default_large_doc_warning_words = defaults.large_doc_warning_words;
+        let default_idle_doc_timeout_secs = defaults.idle_doc_timeout_secs;
+        let obj = match value {
+            Value::Object(map) => map,
+            _ => return defaults,
+        };
+
+        let appearance_value = obj.get("appearance");
+        let legacy_theme = obj.get("theme");
+
+        let appearance = match appearance_value {
+            Some(Value::Object(map)) => AppearanceSettings {
+                mode: parse_theme_mode(map.get("mode")),
+                accent: parse_accent(map.get("accent")),
+            },
+            _ => AppearanceSettings {
+                mode: parse_theme_mode(legacy_theme),
+                accent: default_accent(),
+            },
+        };
+
+        Self {
+            schema_version: default_schema_version(),
+            display_name: obj
+                .get("displayName")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .unwrap_or(default_display_name),
+            custom_relays: obj
+                .get("customRelays")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                        .collect()
+                })
+                .unwrap_or(default_custom_relays),
+            appearance,
+            font_size: obj
+                .get("fontSize")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32)
+                .unwrap_or(default_font_size),
+            auto_save: obj
+                .get("autoSave")
+                .and_then(Value::as_bool)
+                .unwrap_or(default_auto_save),
+            save_interval_secs: obj
+                .get("saveIntervalSecs")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32)
+                .unwrap_or(default_save_interval),
+            large_doc_warning_words: obj
+                .get("largeDocWarningWords")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32)
+                .unwrap_or(default_large_doc_warning_words),
+            idle_doc_timeout_secs: obj
+                .get("idleDocTimeoutSecs")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32)
+                .unwrap_or(default_idle_doc_timeout_secs),
+        }
+        .normalized()
+    }
+}
+
 impl AppSettings {
     /// Load settings from disk, or return defaults if not found.
     pub async fn load(base_dir: &Path) -> Self {
         let path = base_dir.join(".p2p").join("settings.json");
         match tokio::fs::read_to_string(&path).await {
-            Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
+            Ok(json) => serde_json::from_str::<Value>(&json)
+                .map(Self::from_value)
+                .unwrap_or_default(),
             Err(_) => Self::default(),
         }
     }
@@ -154,7 +300,8 @@ mod tests {
     fn test_default_settings() {
         let settings = AppSettings::default();
         assert_eq!(settings.font_size, 16);
-        assert_eq!(settings.theme, "system");
+        assert_eq!(settings.appearance.mode, ThemeMode::System);
+        assert_eq!(settings.appearance.accent, "amber");
         assert!(settings.auto_save);
     }
 
@@ -164,6 +311,20 @@ mod tests {
         let json = serde_json::to_string(&settings).unwrap();
         let loaded: AppSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.font_size, settings.font_size);
+        assert_eq!(loaded.appearance.accent, settings.appearance.accent);
+    }
+
+    #[test]
+    fn test_load_legacy_theme_string() {
+        let legacy = serde_json::json!({
+            "displayName": "tim",
+            "theme": "dark"
+        });
+
+        let loaded = AppSettings::from_value(legacy);
+        assert_eq!(loaded.display_name, "tim");
+        assert_eq!(loaded.appearance.mode, ThemeMode::Dark);
+        assert_eq!(loaded.appearance.accent, "amber");
     }
 
     #[test]

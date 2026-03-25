@@ -9,7 +9,35 @@ use std::path::Path;
 use crate::error::CoreError;
 use crate::types::DocId;
 use crate::version::{Version, VersionSignificance, VersionType};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+
+const VERSION_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS versions (
+    id              TEXT PRIMARY KEY,
+    doc_id          TEXT NOT NULL,
+    project         TEXT NOT NULL,
+    type            TEXT NOT NULL DEFAULT 'auto',
+    name            TEXT NOT NULL,
+    label           TEXT,
+    heads_json      TEXT NOT NULL,
+    actor           TEXT NOT NULL,
+    created_at      INTEGER NOT NULL,
+    change_count    INTEGER NOT NULL DEFAULT 0,
+    chars_added     INTEGER NOT NULL DEFAULT 0,
+    chars_removed   INTEGER NOT NULL DEFAULT 0,
+    blocks_changed  INTEGER NOT NULL DEFAULT 0,
+    significance    TEXT NOT NULL DEFAULT 'significant',
+    automerge_snapshot BLOB,
+    seq             INTEGER NOT NULL DEFAULT 0
+);";
+
+const COMPACTION_LOG_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS compaction_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_id          TEXT NOT NULL,
+    compacted_at    INTEGER NOT NULL,
+    changes_before  INTEGER NOT NULL,
+    bytes_before    INTEGER NOT NULL,
+    bytes_after     INTEGER NOT NULL
+);";
 
 /// SQLite-backed version store.
 pub struct VersionStore {
@@ -30,89 +58,192 @@ impl VersionStore {
 
         conn.execute_batch("PRAGMA journal_mode=WAL;")
             .map_err(|e| CoreError::InvalidData(format!("WAL mode failed: {e}")))?;
-
-        // Create the new versions table
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS versions (
-                id              TEXT PRIMARY KEY,
-                doc_id          TEXT NOT NULL,
-                project         TEXT NOT NULL,
-                type            TEXT NOT NULL DEFAULT 'auto',
-                name            TEXT NOT NULL,
-                label           TEXT,
-                heads_json      TEXT NOT NULL,
-                actor           TEXT NOT NULL,
-                created_at      INTEGER NOT NULL,
-                change_count    INTEGER NOT NULL DEFAULT 0,
-                chars_added     INTEGER NOT NULL DEFAULT 0,
-                chars_removed   INTEGER NOT NULL DEFAULT 0,
-                blocks_changed  INTEGER NOT NULL DEFAULT 0,
-                significance    TEXT NOT NULL DEFAULT 'significant',
-                automerge_snapshot BLOB,
-                seq             INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS idx_versions_doc_seq
-                ON versions(doc_id, seq);
-            CREATE INDEX IF NOT EXISTS idx_versions_doc_time
-                ON versions(doc_id, created_at);
-
-            -- Keep the old tables for migration purposes (read-only)
-            -- They will be dropped after successful migration.
-
-            -- Compaction log (still useful)
-            CREATE TABLE IF NOT EXISTS compaction_log (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                doc_id          TEXT NOT NULL,
-                compacted_at    INTEGER NOT NULL,
-                changes_before  INTEGER NOT NULL,
-                bytes_before    INTEGER NOT NULL,
-                bytes_after     INTEGER NOT NULL
-            );",
-        )
-        .map_err(|e| CoreError::InvalidData(format!("version schema creation failed: {e}")))?;
+        Self::initialize_schema(&conn)?;
 
         Ok(Self { conn })
+    }
+
+    /// Best-effort detection for a legacy plaintext SQLite version store.
+    ///
+    /// This is used only for diagnostics so startup can preserve the file and
+    /// degrade gracefully instead of crashing. It does not mutate the DB.
+    pub fn looks_like_plaintext_sqlite(db_path: &Path) -> bool {
+        let Ok(conn) = Connection::open_with_flags(
+            db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) else {
+            return false;
+        };
+
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'versions' LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value == 1)
+        .unwrap_or(false)
     }
 
     /// Open an in-memory version store (for testing).
     pub fn open_in_memory() -> Result<Self, CoreError> {
         let conn = Connection::open_in_memory()
             .map_err(|e| CoreError::InvalidData(format!("in-memory db failed: {e}")))?;
-
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS versions (
-                id              TEXT PRIMARY KEY,
-                doc_id          TEXT NOT NULL,
-                project         TEXT NOT NULL,
-                type            TEXT NOT NULL DEFAULT 'auto',
-                name            TEXT NOT NULL,
-                label           TEXT,
-                heads_json      TEXT NOT NULL,
-                actor           TEXT NOT NULL,
-                created_at      INTEGER NOT NULL,
-                change_count    INTEGER NOT NULL DEFAULT 0,
-                chars_added     INTEGER NOT NULL DEFAULT 0,
-                chars_removed   INTEGER NOT NULL DEFAULT 0,
-                blocks_changed  INTEGER NOT NULL DEFAULT 0,
-                significance    TEXT NOT NULL DEFAULT 'significant',
-                automerge_snapshot BLOB,
-                seq             INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS idx_versions_doc_seq
-                ON versions(doc_id, seq);
-
-            CREATE TABLE IF NOT EXISTS compaction_log (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                doc_id          TEXT NOT NULL,
-                compacted_at    INTEGER NOT NULL,
-                changes_before  INTEGER NOT NULL,
-                bytes_before    INTEGER NOT NULL,
-                bytes_after     INTEGER NOT NULL
-            );",
-        )
-        .map_err(|e| CoreError::InvalidData(format!("version schema creation failed: {e}")))?;
+        Self::initialize_schema(&conn)?;
 
         Ok(Self { conn })
+    }
+
+    fn initialize_schema(conn: &Connection) -> Result<(), CoreError> {
+        conn.execute_batch(VERSION_SCHEMA_SQL)
+            .map_err(|e| CoreError::InvalidData(format!("version schema creation failed: {e}")))?;
+        conn.execute_batch(COMPACTION_LOG_SCHEMA_SQL).map_err(|e| {
+            CoreError::InvalidData(format!("compaction schema creation failed: {e}"))
+        })?;
+        Self::upgrade_versions_schema(conn)?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_versions_doc_seq ON versions(doc_id, seq);
+             CREATE INDEX IF NOT EXISTS idx_versions_doc_time ON versions(doc_id, created_at);",
+        )
+        .map_err(|e| CoreError::InvalidData(format!("version index creation failed: {e}")))?;
+        Ok(())
+    }
+
+    fn upgrade_versions_schema(conn: &Connection) -> Result<(), CoreError> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(versions)")
+            .map_err(|e| CoreError::InvalidData(format!("schema inspect failed: {e}")))?;
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| CoreError::InvalidData(format!("schema inspect failed: {e}")))?
+            .collect::<Result<_, _>>()
+            .map_err(|e| CoreError::InvalidData(format!("schema inspect failed: {e}")))?;
+
+        for (column, sql) in [
+            (
+                "type",
+                "ALTER TABLE versions ADD COLUMN type TEXT NOT NULL DEFAULT 'auto'",
+            ),
+            ("label", "ALTER TABLE versions ADD COLUMN label TEXT"),
+            (
+                "heads_json",
+                "ALTER TABLE versions ADD COLUMN heads_json TEXT NOT NULL DEFAULT '[]'",
+            ),
+            (
+                "change_count",
+                "ALTER TABLE versions ADD COLUMN change_count INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "chars_added",
+                "ALTER TABLE versions ADD COLUMN chars_added INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "chars_removed",
+                "ALTER TABLE versions ADD COLUMN chars_removed INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "blocks_changed",
+                "ALTER TABLE versions ADD COLUMN blocks_changed INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "significance",
+                "ALTER TABLE versions ADD COLUMN significance TEXT NOT NULL DEFAULT 'significant'",
+            ),
+            (
+                "automerge_snapshot",
+                "ALTER TABLE versions ADD COLUMN automerge_snapshot BLOB",
+            ),
+            (
+                "seq",
+                "ALTER TABLE versions ADD COLUMN seq INTEGER NOT NULL DEFAULT 0",
+            ),
+        ] {
+            if !columns.iter().any(|existing| existing == column) {
+                conn.execute(sql, [])
+                    .map_err(|e| CoreError::InvalidData(format!("schema upgrade failed: {e}")))?;
+            }
+        }
+
+        Self::backfill_heads_json(conn, &columns)?;
+        Self::backfill_seq(conn)?;
+        Ok(())
+    }
+
+    fn backfill_heads_json(
+        conn: &Connection,
+        existing_columns: &[String],
+    ) -> Result<(), CoreError> {
+        if existing_columns
+            .iter()
+            .any(|column| column == "last_change_hash")
+        {
+            conn.execute(
+                "UPDATE versions
+                 SET heads_json = json_array(last_change_hash)
+                 WHERE (heads_json IS NULL OR heads_json = '' OR heads_json = '[]')
+                   AND last_change_hash IS NOT NULL
+                   AND last_change_hash != ''",
+                [],
+            )
+            .map_err(|e| CoreError::InvalidData(format!("heads backfill failed: {e}")))?;
+        }
+
+        conn.execute(
+            "UPDATE versions
+             SET heads_json = '[]'
+             WHERE heads_json IS NULL OR heads_json = ''",
+            [],
+        )
+        .map_err(|e| CoreError::InvalidData(format!("heads normalization failed: {e}")))?;
+
+        Ok(())
+    }
+
+    fn backfill_seq(conn: &Connection) -> Result<(), CoreError> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, doc_id
+                 FROM versions
+                 WHERE seq <= 0
+                 ORDER BY doc_id, created_at, rowid",
+            )
+            .map_err(|e| CoreError::InvalidData(format!("seq backfill failed: {e}")))?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|e| CoreError::InvalidData(format!("seq backfill failed: {e}")))?
+            .collect::<Result<_, _>>()
+            .map_err(|e| CoreError::InvalidData(format!("seq backfill failed: {e}")))?;
+
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| CoreError::InvalidData(format!("seq backfill failed: {e}")))?;
+        let mut current_doc = String::new();
+        let mut next_seq = 0_i64;
+        for (id, doc_id) in rows {
+            if doc_id != current_doc {
+                current_doc = doc_id;
+                next_seq = tx
+                    .query_row(
+                        "SELECT COALESCE(MAX(seq), 0) FROM versions WHERE doc_id = ?1",
+                        params![current_doc.clone()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| CoreError::InvalidData(format!("seq backfill failed: {e}")))?;
+            }
+            next_seq += 1;
+
+            tx.execute(
+                "UPDATE versions SET seq = ?1 WHERE id = ?2",
+                params![next_seq, id],
+            )
+            .map_err(|e| CoreError::InvalidData(format!("seq backfill failed: {e}")))?;
+        }
+        tx.commit()
+            .map_err(|e| CoreError::InvalidData(format!("seq backfill failed: {e}")))?;
+        Ok(())
     }
 
     /// Store a new version entry.
@@ -192,8 +323,8 @@ impl VersionStore {
                 })
             })
             .map_err(|e| CoreError::InvalidData(format!("query failed: {e}")))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::InvalidData(format!("query failed: {e}")))?;
 
         Ok(versions)
     }
@@ -236,8 +367,8 @@ impl VersionStore {
         let names = stmt
             .query_map(params![doc_id.to_string()], |row| row.get(0))
             .map_err(|e| CoreError::InvalidData(format!("query failed: {e}")))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::InvalidData(format!("query failed: {e}")))?;
 
         Ok(names)
     }
@@ -313,12 +444,20 @@ impl VersionStore {
         Ok(())
     }
 
-    /// Migrate data from old history_sessions and history_snapshots tables.
-    /// This is a one-time operation called during app startup.
-    pub fn migrate_from_old_history(&self) -> Result<usize, CoreError> {
-        // Check if old tables exist
-        let has_old_sessions: bool = self
-            .conn
+    /// Migrate data from an old `history.db` into the new versions store.
+    /// Safe to run repeatedly.
+    pub fn migrate_from_legacy_history_db(
+        &self,
+        legacy_db_path: &Path,
+    ) -> Result<usize, CoreError> {
+        if !legacy_db_path.exists() {
+            return Ok(0);
+        }
+
+        let legacy = Connection::open(legacy_db_path)
+            .map_err(|e| CoreError::InvalidData(format!("legacy history db open failed: {e}")))?;
+
+        let has_old_sessions: bool = legacy
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='history_sessions'",
                 [],
@@ -332,8 +471,7 @@ impl VersionStore {
         }
 
         // Count existing old sessions
-        let count: i64 = self
-            .conn
+        let count: i64 = legacy
             .query_row("SELECT COUNT(*) FROM history_sessions", [], |row| {
                 row.get(0)
             })
@@ -348,46 +486,185 @@ impl VersionStore {
             count
         );
 
-        // Migrate each old session as an auto version
-        self.conn
-            .execute_batch(
-                "INSERT OR IGNORE INTO versions
-                 (id, doc_id, project, type, name, label, heads_json, actor,
-                  created_at, change_count, chars_added, chars_removed, blocks_changed,
-                  significance, seq)
-                 SELECT
-                    id,
-                    doc_id,
-                    project,
-                    'auto',
-                    'Migrated',  -- Will need creature name assignment
-                    NULL,
-                    json_array(last_change_hash),
-                    actor,
-                    started_at,
-                    change_count,
-                    0, 0, 0,
-                    CASE WHEN change_count > 5 THEN 'significant' ELSE 'minor' END,
-                    ROW_NUMBER() OVER (PARTITION BY doc_id ORDER BY started_at)
-                 FROM history_sessions",
+        #[derive(Debug)]
+        struct LegacySession {
+            id: String,
+            doc_id: String,
+            project: String,
+            actor: String,
+            started_at: i64,
+            change_count: i64,
+            last_change_hash: String,
+        }
+
+        let mut stmt = legacy
+            .prepare(
+                "SELECT id, doc_id, project, actor, started_at, change_count, last_change_hash
+                 FROM history_sessions
+                 ORDER BY doc_id, started_at, id",
+            )
+            .map_err(|e| CoreError::InvalidData(format!("migration failed: {e}")))?;
+        let sessions: Vec<LegacySession> = stmt
+            .query_map([], |row| {
+                Ok(LegacySession {
+                    id: row.get(0)?,
+                    doc_id: row.get(1)?,
+                    project: row.get(2)?,
+                    actor: row.get(3)?,
+                    started_at: row.get(4)?,
+                    change_count: row.get(5)?,
+                    last_change_hash: row.get(6)?,
+                })
+            })
+            .map_err(|e| CoreError::InvalidData(format!("migration failed: {e}")))?
+            .collect::<Result<_, _>>()
+            .map_err(|e| CoreError::InvalidData(format!("migration failed: {e}")))?;
+
+        let mut snapshot_stmt = legacy
+            .prepare(
+                "SELECT content
+                 FROM history_snapshots
+                 WHERE doc_id = ?1 AND captured_at <= ?2
+                 ORDER BY captured_at DESC
+                 LIMIT 1",
+            )
+            .map_err(|e| CoreError::InvalidData(format!("migration failed: {e}")))?;
+        let mut fallback_snapshot_stmt = legacy
+            .prepare(
+                "SELECT content
+                 FROM history_snapshots
+                 WHERE doc_id = ?1
+                 ORDER BY captured_at DESC
+                 LIMIT 1",
             )
             .map_err(|e| CoreError::InvalidData(format!("migration failed: {e}")))?;
 
-        // Drop old tables after successful migration
-        self.conn
-            .execute_batch(
-                "DROP TABLE IF EXISTS history_sessions;
-                 DROP TABLE IF EXISTS history_snapshots;",
-            )
-            .ok(); // Don't fail if drop fails
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| CoreError::InvalidData(format!("migration failed: {e}")))?;
+        let mut current_doc = String::new();
+        let mut next_seq = 0_i64;
+        let mut migrated = 0_usize;
 
-        Ok(count as usize)
+        for session in sessions {
+            let exists: Option<String> = tx
+                .query_row(
+                    "SELECT id FROM versions WHERE id = ?1",
+                    params![session.id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| CoreError::InvalidData(format!("migration failed: {e}")))?;
+            if exists.is_some() {
+                continue;
+            }
+
+            if session.doc_id != current_doc {
+                current_doc = session.doc_id.clone();
+                let existing_max: i64 = tx
+                    .query_row(
+                        "SELECT COALESCE(MAX(seq), 0) FROM versions WHERE doc_id = ?1",
+                        params![session.doc_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| CoreError::InvalidData(format!("migration failed: {e}")))?;
+                next_seq = existing_max + 1;
+            } else {
+                next_seq += 1;
+            }
+
+            let used_names: Vec<String> = {
+                let mut used_stmt = tx
+                    .prepare("SELECT name FROM versions WHERE doc_id = ?1")
+                    .map_err(|e| CoreError::InvalidData(format!("migration failed: {e}")))?;
+                let used_names = used_stmt
+                    .query_map(params![session.doc_id.clone()], |row| row.get(0))
+                    .map_err(|e| CoreError::InvalidData(format!("migration failed: {e}")))?
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| CoreError::InvalidData(format!("migration failed: {e}")))?;
+                used_names
+            };
+
+            let version = Version {
+                id: session.id.clone(),
+                doc_id: session.doc_id.clone(),
+                project: session.project,
+                version_type: VersionType::Auto,
+                name: crate::version::unique_creature_name(&session.id, &used_names),
+                label: None,
+                heads: vec![session.last_change_hash],
+                actor: session.actor,
+                created_at: session.started_at,
+                change_count: session.change_count.max(0) as usize,
+                chars_added: 0,
+                chars_removed: 0,
+                blocks_changed: 0,
+                significance: if session.change_count > 5 {
+                    VersionSignificance::Significant
+                } else {
+                    VersionSignificance::Minor
+                },
+                seq: next_seq,
+            };
+
+            let snapshot = snapshot_stmt
+                .query_row(params![version.doc_id.clone(), version.created_at], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })
+                .optional()
+                .map_err(|e| CoreError::InvalidData(format!("migration failed: {e}")))?
+                .or(fallback_snapshot_stmt
+                    .query_row(params![version.doc_id.clone()], |row| {
+                        row.get::<_, Vec<u8>>(0)
+                    })
+                    .optional()
+                    .map_err(|e| CoreError::InvalidData(format!("migration failed: {e}")))?);
+
+            let heads_json =
+                serde_json::to_string(&version.heads).unwrap_or_else(|_| "[]".to_string());
+            tx.execute(
+                "INSERT INTO versions
+                 (id, doc_id, project, type, name, label, heads_json, actor,
+                  created_at, change_count, chars_added, chars_removed, blocks_changed,
+                  significance, automerge_snapshot, seq)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                params![
+                    version.id,
+                    version.doc_id,
+                    version.project,
+                    version.version_type.as_str(),
+                    version.name,
+                    version.label,
+                    heads_json,
+                    version.actor,
+                    version.created_at,
+                    version.change_count as i64,
+                    version.chars_added as i64,
+                    version.chars_removed as i64,
+                    version.blocks_changed as i64,
+                    version.significance.as_str(),
+                    snapshot,
+                    version.seq,
+                ],
+            )
+            .map_err(|e| CoreError::InvalidData(format!("migration failed: {e}")))?;
+
+            migrated += 1;
+        }
+
+        tx.commit()
+            .map_err(|e| CoreError::InvalidData(format!("migration failed: {e}")))?;
+
+        Ok(migrated)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use rusqlite::Connection;
 
     fn make_test_version(id: &str, doc_id: &str, seq: i64) -> Version {
         Version {
@@ -539,5 +816,128 @@ mod tests {
 
         let not_found = store.get_version("nonexistent").unwrap();
         assert!(not_found.is_none());
+    }
+
+    #[test]
+    fn test_open_upgrades_existing_versions_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("versions.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE versions (
+                id TEXT PRIMARY KEY,
+                doc_id TEXT NOT NULL,
+                project TEXT NOT NULL,
+                name TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                last_change_hash TEXT NOT NULL
+            );
+            INSERT INTO versions (id, doc_id, project, name, actor, created_at, last_change_hash)
+            VALUES ('v1', 'doc-1', 'project', 'Legacy', 'actor', 123, 'abc123');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = VersionStore::open(&db_path, None).unwrap();
+
+        let conn = Connection::open(&db_path).unwrap();
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(versions)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(columns.contains(&"seq".to_string()));
+        assert!(columns.contains(&"heads_json".to_string()));
+
+        let heads_json: String = conn
+            .query_row(
+                "SELECT heads_json FROM versions WHERE id = 'v1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let seq: i64 = conn
+            .query_row("SELECT seq FROM versions WHERE id = 'v1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(heads_json, "[\"abc123\"]");
+        assert_eq!(seq, 1);
+
+        drop(store);
+    }
+
+    #[test]
+    fn test_migrate_from_legacy_history_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let versions_path = dir.path().join("versions.db");
+        let history_path = dir.path().join("history.db");
+
+        let store = VersionStore::open(&versions_path, None).unwrap();
+
+        let legacy = Connection::open(&history_path).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE history_sessions (
+                    id TEXT NOT NULL,
+                    doc_id TEXT NOT NULL,
+                    project TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    started_at INTEGER NOT NULL,
+                    ended_at INTEGER NOT NULL,
+                    change_count INTEGER NOT NULL,
+                    op_count INTEGER NOT NULL,
+                    first_change_hash TEXT NOT NULL,
+                    last_change_hash TEXT NOT NULL,
+                    PRIMARY KEY (id, doc_id)
+                );
+                CREATE TABLE history_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    doc_id TEXT NOT NULL,
+                    project TEXT NOT NULL,
+                    captured_at INTEGER NOT NULL,
+                    change_count INTEGER NOT NULL,
+                    word_count INTEGER NOT NULL,
+                    content BLOB NOT NULL,
+                    epoch INTEGER NOT NULL DEFAULT 0,
+                    trigger TEXT NOT NULL DEFAULT 'compaction'
+                );
+                INSERT INTO history_sessions
+                    (id, doc_id, project, actor, started_at, ended_at, change_count, op_count, first_change_hash, last_change_hash)
+                VALUES
+                    ('legacy-1', '11111111-1111-1111-1111-111111111111', 'project', 'actor-a', 10, 11, 2, 2, 'hash-a1', 'hash-a2'),
+                    ('legacy-2', '11111111-1111-1111-1111-111111111111', 'project', 'actor-a', 20, 21, 8, 3, 'hash-b1', 'hash-b2');
+                INSERT INTO history_snapshots
+                    (doc_id, project, captured_at, change_count, word_count, content, epoch, trigger)
+                VALUES
+                    ('11111111-1111-1111-1111-111111111111', 'project', 9, 2, 10, X'616263', 0, 'idle'),
+                    ('11111111-1111-1111-1111-111111111111', 'project', 19, 8, 20, X'646566', 0, 'idle');",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let migrated = store.migrate_from_legacy_history_db(&history_path).unwrap();
+        assert_eq!(migrated, 2);
+
+        let doc_id = uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let versions = store.get_versions(&doc_id).unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].seq, 2);
+        assert_eq!(versions[1].seq, 1);
+        assert_eq!(versions[0].heads, vec!["hash-b2".to_string()]);
+        assert_eq!(
+            store.get_snapshot("legacy-1").unwrap(),
+            Some(b"abc".to_vec())
+        );
+        assert_eq!(
+            store.get_snapshot("legacy-2").unwrap(),
+            Some(b"def".to_vec())
+        );
+
+        let migrated_again = store.migrate_from_legacy_history_db(&history_path).unwrap();
+        assert_eq!(migrated_again, 0);
     }
 }
