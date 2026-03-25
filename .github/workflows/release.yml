@@ -15,10 +15,12 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             arch: aarch64
+            runner: macos-latest
           - target: x86_64-apple-darwin
             arch: x64
+            runner: macos-13
 
-    runs-on: macos-latest
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - uses: actions/checkout@v4
@@ -31,7 +33,7 @@ jobs:
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: './src-tauri -> target'
+          workspaces: '. -> target'
           shared-key: ${{ matrix.target }}
 
       - name: Install bun
@@ -41,7 +43,7 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Install Tauri CLI
-        run: cargo install tauri-cli --version "^2" --locked
+        run: bun add -g @tauri-apps/cli@latest
 
       - name: Verify version
         run: |
@@ -57,30 +59,66 @@ jobs:
       - name: Build
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-        run: cargo tauri build --target ${{ matrix.target }}
+        run: tauri build --target ${{ matrix.target }}
+
+      - name: Locate bundle
+        id: bundle
+        run: |
+          BUNDLE_DIR="target/${{ matrix.target }}/release/bundle"
+          APP=$(find "$BUNDLE_DIR/macos" -name "*.app" -maxdepth 1 | head -1)
+          if [ -z "$APP" ]; then
+            echo "::error::No .app bundle found in $BUNDLE_DIR/macos"
+            ls -laR "$BUNDLE_DIR" || true
+            exit 1
+          fi
+          echo "dir=$BUNDLE_DIR" >> "$GITHUB_OUTPUT"
+          echo "app=$APP" >> "$GITHUB_OUTPUT"
+          echo "Found: $APP"
 
       - name: Ad-hoc codesign
         run: |
-          APP=$(find src-tauri/target/${{ matrix.target }}/release/bundle/macos -name "*.app" -maxdepth 1 | head -1)
-          codesign --force --deep -s - "$APP"
-          codesign --verify --deep --strict "$APP"
-          echo "Signed: $APP"
+          codesign --force --deep -s - "${{ steps.bundle.outputs.app }}"
+          codesign --verify --deep --strict "${{ steps.bundle.outputs.app }}"
+          echo "Signature OK"
 
       - name: Repackage updater tarball with signed app
         run: |
-          DIR="src-tauri/target/${{ matrix.target }}/release/bundle/macos"
-          APP=$(basename "$(find "$DIR" -name "*.app" -maxdepth 1 | head -1)")
-          TAR=$(basename "$(find "$DIR" -name "*.app.tar.gz" -maxdepth 1 | head -1)")
-          (cd "$DIR" && rm -f "$TAR" && tar czf "$TAR" "$APP")
-          echo "Repackaged: $TAR"
+          DIR="${{ steps.bundle.outputs.dir }}/macos"
+          APP_NAME=$(basename "${{ steps.bundle.outputs.app }}")
+          TAR=$(find "$DIR" -name "*.app.tar.gz" -maxdepth 1 | head -1)
+          TAR_BASE=$(basename "$TAR")
+          (cd "$DIR" && rm -f "$TAR_BASE" && tar czf "$TAR_BASE" "$APP_NAME")
+          echo "Repackaged: $TAR_BASE"
 
-      - name: Sign updater tarball
+      - name: Re-sign updater tarball
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
-          TAR=$(find src-tauri/target/${{ matrix.target }}/release/bundle/macos -name "*.app.tar.gz" | head -1)
+          DIR="${{ steps.bundle.outputs.dir }}/macos"
+          TAR=$(find "$DIR" -name "*.app.tar.gz" -maxdepth 1 | head -1)
           rm -f "${TAR}.sig"
-          cargo tauri signer sign --private-key "$TAURI_SIGNING_PRIVATE_KEY" "$TAR"
+          tauri signer sign --private-key "$TAURI_SIGNING_PRIVATE_KEY" "$TAR"
+          echo "Signed: ${TAR}.sig"
+
+      - name: Rebuild DMG with signed app
+        run: |
+          DIR="${{ steps.bundle.outputs.dir }}"
+          APP="${{ steps.bundle.outputs.app }}"
+          DMG=$(find "$DIR/dmg" -name "*.dmg" -maxdepth 1 | head -1)
+          if [ -n "$DMG" ]; then
+            DMG_NAME=$(basename "$DMG")
+            APP_NAME=$(basename "$APP")
+            rm -f "$DMG"
+            hdiutil create -volname "$APP_NAME" -srcfolder "$APP" \
+              -ov -format UDZO "$DIR/dmg/$DMG_NAME"
+            echo "Rebuilt DMG: $DMG_NAME"
+          fi
+
+      - name: Get app version
+        id: version
+        run: |
+          VER=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
 
       - name: Create draft release
         env:
@@ -88,20 +126,30 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "notes ${GITHUB_REF_NAME}" \
-            --notes '**macOS:** If you see "unidentified developer", right-click the app and select Open.' \
+            --title "notes v${{ steps.version.outputs.version }}" \
+            --notes $'**macOS:** If you see "unidentified developer", right-click the app and select Open.' \
             --draft 2>/dev/null || true
 
       - name: Upload assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
+          DIR="${{ steps.bundle.outputs.dir }}"
           TAG="$GITHUB_REF_NAME"
           REPO="$GITHUB_REPOSITORY"
 
+          # Wait for release to exist (in case the other matrix job creates it)
+          for i in $(seq 1 30); do
+            gh release view "$TAG" --repo "$REPO" &>/dev/null && break
+            echo "Waiting for release... (attempt $i)"
+            sleep 5
+          done
+
           for f in "$DIR"/dmg/*.dmg "$DIR"/macos/*.app.tar.gz "$DIR"/macos/*.app.tar.gz.sig; do
-            [ -f "$f" ] && gh release upload "$TAG" "$f" --repo "$REPO" --clobber
+            if [ -f "$f" ]; then
+              echo "Uploading: $(basename "$f")"
+              gh release upload "$TAG" "$f" --repo "$REPO" --clobber
+            fi
           done
 
   updater-json:
@@ -122,30 +170,44 @@ jobs:
           BASE="https://github.com/${REPO}/releases/download/${TAG}"
           NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-          # Download the .sig files from the release to read their contents
           mkdir -p /tmp/sigs
-          gh release download "$TAG" --repo "$REPO" --pattern "*.sig" --dir /tmp/sigs 2>/dev/null || true
+          gh release download "$TAG" --repo "$REPO" --pattern "*.sig" --dir /tmp/sigs
 
           AARCH64_SIG=""
           X64_SIG=""
-          [ -f /tmp/sigs/notes_aarch64.app.tar.gz.sig ] && AARCH64_SIG=$(cat /tmp/sigs/notes_aarch64.app.tar.gz.sig)
-          [ -f /tmp/sigs/notes_x64.app.tar.gz.sig ] && X64_SIG=$(cat /tmp/sigs/notes_x64.app.tar.gz.sig)
+          for f in /tmp/sigs/*aarch64*.app.tar.gz.sig; do
+            [ -f "$f" ] && AARCH64_SIG=$(cat "$f")
+          done
+          for f in /tmp/sigs/*x64*.app.tar.gz.sig; do
+            [ -f "$f" ] && X64_SIG=$(cat "$f")
+          done
 
-          cat > /tmp/latest.json << EOF
-          {
-            "version": "${VER}",
-            "pub_date": "${NOW}",
-            "platforms": {
-              "darwin-aarch64": {
-                "url": "${BASE}/notes_aarch64.app.tar.gz",
-                "signature": "${AARCH64_SIG}"
-              },
-              "darwin-x86_64": {
-                "url": "${BASE}/notes_x64.app.tar.gz",
-                "signature": "${X64_SIG}"
-              }
-            }
-          }
-          EOF
+          if [ -z "$AARCH64_SIG" ] || [ -z "$X64_SIG" ]; then
+            echo "::error::Missing updater signatures (aarch64='${AARCH64_SIG:+set}' x64='${X64_SIG:+set}')"
+            ls -la /tmp/sigs/ || true
+            exit 1
+          fi
 
+          # Find actual tarball filenames from the release
+          AARCH64_TAR=$(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name' | grep 'aarch64.*app\.tar\.gz$' | head -1)
+          X64_TAR=$(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name' | grep 'x64.*app\.tar\.gz$' | head -1)
+
+          cat > /tmp/latest.json <<EOF
+{
+  "version": "${VER}",
+  "pub_date": "${NOW}",
+  "platforms": {
+    "darwin-aarch64": {
+      "url": "${BASE}/${AARCH64_TAR}",
+      "signature": "${AARCH64_SIG}"
+    },
+    "darwin-x86_64": {
+      "url": "${BASE}/${X64_TAR}",
+      "signature": "${X64_SIG}"
+    }
+  }
+}
+EOF
+
+          cat /tmp/latest.json
           gh release upload "$TAG" /tmp/latest.json --repo "$REPO" --clobber
