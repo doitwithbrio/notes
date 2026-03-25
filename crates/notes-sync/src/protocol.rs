@@ -25,6 +25,9 @@ pub enum MessageType {
     ViewerSnapshot = 0x02,
     /// Presence/cursor update (ephemeral, via gossip).
     PresenceUpdate = 0x03,
+    /// Batch of Ed25519 signatures for changes (sidecar to sync).
+    /// Sent after sync converges. Each entry maps a change hash to its SignedChange envelope.
+    SignatureBatch = 0x04,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -35,9 +38,29 @@ impl TryFrom<u8> for MessageType {
             0x01 => Ok(Self::SyncMessage),
             0x02 => Ok(Self::ViewerSnapshot),
             0x03 => Ok(Self::PresenceUpdate),
+            0x04 => Ok(Self::SignatureBatch),
             _ => Err(ProtocolError::UnknownMessageType(value)),
         }
     }
+}
+
+/// A batch of change signatures transmitted as a sidecar to sync messages.
+/// Each entry maps a change hash (hex) to a SignedChange envelope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignatureBatchPayload {
+    /// Map of change_hash_hex -> SignedChange JSON.
+    pub signatures: Vec<ChangeSignature>,
+}
+
+/// A single change's signature.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangeSignature {
+    /// The Automerge change hash (hex-encoded).
+    pub change_hash: String,
+    /// The author's public key (hex-encoded EndpointId).
+    pub author: String,
+    /// Ed25519 signature over the raw change bytes (hex-encoded).
+    pub signature: String,
 }
 
 /// Errors in the sync protocol.
@@ -102,8 +125,12 @@ mod tests {
             MessageType::try_from(0x03).unwrap(),
             MessageType::PresenceUpdate
         );
+        assert_eq!(
+            MessageType::try_from(0x04).unwrap(),
+            MessageType::SignatureBatch
+        );
         assert!(MessageType::try_from(0x00).is_err());
-        assert!(MessageType::try_from(0x04).is_err());
+        assert!(MessageType::try_from(0x05).is_err());
         assert!(MessageType::try_from(0xFF).is_err());
     }
 

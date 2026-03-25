@@ -4,7 +4,6 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
   AppSettings,
   BackendDocInfo,
-  BackendHistorySession,
   BackendPeerStatusEvent,
   BackendPeerStatusSummary,
   BackendPresenceEvent,
@@ -13,6 +12,8 @@ import type {
   BackendSearchResult,
   BackendSyncStatusEvent,
   BackendUnseenDocInfo,
+  BackendVersion,
+  BackendDocBlame,
 } from '../types/index.js';
 import { assertTauriRuntime } from '../runtime/tauri.js';
 
@@ -57,14 +58,20 @@ export const tauriApi = {
     guardedInvoke<void>('compact_doc', { project, docId }),
   getPeerStatus: (project: string) =>
     guardedInvoke<BackendPeerStatusSummary[]>('get_peer_status', { project }),
-  getDocHistory: (project: string, docId: string) =>
-    guardedInvoke<BackendHistorySession[]>('get_doc_history', { project, docId }),
-  getSessionText: (project: string, docId: string, sessionId: string) =>
-    guardedInvoke<string>('get_session_text', { project, docId, sessionId }),
-  restoreToSession: (project: string, docId: string, sessionId: string) =>
-    guardedInvoke<void>('restore_to_session', { project, docId, sessionId }),
   getActorAliases: (project: string) =>
     guardedInvoke<Record<string, string>>('get_actor_aliases', { project }),
+  // Version system
+  getDeviceActorId: () => guardedInvoke<string>('get_device_actor_id'),
+  getDocVersions: (docId: string) =>
+    guardedInvoke<BackendVersion[]>('get_doc_versions', { docId }),
+  createVersion: (project: string, docId: string, label?: string) =>
+    guardedInvoke<BackendVersion>('create_version', { project, docId, label: label ?? null }),
+  getVersionText: (project: string, docId: string, versionId: string) =>
+    guardedInvoke<string>('get_version_text', { project, docId, versionId }),
+  restoreToVersion: (project: string, docId: string, versionId: string) =>
+    guardedInvoke<void>('restore_to_version_cmd', { project, docId, versionId }),
+  getDocBlame: (project: string, docId: string) =>
+    guardedInvoke<BackendDocBlame>('get_doc_blame', { project, docId }),
   searchNotes: (query: string, limit?: number) =>
     guardedInvoke<BackendSearchResult[]>('search_notes', { query, limit }),
   searchProjectNotes: (query: string, project: string, limit?: number) =>

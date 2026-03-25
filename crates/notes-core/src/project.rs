@@ -7,11 +7,8 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use automerge::ReadDoc;
-
 use crate::doc_store::DocStore;
 use crate::error::CoreError;
-use crate::history_store::HistoryStore;
 use crate::manifest::ProjectManifest;
 use crate::persistence::Persistence;
 use crate::search::SearchIndex;
@@ -28,10 +25,10 @@ pub struct ProjectManager {
     manifests: DashMap<String, Arc<RwLock<ProjectManifest>>>,
     /// Per-project epoch key managers (for encrypted projects).
     epoch_keys: DashMap<String, Arc<RwLock<notes_crypto::EpochKeyManager>>>,
-    /// Optional search index (shared across all projects).
+    /// Global search index (fallback for projects without per-project DBs).
     search_index: Option<Arc<std::sync::Mutex<SearchIndex>>>,
-    /// Optional history store (shared across all projects).
-    history_store: Option<Arc<std::sync::Mutex<HistoryStore>>>,
+    /// Per-project search indexes (encrypted with project epoch key).
+    project_search: DashMap<String, Arc<std::sync::Mutex<SearchIndex>>>,
     /// Background save tasks.
     save_tasks: Mutex<JoinSet<()>>,
     /// Cancellation tokens for active save loops, keyed by DocId.
@@ -48,7 +45,7 @@ impl ProjectManager {
             manifests: DashMap::new(),
             epoch_keys: DashMap::new(),
             search_index: None,
-            history_store: None,
+            project_search: DashMap::new(),
             save_tasks: Mutex::new(JoinSet::new()),
             save_tokens: DashMap::new(),
             doc_projects: DashMap::new(),
@@ -66,35 +63,41 @@ impl ProjectManager {
             manifests: DashMap::new(),
             epoch_keys: DashMap::new(),
             search_index: Some(search_index),
-            history_store: None,
+            project_search: DashMap::new(),
             save_tasks: Mutex::new(JoinSet::new()),
             save_tokens: DashMap::new(),
             doc_projects: DashMap::new(),
         }
     }
 
-    /// Create a ProjectManager with both search index and history store.
-    pub fn with_search_and_history(
+    /// Create a ProjectManager with search and a stable device actor ID.
+    pub fn with_full_config(
         base_dir: PathBuf,
         search_index: Arc<std::sync::Mutex<SearchIndex>>,
-        history_store: Arc<std::sync::Mutex<HistoryStore>>,
+        device_actor_id: automerge::ActorId,
     ) -> Self {
         Self {
             persistence: Arc::new(Persistence::new(base_dir)),
-            doc_store: Arc::new(DocStore::new()),
+            doc_store: Arc::new(DocStore::with_actor_id(device_actor_id)),
             manifests: DashMap::new(),
             epoch_keys: DashMap::new(),
             search_index: Some(search_index),
-            history_store: Some(history_store),
+            project_search: DashMap::new(),
             save_tasks: Mutex::new(JoinSet::new()),
             save_tokens: DashMap::new(),
             doc_projects: DashMap::new(),
         }
     }
 
-    /// Get a reference to the history store.
-    pub fn history_store(&self) -> Option<&Arc<std::sync::Mutex<HistoryStore>>> {
-        self.history_store.as_ref()
+    /// Get the epoch key manager for a project (if loaded).
+    pub fn get_epoch_keys(
+        &self,
+        project_name: &str,
+    ) -> Result<Arc<RwLock<notes_crypto::EpochKeyManager>>, CoreError> {
+        self.epoch_keys
+            .get(project_name)
+            .map(|entry| Arc::clone(entry.value()))
+            .ok_or_else(|| CoreError::InvalidData(format!("no epoch keys for {project_name}")))
     }
 
     /// Get a reference to the DocStore.
@@ -111,21 +114,21 @@ impl ProjectManager {
         let mgr = notes_crypto::EpochKeyManager::new()
             .map_err(|e| CoreError::InvalidData(format!("epoch key init failed: {e}")))?;
 
-        // Persist
+        // Persist to OS keychain (primary) and encrypted file (fallback)
         let data = mgr.serialize()
             .map_err(|e| CoreError::InvalidData(format!("epoch key serialize failed: {e}")))?;
-        let key_path = self
+        let keys_dir = self
             .persistence
             .base_dir()
             .join(project_name)
             .join(".p2p")
-            .join("keys")
-            .join("epochs.json");
-        tokio::fs::create_dir_all(key_path.parent().unwrap()).await?;
-        // Atomic write: tmp + rename to prevent corruption on crash
-        let tmp_path = key_path.with_extension("json.tmp");
-        tokio::fs::write(&tmp_path, &data).await?;
-        tokio::fs::rename(&tmp_path, &key_path).await?;
+            .join("keys");
+        tokio::fs::create_dir_all(&keys_dir).await?;
+        let keystore = notes_crypto::KeyStore::new(keys_dir);
+        let keychain_name = format!("epoch-keys-{project_name}");
+        keystore
+            .store_key(&keychain_name, &data)
+            .map_err(|e| CoreError::InvalidData(format!("epoch key store failed: {e}")))?;
 
         self.epoch_keys.insert(
             project_name.to_string(),
@@ -142,18 +145,38 @@ impl ProjectManager {
             return Ok(true);
         }
 
-        let key_path = self
+        let keys_dir = self
             .persistence
             .base_dir()
             .join(project_name)
             .join(".p2p")
-            .join("keys")
-            .join("epochs.json");
+            .join("keys");
+        let keystore = notes_crypto::KeyStore::new(keys_dir.clone());
+        let keychain_name = format!("epoch-keys-{project_name}");
 
-        match tokio::fs::read(&key_path).await {
-            Ok(data) => {
-                let mgr = notes_crypto::EpochKeyManager::deserialize(&data)
-                    .map_err(|e| CoreError::InvalidData(format!("epoch key load failed: {e}")))?;
+        // Try loading from OS keychain (primary), fall back to legacy file
+        let data = match keystore.load_key(&keychain_name) {
+            Ok(data) => data,
+            Err(_) => {
+                // Fall back to legacy plaintext file for migration
+                let legacy_path = keys_dir.join("epochs.json");
+                match tokio::fs::read(&legacy_path).await {
+                    Ok(data) => {
+                        // Migrate: store in keychain and delete plaintext file
+                        if keystore.store_key(&keychain_name, &data).is_ok() {
+                            let _ = tokio::fs::remove_file(&legacy_path).await;
+                            log::info!("Migrated epoch keys from file to keychain for {project_name}");
+                        }
+                        data
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                    Err(e) => return Err(CoreError::Io(e)),
+                }
+            }
+        };
+
+        match notes_crypto::EpochKeyManager::deserialize(&data) {
+            Ok(mgr) => {
                 self.epoch_keys.insert(
                     project_name.to_string(),
                     Arc::new(RwLock::new(mgr)),
@@ -161,8 +184,7 @@ impl ProjectManager {
                 log::info!("Loaded epoch keys for project {project_name}");
                 Ok(true)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(CoreError::Io(e)),
+            Err(e) => Err(CoreError::InvalidData(format!("epoch key load failed: {e}"))),
         }
     }
 
@@ -179,20 +201,20 @@ impl ProjectManager {
             let epoch = mgr.ratchet()
                 .map_err(|e| CoreError::InvalidData(format!("ratchet failed: {e}")))?;
 
-            // Persist
+            // Persist to OS keychain
             let data = mgr.serialize()
                 .map_err(|e| CoreError::InvalidData(format!("serialize failed: {e}")))?;
-            let key_path = self
+            let keys_dir = self
                 .persistence
                 .base_dir()
                 .join(project_name)
                 .join(".p2p")
-                .join("keys")
-                .join("epochs.json");
-            // Atomic write: tmp + rename to prevent corruption on crash
-            let tmp_path = key_path.with_extension("json.tmp");
-            tokio::fs::write(&tmp_path, &data).await?;
-            tokio::fs::rename(&tmp_path, &key_path).await?;
+                .join("keys");
+            let keystore = notes_crypto::KeyStore::new(keys_dir);
+            let keychain_name = format!("epoch-keys-{project_name}");
+            keystore
+                .store_key(&keychain_name, &data)
+                .map_err(|e| CoreError::InvalidData(format!("epoch key store failed: {e}")))?;
             epoch
         };
 
@@ -228,6 +250,103 @@ impl ProjectManager {
         let manifest_arc = self.get_manifest(project_name)?;
         let manifest = manifest_arc.read().await;
         manifest.list_peers()
+    }
+
+    /// Open per-project search and history databases.
+    /// If the project has epoch keys, derives a SQLCipher encryption key.
+    /// Otherwise, opens unencrypted (local-only projects).
+    pub async fn open_project_databases(&self, project_name: &str) -> Result<(), CoreError> {
+        // Skip if already opened
+        if self.project_search.contains_key(project_name) {
+            return Ok(());
+        }
+
+        let project_dir = self.persistence.project_dir(project_name);
+        let p2p_dir = project_dir.join(".p2p");
+        tokio::fs::create_dir_all(&p2p_dir).await.ok();
+
+        // Derive encryption key from epoch key if available
+        let db_key: Option<[u8; 32]> = if let Some(epoch_mgr) = self.epoch_keys.get(project_name) {
+            let mgr = epoch_mgr.read().await;
+            if let Ok(key) = mgr.current_key() {
+                // Derive a SQLCipher key using HKDF with a db-specific context
+                use hkdf::Hkdf;
+                use sha2::Sha256;
+                let hk = Hkdf::<Sha256>::new(None, key.as_bytes());
+                let mut db_key = [0u8; 32];
+                let info = format!("p2p-notes/v1/sqlite-encryption/{project_name}");
+                hk.expand(info.as_bytes(), &mut db_key)
+                    .map_err(|_| CoreError::InvalidData("HKDF expand failed".into()))?;
+                Some(db_key)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let key_ref = db_key.as_ref();
+
+        // Open per-project search index
+        let search_path = p2p_dir.join("search.db");
+        let search = SearchIndex::open(&search_path, key_ref)?;
+        self.project_search.insert(
+            project_name.to_string(),
+            Arc::new(std::sync::Mutex::new(search)),
+        );
+
+        log::info!(
+            "Opened per-project databases for {project_name} (encrypted: {})",
+            db_key.is_some()
+        );
+        Ok(())
+    }
+
+    /// Get the search index for a project (per-project if available, global fallback).
+    pub fn search_index_for_project(
+        &self,
+        project_name: &str,
+    ) -> Option<Arc<std::sync::Mutex<SearchIndex>>> {
+        // Prefer per-project store
+        if let Some(index) = self.project_search.get(project_name) {
+            return Some(Arc::clone(index.value()));
+        }
+        // Fall back to global index
+        self.search_index.as_ref().map(Arc::clone)
+    }
+
+    /// Validate manifest integrity after receiving remote changes.
+    ///
+    /// Call this after a manifest sync completes. Checks that `_ownerControlled`
+    /// fields were only modified by the project owner. If unauthorized changes
+    /// are detected, reverts the manifest to `before_heads` and returns an error.
+    ///
+    /// `before_heads` should be captured before the sync starts.
+    /// `owner_actor_hex` is the Automerge actor ID of the owner (from the manifest).
+    pub async fn validate_manifest_after_sync(
+        &self,
+        project_name: &str,
+        before_heads: &[automerge::ChangeHash],
+        owner_actor_hex: &str,
+    ) -> Result<(), CoreError> {
+        let manifest_arc = self.get_manifest(project_name)?;
+        let mut manifest = manifest_arc.write().await;
+
+        if let Err(e) = manifest.validate_owner_controlled_changes(before_heads, owner_actor_hex) {
+            log::error!(
+                "Manifest validation failed for {project_name}: {e}. \
+                 Reverting to pre-sync state."
+            );
+            // Revert: reload manifest from the last persisted save
+            drop(manifest);
+            let data = self.persistence.load_manifest(project_name).await?;
+            let reverted = crate::manifest::ProjectManifest::load(&data)?;
+            self.manifests
+                .insert(project_name.to_string(), Arc::new(RwLock::new(reverted)));
+            return Err(e);
+        }
+
+        Ok(())
     }
 
     // ── Project operations ───────────────────────────────────────────
@@ -278,6 +397,12 @@ impl ProjectManager {
         self.manifests
             .entry(name.to_string())
             .or_insert_with(|| Arc::new(RwLock::new(manifest)));
+
+        // Open per-project encrypted databases (search + history)
+        if let Err(e) = self.open_project_databases(name).await {
+            log::warn!("Failed to open per-project databases for {name}: {e}");
+            // Non-fatal: will fall back to global databases
+        }
 
         log::info!("Opened project: {name}");
         Ok(())
@@ -356,12 +481,21 @@ impl ProjectManager {
         self.doc_store.create_doc_with_id(doc_id)?;
 
         // Save the new document first (before manifest, so manifest never points to missing doc)
+        // Use encrypted save path when epoch keys are available
         let doc_data = self.doc_store.save_doc(&doc_id).await?;
-        if let Err(e) = self
-            .persistence
-            .save_doc(project_name, &doc_id, &doc_data)
-            .await
-        {
+        let save_result = if let Some(epoch_mgr) = self.epoch_keys.get(project_name) {
+            let mgr = epoch_mgr.read().await;
+            if let Ok(key) = mgr.current_key() {
+                self.persistence
+                    .save_doc_encrypted(project_name, &doc_id, &doc_data, key.as_bytes(), mgr.current_epoch())
+                    .await
+            } else {
+                self.persistence.save_doc(project_name, &doc_id, &doc_data).await
+            }
+        } else {
+            self.persistence.save_doc(project_name, &doc_id, &doc_data).await
+        };
+        if let Err(e) = save_result {
             // Compensate: undo in-memory changes
             self.doc_store.remove_doc(&doc_id);
             let mut manifest = manifest_arc.write().await;
@@ -675,88 +809,14 @@ impl ProjectManager {
     }
 
     /// Compact a document to reduce memory/disk usage.
-    /// Archives history to SQLite before compacting so version history survives.
+    /// Version history is preserved in the VersionStore (SQLite) — compaction
+    /// only affects the in-memory/on-disk Automerge document.
     pub async fn compact_doc(
         &self,
         project_name: &str,
         doc_id: &DocId,
     ) -> Result<(), CoreError> {
-        // Archive history before compaction if history store is available
-        if let Some(ref history_store) = self.history_store {
-            let doc_arc = self.doc_store.get_doc(doc_id)?;
-
-            let (sessions, text, change_count, bytes_before) = {
-                let mut doc = doc_arc.write().await;
-                let sessions = crate::history::get_document_history(&mut doc);
-                // Read text directly from the locked doc to avoid deadlock
-                // (do NOT call self.doc_store.get_text() which re-acquires the same lock)
-                let text = if let Some((automerge::Value::Object(automerge::ObjType::Text), text_id)) =
-                    doc.get(automerge::ROOT, "text").ok().flatten()
-                {
-                    doc.text(&text_id).unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                let change_count = crate::history::get_change_count(&mut doc);
-                let bytes_before = doc.save().len();
-                (sessions, text, change_count, bytes_before)
-            };
-
-            // Archive sessions and store snapshot synchronously (lock must not
-            // be held across .await points to keep the future Send).
-            let snapshot_result = {
-                match history_store.lock() {
-                    Ok(store) => {
-                        if let Err(e) = store.archive_sessions(&sessions, project_name, doc_id) {
-                            log::warn!("Failed to archive history sessions before compaction: {e}");
-                        }
-                        Some(store.store_snapshot(
-                            doc_id,
-                            project_name,
-                            &text,
-                            change_count,
-                            "compaction",
-                        ))
-                    }
-                    Err(_) => {
-                        log::warn!("History store lock poisoned, compacting without archiving");
-                        None
-                    }
-                }
-            }; // MutexGuard dropped here
-
-            // Now do async compaction work without holding the lock
-            match snapshot_result {
-                Some(Ok(snapshot_id)) => {
-                    self.doc_store.compact(doc_id).await?;
-                    let bytes_after = self.doc_store.save_doc(doc_id).await?.len();
-                    // Re-acquire lock briefly to log compaction
-                    if let Ok(store) = history_store.lock() {
-                        if let Err(e) = store.log_compaction(
-                            doc_id,
-                            change_count,
-                            bytes_before,
-                            bytes_after,
-                            snapshot_id,
-                        ) {
-                            log::warn!("Failed to log compaction: {e}");
-                        }
-                    }
-                }
-                Some(Err(e)) => {
-                    log::warn!("Failed to store snapshot before compaction: {e}");
-                    self.doc_store.compact(doc_id).await?;
-                }
-                None => {
-                    // Lock was poisoned
-                    self.doc_store.compact(doc_id).await?;
-                }
-            }
-        } else {
-            // No history store — compact without archiving (legacy behavior)
-            self.doc_store.compact(doc_id).await?;
-        }
-
+        self.doc_store.compact(doc_id).await?;
         self.save_doc(project_name, doc_id).await?;
         Ok(())
     }
@@ -852,6 +912,12 @@ impl ProjectManager {
         let persistence = Arc::clone(&self.persistence);
         let manifests_ref = &self.manifests;
 
+        // Clone epoch key manager for encrypted saves (None for local-only projects)
+        let epoch_mgr = self
+            .epoch_keys
+            .get(&project_name)
+            .map(|entry| Arc::clone(entry.value()));
+
         // Clone the manifest Arc out of DashMap BEFORE spawning (avoid holding DashMap ref across await)
         let manifest_arc = manifests_ref
             .get(&project_name)
@@ -880,12 +946,31 @@ impl ProjectManager {
                             continue;
                         }
 
-                        // Save Automerge binary
+                        // Save Automerge binary (encrypted if epoch keys available)
                         let save_result = async {
                             let data = doc_store.save_doc(&doc_id).await?;
-                            persistence
-                                .save_doc(&project_name, &doc_id, &data)
-                                .await?;
+                            if let Some(ref mgr_arc) = epoch_mgr {
+                                let mgr = mgr_arc.read().await;
+                                if let Ok(key) = mgr.current_key() {
+                                    persistence
+                                        .save_doc_encrypted(
+                                            &project_name,
+                                            &doc_id,
+                                            &data,
+                                            key.as_bytes(),
+                                            mgr.current_epoch(),
+                                        )
+                                        .await?;
+                                } else {
+                                    persistence
+                                        .save_doc(&project_name, &doc_id, &data)
+                                        .await?;
+                                }
+                            } else {
+                                persistence
+                                    .save_doc(&project_name, &doc_id, &data)
+                                    .await?;
+                            }
                             Ok::<(), CoreError>(())
                         }
                         .await;

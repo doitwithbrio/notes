@@ -18,9 +18,19 @@ pub struct SearchIndex {
 
 impl SearchIndex {
     /// Open or create the search index database.
-    pub fn open(db_path: &Path) -> Result<Self, CoreError> {
+    ///
+    /// When `encryption_key` is provided, the database is encrypted with SQLCipher.
+    /// Pass `None` for unencrypted databases (local-only projects without epoch keys).
+    pub fn open(db_path: &Path, encryption_key: Option<&[u8; 32]>) -> Result<Self, CoreError> {
         let conn = Connection::open(db_path)
             .map_err(|e| CoreError::InvalidData(format!("failed to open search db: {e}")))?;
+
+        // Apply SQLCipher encryption key if provided
+        if let Some(key) = encryption_key {
+            let hex_key: String = key.iter().map(|b| format!("{:02x}", b)).collect();
+            conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+                .map_err(|e| CoreError::InvalidData(format!("SQLCipher key failed: {e}")))?;
+        }
 
         // Create the FTS5 virtual table if it doesn't exist
         conn.execute_batch(

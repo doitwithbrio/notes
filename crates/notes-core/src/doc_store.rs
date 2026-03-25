@@ -25,6 +25,8 @@ pub struct DocStore {
     docs: DashMap<DocId, Arc<RwLock<AutoCommit>>>,
     /// Set of document IDs that have unsaved changes.
     dirty: DashMap<DocId, ()>,
+    /// Stable device actor ID. When set, all loaded/created documents use this actor.
+    device_actor_id: Option<automerge::ActorId>,
 }
 
 impl DocStore {
@@ -32,13 +34,37 @@ impl DocStore {
         Self {
             docs: DashMap::new(),
             dirty: DashMap::new(),
+            device_actor_id: None,
         }
+    }
+
+    /// Create a new DocStore with a stable device actor ID.
+    /// All documents created or loaded will use this actor ID.
+    pub fn with_actor_id(actor_id: automerge::ActorId) -> Self {
+        Self {
+            docs: DashMap::new(),
+            dirty: DashMap::new(),
+            device_actor_id: Some(actor_id),
+        }
+    }
+
+    /// Set the stable device actor ID.
+    pub fn set_device_actor_id(&mut self, actor_id: automerge::ActorId) {
+        self.device_actor_id = Some(actor_id);
+    }
+
+    /// Get the device actor ID as a hex string.
+    pub fn device_actor_hex(&self) -> Option<String> {
+        self.device_actor_id.as_ref().map(|id| id.to_hex_string())
     }
 
     /// Create a new empty Automerge document with a specific ID.
     /// Returns an error if a document with this ID already exists.
     pub fn create_doc_with_id(&self, id: DocId) -> Result<(), CoreError> {
         let mut doc = AutoCommit::new();
+        if let Some(ref actor_id) = self.device_actor_id {
+            doc.set_actor(actor_id.clone());
+        }
         doc.put(automerge::ROOT, "schemaVersion", 1_u64)?;
         doc.put_object(automerge::ROOT, "text", ObjType::Text)?;
 
@@ -56,7 +82,10 @@ impl DocStore {
     /// Load an existing Automerge document from binary data.
     /// If a document with this ID already exists, the entry is kept (no overwrite).
     pub fn load_doc(&self, id: DocId, data: &[u8]) -> Result<(), CoreError> {
-        let doc = AutoCommit::load(data)?;
+        let mut doc = AutoCommit::load(data)?;
+        if let Some(ref actor_id) = self.device_actor_id {
+            doc.set_actor(actor_id.clone());
+        }
         // Atomic insert-if-absent to avoid TOCTOU race
         self.docs
             .entry(id)
@@ -199,7 +228,11 @@ impl DocStore {
         let doc_arc = self.get_doc(id)?;
         let mut doc = doc_arc.write().await;
         let bytes = doc.save();
-        *doc = AutoCommit::load(&bytes)?;
+        let mut reloaded = AutoCommit::load(&bytes)?;
+        if let Some(ref actor_id) = self.device_actor_id {
+            reloaded.set_actor(actor_id.clone());
+        }
+        *doc = reloaded;
         self.dirty.insert(*id, ());
         log::info!("Compacted document {id}: {} bytes", bytes.len());
         Ok(())
@@ -233,6 +266,15 @@ impl DocStore {
 impl Default for DocStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl std::fmt::Debug for DocStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DocStore")
+            .field("doc_count", &self.docs.len())
+            .field("has_device_actor", &self.device_actor_id.is_some())
+            .finish()
     }
 }
 

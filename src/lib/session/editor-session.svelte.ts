@@ -3,7 +3,7 @@ import * as Automerge from '@automerge/automerge';
 import { tauriApi } from '../api/tauri.js';
 import { TauriRuntimeUnavailableError } from '../runtime/tauri.js';
 import { getDocById, markDocUnread, setActiveDoc, setDocWordCount } from '../state/documents.svelte.js';
-import { loadHistory } from '../state/history.svelte.js';
+import { createVersion, loadVersions, versionState } from '../state/versions.svelte.js';
 
 type NotesDoc = {
   schemaVersion?: number;
@@ -39,6 +39,10 @@ let currentDoc: Automerge.Doc<NotesDoc> | null = null;
 let pendingChunks: Uint8Array[] = [];
 let applyTimer: ReturnType<typeof setTimeout> | null = null;
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
+let idleVersionTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** 15 minutes idle = auto-create a version. */
+const IDLE_VERSION_TIMEOUT_MS = 15 * 60 * 1000;
 
 function clearTimers() {
   if (applyTimer) {
@@ -48,6 +52,10 @@ function clearTimers() {
   if (saveTimer) {
     clearTimeout(saveTimer);
     saveTimer = null;
+  }
+  if (idleVersionTimer) {
+    clearTimeout(idleVersionTimer);
+    idleVersionTimer = null;
   }
 }
 
@@ -61,6 +69,14 @@ function scheduleFlush() {
   saveTimer = setTimeout(() => {
     void saveNow();
   }, 1500);
+
+  // Reset the idle version timer — user is actively editing
+  clearTimeout(idleVersionTimer ?? undefined);
+  idleVersionTimer = setTimeout(() => {
+    if (editorSessionState.projectId && editorSessionState.docId) {
+      void createVersion(editorSessionState.projectId, editorSessionState.docId);
+    }
+  }, IDLE_VERSION_TIMEOUT_MS);
 }
 
 export function getActiveSession() {
@@ -73,7 +89,13 @@ export function getActiveSession() {
 
 async function loadBinary(projectId: string, docId: string) {
   const binary = await tauriApi.getDocBinary(projectId, docId);
-  currentDoc = Automerge.load<NotesDoc>(binary);
+  const doc = Automerge.load<NotesDoc>(binary);
+  // Set stable device actor ID if available
+  if (versionState.deviceActorId) {
+    currentDoc = Automerge.clone(doc, { actor: versionState.deviceActorId });
+  } else {
+    currentDoc = doc;
+  }
   editorSessionState.text = getDocText(currentDoc);
   editorSessionState.revision += 1;
   setDocWordCount(docId, editorSessionState.text);
@@ -81,6 +103,9 @@ async function loadBinary(projectId: string, docId: string) {
 
 export async function openEditorSession(projectId: string, docId: string) {
   if (editorSessionState.projectId === projectId && editorSessionState.docId === docId) {
+    // Session already loaded — just ensure the UI view is restored
+    // (user may have navigated to project-overview or settings and come back)
+    setActiveDoc(docId);
     return;
   }
 
@@ -97,7 +122,7 @@ export async function openEditorSession(projectId: string, docId: string) {
     editorSessionState.docId = docId;
     setActiveDoc(docId);
     markDocUnread(docId, false);
-    await loadHistory(projectId, docId);
+    await loadVersions(docId);
   } catch (error) {
     if (error instanceof TauriRuntimeUnavailableError) {
       editorSessionState.lastError = null;
@@ -195,14 +220,21 @@ export async function closeEditorSession() {
 
   const { projectId, docId } = editorSessionState;
   await saveNow().catch(() => undefined);
+
+  // Create an auto-version on document switch/close (if there are changes)
+  await createVersion(projectId, docId).catch(() => undefined);
+
   await tauriApi.closeDoc(projectId, docId).catch(() => undefined);
 
-  currentDoc = null;
-  pendingChunks = [];
-  editorSessionState.projectId = null;
-  editorSessionState.docId = null;
-  editorSessionState.text = '';
-  editorSessionState.revision += 1;
+  // Only clear state if no newer session was opened while we were awaiting
+  if (editorSessionState.projectId === projectId && editorSessionState.docId === docId) {
+    currentDoc = null;
+    pendingChunks = [];
+    editorSessionState.projectId = null;
+    editorSessionState.docId = null;
+    editorSessionState.text = '';
+    editorSessionState.revision += 1;
+  }
 }
 
 export async function renameActiveDoc(newPath: string) {

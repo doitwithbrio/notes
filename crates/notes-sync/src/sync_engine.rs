@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use automerge::AutoCommit;
@@ -43,6 +44,15 @@ pub struct SyncEngine {
     /// ACL: maps (doc_key, peer_id) -> role. If no entry, peer is unauthorized.
     acl: Arc<DashMap<([u8; 32], iroh::EndpointId), PeerRole>>,
 
+    /// Known Automerge actor hex IDs per document, for actor-based verification.
+    /// Maps doc_key -> set of authorized actor hex strings.
+    known_actors: Arc<DashMap<[u8; 32], HashSet<String>>>,
+
+    /// Signature store: maps (doc_key, change_hash_hex) -> ChangeSignature.
+    /// Signatures are attached at the IPC boundary when local changes are applied,
+    /// and received from peers as sidecar SignatureBatch messages.
+    signatures: Arc<DashMap<([u8; 32], String), crate::protocol::ChangeSignature>>,
+
     /// Persistent sync state store (optional — if None, fresh state per session).
     sync_state_store: Option<Arc<crate::SyncStateStore>>,
 
@@ -67,6 +77,8 @@ impl SyncEngine {
         Self {
             docs: Arc::new(DashMap::new()),
             acl: Arc::new(DashMap::new()),
+            known_actors: Arc::new(DashMap::new()),
+            signatures: Arc::new(DashMap::new()),
             sync_state_store: None,
             change_tx,
             connection_semaphore: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
@@ -131,6 +143,57 @@ impl SyncEngine {
         self.docs.get(key).map(|entry| Arc::clone(entry.value()))
     }
 
+    /// Store a signature for a local change (called from the Tauri IPC boundary).
+    pub fn store_signature(
+        &self,
+        doc_id: Uuid,
+        change_hash: String,
+        signature: crate::protocol::ChangeSignature,
+    ) {
+        let key = uuid_to_doc_key(doc_id);
+        self.signatures.insert((key, change_hash), signature);
+    }
+
+    /// Get all stored signatures for a document (for transmitting as sidecar).
+    pub fn get_signatures_for_doc(
+        &self,
+        doc_id: Uuid,
+    ) -> Vec<crate::protocol::ChangeSignature> {
+        let key = uuid_to_doc_key(doc_id);
+        self.signatures
+            .iter()
+            .filter(|entry| entry.key().0 == key)
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+
+    /// Register known Automerge actor IDs for a document.
+    /// Call this after opening a project, passing actor IDs from the manifest.
+    pub fn set_known_actors(&self, doc_id: Uuid, actors: HashSet<String>) {
+        let key = uuid_to_doc_key(doc_id);
+        self.known_actors.insert(key, actors);
+    }
+
+    /// Get the known actor IDs for a document.
+    fn get_known_actors_for_doc(&self, doc_key: &[u8; 32]) -> HashSet<String> {
+        self.known_actors
+            .get(doc_key)
+            .map(|entry| entry.value().clone())
+            .unwrap_or_default()
+    }
+
+    /// Get all authorized peer IDs for a document (for signature verification).
+    fn get_allowed_peers_for_doc(&self, doc_key: &[u8; 32]) -> Vec<iroh::EndpointId> {
+        self.acl
+            .iter()
+            .filter(|entry| {
+                let ((key, _), role) = entry.pair();
+                key == doc_key && *role != PeerRole::Unauthorized
+            })
+            .map(|entry| entry.pair().0 .1)
+            .collect()
+    }
+
     /// Initiate a sync with a remote peer for a specific document.
     pub async fn sync_doc_with_peer(
         &self,
@@ -150,7 +213,12 @@ impl SyncEngine {
             None
         };
 
-        let mut session = SyncSession::new_with_state(key, initial_state);
+        let allowed_peers = self.get_allowed_peers_for_doc(&key);
+        let known_actors = self.get_known_actors_for_doc(&key);
+        let mut session = SyncSession::new_with_state(key, initial_state)
+            .with_acl(allowed_peers)
+            .with_known_actors(known_actors)
+            .with_remote_peer(peer_id);
         session.run_initiator(connection, doc).await?;
 
         // Save sync state after successful sync
@@ -243,7 +311,13 @@ impl SyncEngine {
                         }
                     };
 
-                    let mut session = SyncSession::new(doc_id);
+                    // Build session with ACL for signature verification
+                    let allowed_peers = self.get_allowed_peers_for_doc(&doc_id);
+                    let known_actors = self.get_known_actors_for_doc(&doc_id);
+                    let mut session = SyncSession::new(doc_id)
+                        .with_acl(allowed_peers)
+                        .with_known_actors(known_actors)
+                        .with_remote_peer(remote_id);
                     if let Err(e) = session.run_responder(&mut send, &mut recv, doc).await {
                         log::error!("Sync session error for doc {:?}: {e}", &doc_id[..4]);
                     }
@@ -270,6 +344,22 @@ impl SyncEngine {
                     log::debug!("Presence update handled via gossip, not sync stream");
                     let _ = send.finish();
                 }
+                protocol::MessageType::SignatureBatch => {
+                    // Read and store incoming signature batch
+                    match crate::sync_session::read_framed(&mut recv).await {
+                        Ok(batch_bytes) => {
+                            if let Ok(batch) = serde_json::from_slice::<protocol::SignatureBatchPayload>(&batch_bytes) {
+                                for sig in batch.signatures {
+                                    self.signatures.insert((doc_id, sig.change_hash.clone()), sig);
+                                }
+                                log::debug!("Received signature batch for doc {:?}", &doc_id[..4]);
+                            }
+                        }
+                        Err(SyncError::StreamFinished) => {}
+                        Err(e) => log::warn!("Failed to read signature batch: {e}"),
+                    }
+                    let _ = send.finish();
+                }
             }
         }
 
@@ -292,6 +382,8 @@ impl iroh::protocol::ProtocolHandler for SyncEngine {
         let engine = SyncEngine {
             docs: Arc::clone(&self.docs),
             acl: Arc::clone(&self.acl),
+            known_actors: Arc::clone(&self.known_actors),
+            signatures: Arc::clone(&self.signatures),
             sync_state_store: self.sync_state_store.clone(),
             change_tx: self.change_tx.clone(),
             connection_semaphore: Arc::clone(&self.connection_semaphore),

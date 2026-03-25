@@ -3,7 +3,7 @@
   import { PanelRightClose, PanelRightOpen, Users, CheckSquare, Clock, Settings } from 'lucide-svelte';
   import PeersSection from './PeersSection.svelte';
   import TodosSection from './TodosSection.svelte';
-  import HistorySection from './HistorySection.svelte';
+  import VersionSection from './VersionSection.svelte';
 
   const collapsed = $derived(!uiState.rightSidebarOpen);
 </script>
@@ -31,7 +31,7 @@
       <button class="collapsed-icon-btn" onclick={toggleRightSidebar} aria-label="todos" title="todos">
         <CheckSquare size={15} strokeWidth={1.5} />
       </button>
-      <button class="collapsed-icon-btn" onclick={toggleRightSidebar} aria-label="history" title="history">
+      <button class="collapsed-icon-btn" onclick={toggleRightSidebar} aria-label="versions" title="versions">
         <Clock size={15} strokeWidth={1.5} />
       </button>
     </div>
@@ -41,10 +41,10 @@
       </button>
     </div>
   {:else}
-    <div class="right-sidebar-scroll">
+    <div class="right-sidebar-sections">
       <PeersSection />
       <TodosSection />
-      <HistorySection />
+      <VersionSection />
     </div>
     <div class="right-sidebar-footer expanded">
       <button class="settings-btn" onclick={openSettings} aria-label="settings">
@@ -122,12 +122,11 @@
     background: var(--surface-hover);
   }
 
-  .right-sidebar-scroll {
+  .right-sidebar-sections {
     flex: 1;
-    overflow-y: auto;
+    min-height: 0;
     display: flex;
     flex-direction: column;
-    gap: 6px;
   }
 
   .right-sidebar-footer {

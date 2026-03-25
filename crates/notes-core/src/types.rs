@@ -77,3 +77,43 @@ pub struct PeerStatusSummary {
     pub role: Option<PeerRole>,
     pub active_doc: Option<String>,
 }
+
+// ── Blame Types ──────────────────────────────────────────────────────
+
+/// A contiguous run of text written by the same author.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlameSpan {
+    /// Character offset where this span starts.
+    pub start: usize,
+    /// Character offset where this span ends (exclusive).
+    pub end: usize,
+    /// Automerge ActorId hex string.
+    pub actor: String,
+    /// Human-readable alias if known, else None.
+    pub alias: Option<String>,
+    /// Approximate timestamp (latest change timestamp from this actor).
+    pub timestamp: Option<i64>,
+}
+
+/// Full blame result for a document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocBlame {
+    /// Total text length in characters.
+    pub text_length: usize,
+    /// Ordered, non-overlapping spans covering the full text.
+    pub spans: Vec<BlameSpan>,
+    /// Map of actor hex -> info (alias, color index).
+    pub actors: std::collections::HashMap<String, ActorInfo>,
+}
+
+/// Metadata about an Automerge actor (author).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActorInfo {
+    /// Human-readable alias (from manifest or "You").
+    pub alias: Option<String>,
+    /// Assigned color index (0..N for N distinct actors).
+    pub color_index: usize,
+}

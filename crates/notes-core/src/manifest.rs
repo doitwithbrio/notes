@@ -417,6 +417,81 @@ impl ProjectManifest {
     pub fn doc_mut(&mut self) -> &mut AutoCommit {
         &mut self.doc
     }
+
+    // ── ACL Validation ───────────────────────────────────────────────
+
+    /// Validate that `_ownerControlled` fields were only modified by the owner.
+    ///
+    /// Call this after syncing the manifest. Checks all changes applied since
+    /// `before_heads`. If any change that modifies `_ownerControlled` was made
+    /// by an actor that is NOT the owner, returns an error.
+    ///
+    /// `owner_actor_hex` is the Automerge actor ID (hex string) of the owner.
+    /// This must be set in the manifest (via `set_peer_actor_id`) during the
+    /// invite flow so we know which actor corresponds to the owner.
+    pub fn validate_owner_controlled_changes(
+        &mut self,
+        before_heads: &[automerge::ChangeHash],
+        owner_actor_hex: &str,
+    ) -> Result<(), CoreError> {
+        let changes = self.doc.get_changes(before_heads);
+
+        if changes.is_empty() {
+            return Ok(());
+        }
+
+        // Get the _ownerControlled object ID
+        let owner_section_id = self.owner_section_id()?;
+
+        // For each new change, check if it touches the _ownerControlled subtree.
+        // We do this by checking if any operation in the change targets the
+        // _ownerControlled object or any of its descendants.
+        //
+        // A simpler heuristic: compare _ownerControlled state at before_heads
+        // vs current heads. If it changed, verify ALL new changes are from the owner.
+        let owner_before = self
+            .doc
+            .get_at(&owner_section_id, "owner", before_heads)?
+            .and_then(|(v, _)| value_to_string(v));
+        let owner_after = self
+            .doc
+            .get(&owner_section_id, "owner")?
+            .and_then(|(v, _)| value_to_string(v));
+
+        let epoch_before = self
+            .doc
+            .get_at(&owner_section_id, "keyEpoch", before_heads)?
+            .and_then(|(v, _)| v.to_u64());
+        let epoch_after = self
+            .doc
+            .get(&owner_section_id, "keyEpoch")?
+            .and_then(|(v, _)| v.to_u64());
+
+        // Check if _ownerControlled fields changed
+        let owner_changed = owner_before != owner_after;
+        let epoch_changed = epoch_before != epoch_after;
+        // Note: peers map changes are harder to detect generically.
+        // For now, check the two most critical fields.
+
+        if owner_changed || epoch_changed {
+            // Verify all new changes are from the owner actor
+            for change in &changes {
+                let actor = change.actor_id().to_hex_string();
+                if actor != owner_actor_hex {
+                    log::error!(
+                        "Unauthorized _ownerControlled modification by actor {}, expected {}",
+                        &actor[..8.min(actor.len())],
+                        &owner_actor_hex[..8.min(owner_actor_hex.len())],
+                    );
+                    return Err(CoreError::InvalidInput(
+                        "unauthorized modification of owner-controlled fields".into(),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -476,5 +551,16 @@ mod tests {
         manifest.add_file("hello.md", FileType::Note).unwrap();
         let result = manifest.add_file("hello.md", FileType::Note);
         assert!(matches!(result, Err(CoreError::FileAlreadyExists(_))));
+    }
+
+    #[test]
+    fn test_validate_owner_controlled_no_changes() {
+        let mut manifest = ProjectManifest::new("test").unwrap();
+        manifest.set_owner("owner-node-id").unwrap();
+        let heads = manifest.doc.get_heads().to_vec();
+        // No new changes — should pass
+        assert!(manifest
+            .validate_owner_controlled_changes(&heads, "owner-actor-hex")
+            .is_ok());
     }
 }

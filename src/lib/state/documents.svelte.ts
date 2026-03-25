@@ -1,6 +1,7 @@
 import { tauriApi } from '../api/tauri.js';
 import type { BackendDocInfo, BackendUnseenDocInfo, Document, SyncStatus } from '../types/index.js';
 import { uiState } from './ui.svelte.js';
+import { applyDocOrder, saveDocOrder } from './ordering.svelte.js';
 
 export const documentState = $state({
   activeDocId: null as string | null,
@@ -48,7 +49,10 @@ export function setActiveDoc(docId: string | null) {
   if (!docId) return;
   const doc = getDocById(docId);
   if (!doc) return;
-  uiState.view = 'editor';
+  // Don't overwrite history-review mode — only switch to editor from other views
+  if (uiState.view !== 'history-review') {
+    uiState.view = 'editor';
+  }
   uiState.activeProjectId = doc.projectId;
 }
 
@@ -59,10 +63,11 @@ export async function loadProjectDocs(projectId: string) {
   ]);
   const unseenMap = new Map(unseenDocs.map((entry) => [entry.docId, entry]));
   const nextDocs = docs.map((doc) => mapDoc(projectId, doc, unseenMap));
+  const orderedDocs = applyDocOrder(projectId, nextDocs);
   documentState.docs = [
     ...documentState.docs.filter((doc) => doc.projectId !== projectId),
-    ...nextDocs,
-  ].sort((a, b) => a.path.localeCompare(b.path));
+    ...orderedDocs,
+  ];
 }
 
 export async function loadAllProjectDocs(projectIds: string[]) {
@@ -146,4 +151,5 @@ export function reorderDocs(projectId: string, fromIndex: number, toIndex: numbe
   documentState.docs = documentState.docs.map((doc) =>
     doc.projectId === projectId ? scoped[scopedIndex++]! : doc,
   );
+  saveDocOrder(projectId, scoped);
 }

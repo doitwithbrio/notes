@@ -1,5 +1,6 @@
 import { tauriApi } from '../api/tauri.js';
 import type { BackendProjectSummary, Project } from '../types/index.js';
+import { applyProjectOrder, saveProjectOrder } from './ordering.svelte.js';
 
 export const projectState = $state({
   projects: [] as Project[],
@@ -26,7 +27,7 @@ export async function loadProjects() {
   projectState.loading = true;
   try {
     const projects = await tauriApi.listProjectSummaries();
-    projectState.projects = projects.map(mapProject);
+    projectState.projects = applyProjectOrder(projects.map(mapProject));
   } finally {
     projectState.loading = false;
   }
@@ -48,4 +49,5 @@ export function reorderProject(fromIndex: number, toIndex: number) {
   if (fromIndex === toIndex) return;
   const [item] = projectState.projects.splice(fromIndex, 1);
   if (item) projectState.projects.splice(toIndex, 0, item);
+  saveProjectOrder(projectState.projects);
 }

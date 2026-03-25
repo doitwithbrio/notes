@@ -7,9 +7,13 @@
   import { syncState } from '../../state/sync.svelte.js';
   import { editorSessionState, updateEditorText, reloadActiveSession } from '../../session/editor-session.svelte.js';
   import { uiState } from '../../state/ui.svelte.js';
-  import { historyState, exitHistoryReview } from '../../state/history.svelte.js';
+  import { versionState, exitVersionReview, showSavePrompt, createVersion, restoreVersion } from '../../state/versions.svelte.js';
   import { computeBlockDiff } from '../../utils/diff.js';
-  import HistoryReviewBar from './HistoryReviewBar.svelte';
+  import TimelineScrubber from './TimelineScrubber.svelte';
+  import SaveVersionBar from './SaveVersionBar.svelte';
+  import ChangeMinibar from './ChangeMinibar.svelte';
+  import BlameGutter from './BlameGutter.svelte';
+  import { blameState, loadBlame, clearBlame } from '../../state/blame.svelte.js';
 
   let editorElement = $state<HTMLDivElement | null>(null);
   let editor = $state<Editor | null>(null);
@@ -27,14 +31,23 @@
       ? 'connected'
       : syncState.connection === 'slow'
         ? 'syncing'
-        : 'offline',
+        : syncState.connection === 'local'
+          ? ''
+          : 'offline',
   );
 
   // Compute diff blocks when in history review mode
   const diffBlocks = $derived.by(() => {
-    if (!isHistoryReview || !historyState.previewText) return [];
-    return computeBlockDiff(historyState.previewText, editorSessionState.text);
+    if (isHistoryReview && versionState.previewText != null) {
+      return computeBlockDiff(versionState.previewText, editorSessionState.text);
+    }
+    return [];
   });
+
+  // Total lines for minibar calculation
+  const totalLines = $derived(
+    editorSessionState.text.split('\n').length,
+  );
 
   function syncEditorContent(text: string) {
     if (!editor || isHistoryReview) return; // Don't sync live text while reviewing history
@@ -76,22 +89,49 @@
     }
   });
 
-  // When history preview text loads, show it in the editor
+  // When version preview text loads, show it in the editor
   $effect(() => {
-    if (isHistoryReview && historyState.previewText != null && editor) {
+    if (isHistoryReview && versionState.previewText != null && editor) {
       applyingRemoteText = true;
-      editor.commands.setContent(textToEditorHtml(historyState.previewText), { emitUpdate: false });
+      editor.commands.setContent(textToEditorHtml(versionState.previewText), { emitUpdate: false });
       applyingRemoteText = false;
     }
   });
 
-  // Exit history review when the active document changes
+  // Exit version review when the active document changes
+  let prevDocId: string | null = null;
   $effect(() => {
-    const _docId = editorSessionState.docId; // track dependency
-    if (isHistoryReview) {
-      uiState.view = 'editor';
-      uiState.historyReviewSessionId = null;
-      exitHistoryReview();
+    const docId = editorSessionState.docId;
+    if (prevDocId !== null && docId !== prevDocId) {
+      if (untrack(() => isHistoryReview)) {
+        uiState.view = 'editor';
+        uiState.historyReviewSessionId = null;
+        exitVersionReview();
+      }
+    }
+    prevDocId = docId;
+  });
+
+  // Cmd+S handler — create a named version
+  function handleGlobalKeydown(e: KeyboardEvent) {
+    if ((e.metaKey || e.ctrlKey) && e.key === 's') {
+      e.preventDefault();
+      if (!isHistoryReview && editorSessionState.projectId && editorSessionState.docId) {
+        showSavePrompt();
+      }
+    }
+  }
+
+  // Fetch blame data when blame gutter is toggled on (or doc changes while active)
+  $effect(() => {
+    const visible = uiState.blameVisible;
+    const projectId = editorSessionState.projectId;
+    const docId = editorSessionState.docId;
+
+    if (visible && projectId && docId) {
+      void loadBlame(projectId, docId);
+    } else if (!visible) {
+      clearBlame();
     }
   });
 
@@ -100,6 +140,8 @@
     await reloadActiveSession();
   }
 </script>
+
+<svelte:window onkeydown={handleGlobalKeydown} />
 
 <div class="editor-pane">
   <div class="editor-drag" data-tauri-drag-region>
@@ -117,21 +159,24 @@
     </div>
   </div>
 
-  {#if isHistoryReview}
-    <HistoryReviewBar onRestore={handleRestore} />
-  {/if}
+  <TimelineScrubber />
+  <SaveVersionBar />
 
   {#if activeDoc}
-    <div class="editor-scroll">
+    <div class="editor-scroll" style="position: relative;">
+      {#if isHistoryReview}
+        <ChangeMinibar {diffBlocks} {totalLines} />
+      {/if}
+
       <div class="editor-content-wrap">
         <h1 class="doc-title">{activeDoc.title}</h1>
         {#if editorSessionState.lastError && !isHistoryReview}
           <p class="editor-error">{editorSessionState.lastError}</p>
         {/if}
-        {#if isHistoryReview && historyState.previewLoading}
+        {#if isHistoryReview && versionState.previewLoading}
           <p class="history-loading">loading version...</p>
-        {:else if isHistoryReview && historyState.previewError}
-          <p class="editor-error">{historyState.previewError}</p>
+        {:else if isHistoryReview && versionState.previewError}
+          <p class="editor-error">{versionState.previewError}</p>
         {/if}
 
         {#if isHistoryReview && diffBlocks.length > 0}
@@ -142,13 +187,18 @@
               </div>
             {/each}
           </div>
-        {:else if isHistoryReview && !historyState.previewLoading && !historyState.previewError && historyState.previewText != null}
+        {:else if isHistoryReview && !versionState.previewLoading && !versionState.previewError && versionState.previewText != null}
           <div class="diff-identical">
             <p>this version is identical to the current document</p>
           </div>
           <div class="editor-mount" bind:this={editorElement}></div>
         {:else}
-          <div class="editor-mount" bind:this={editorElement}></div>
+          <div class="editor-body" class:blame-active={uiState.blameVisible && !isHistoryReview}>
+            {#if uiState.blameVisible && !isHistoryReview && blameState.data}
+              <BlameGutter {editor} blame={blameState.data} />
+            {/if}
+            <div class="editor-mount" bind:this={editorElement}></div>
+          </div>
         {/if}
       </div>
     </div>
@@ -159,7 +209,9 @@
       {:else}
         <span class="md-hints">**bold  _italic_  # heading  - list  [] task  > quote  `code`</span>
       {/if}
-      <span class="connection-status" class:connected={syncState.connection === 'connected'} class:slow={syncState.connection === 'slow'} class:offline={syncState.connection === 'offline'}>{connectionLabel}</span>
+      {#if syncState.connection !== 'local'}
+        <span class="connection-status" class:connected={syncState.connection === 'connected'} class:slow={syncState.connection === 'slow'} class:offline={syncState.connection === 'offline'}>{connectionLabel}</span>
+      {/if}
     </div>
   {:else}
     <div class="empty-state">
@@ -231,6 +283,20 @@
     max-width: 660px;
     margin: 0 auto;
     min-height: 100%;
+  }
+
+  .editor-content-wrap:has(.blame-active) {
+    max-width: 820px;
+  }
+
+  .editor-body {
+    display: flex;
+    gap: 0;
+  }
+
+  .editor-body .editor-mount {
+    flex: 1;
+    min-width: 0;
   }
 
   .doc-title {

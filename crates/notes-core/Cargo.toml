@@ -14,9 +14,12 @@ thiserror.workspace = true
 dashmap.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
 tokio-util = "0.7"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
 notes-crypto = { path = "../notes-crypto" }
+hkdf = "0.12"
+sha2 = "0.10"
 whoami = "1"
+getrandom = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

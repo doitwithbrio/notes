@@ -64,104 +64,110 @@
 </script>
 
 <section class="section">
-  <div class="section-label">
-    <span class="section-rule"></span>
-    <span class="section-name">{headerLabel}</span>
+  <div class="section-header">
+    <span class="section-title">{headerLabel}</span>
     {#if pendingCount > 0}
       <span class="section-count">{pendingCount}</span>
     {/if}
   </div>
 
-  {#if !projectId}
-    <p class="empty-text">select a project or note</p>
-  {:else}
-    <div class="todo-input-wrap">
-      <input
-        class="todo-input"
-        type="text"
-        placeholder={isFileMode ? 'add a todo for this file...' : 'add a todo...'}
-        bind:value={newTodoText}
-        onkeydown={handleKeydown}
-      />
-    </div>
+  <div class="section-body">
+    {#if !projectId}
+      <p class="empty-text">select a project or note</p>
+    {:else}
+      <div class="todo-input-wrap">
+        <input
+          class="todo-input"
+          type="text"
+          placeholder={isFileMode ? 'add a todo for this file...' : 'add a todo...'}
+          bind:value={newTodoText}
+          onkeydown={handleKeydown}
+        />
+      </div>
 
-    <div class="todo-list">
-      {#each pendingTodos as todo (todo.id)}
-        <div class="todo-item">
-          <label class="todo-check">
-            <input
-              type="checkbox"
-              checked={todo.done}
-              onchange={() => toggleTodo(todo.id)}
-            />
-          </label>
-          <div class="todo-content">
-            <span class="todo-text">{todo.text}</span>
-            {#if todo.linkedDocId && !isFileMode}
-              {@const title = getLinkedDocTitle(todo.linkedDocId)}
-              {#if title}
-                <span class="todo-link">
-                  <FileText size={10} strokeWidth={1.5} />
-                  {title}
-                </span>
+      <div class="todo-list">
+        {#each pendingTodos as todo (todo.id)}
+          <div class="todo-item">
+            <label class="todo-check">
+              <input
+                type="checkbox"
+                checked={todo.done}
+                onchange={() => toggleTodo(todo.id)}
+              />
+            </label>
+            <div class="todo-content">
+              <span class="todo-text">{todo.text}</span>
+              {#if todo.linkedDocId && !isFileMode}
+                {@const title = getLinkedDocTitle(todo.linkedDocId)}
+                {#if title}
+                  <span class="todo-link">
+                    <FileText size={10} strokeWidth={1.5} />
+                    {title}
+                  </span>
+                {/if}
               {/if}
-            {/if}
+            </div>
+            <button class="todo-remove" onclick={() => removeTodo(todo.id)} aria-label="remove todo">
+              <X size={11} strokeWidth={1.5} />
+            </button>
           </div>
-          <button class="todo-remove" onclick={() => removeTodo(todo.id)} aria-label="remove todo">
-            <X size={11} strokeWidth={1.5} />
-          </button>
-        </div>
-      {/each}
+        {/each}
 
-      {#each doneTodos as todo (todo.id)}
-        <div class="todo-item done">
-          <label class="todo-check">
-            <input
-              type="checkbox"
-              checked={todo.done}
-              onchange={() => toggleTodo(todo.id)}
-            />
-          </label>
-          <div class="todo-content">
-            <span class="todo-text">{todo.text}</span>
+        {#each doneTodos as todo (todo.id)}
+          <div class="todo-item done">
+            <label class="todo-check">
+              <input
+                type="checkbox"
+                checked={todo.done}
+                onchange={() => toggleTodo(todo.id)}
+              />
+            </label>
+            <div class="todo-content">
+              <span class="todo-text">{todo.text}</span>
+            </div>
+            <button class="todo-remove" onclick={() => removeTodo(todo.id)} aria-label="remove todo">
+              <X size={11} strokeWidth={1.5} />
+            </button>
           </div>
-          <button class="todo-remove" onclick={() => removeTodo(todo.id)} aria-label="remove todo">
-            <X size={11} strokeWidth={1.5} />
-          </button>
-        </div>
-      {/each}
+        {/each}
 
-      {#if todos.length === 0}
-        <p class="empty-text">{isFileMode ? 'no todos for this file' : 'no todos yet'}</p>
-      {/if}
-    </div>
-  {/if}
+        {#if todos.length === 0}
+          <p class="empty-text">{isFileMode ? 'no todos for this file' : 'no todos yet'}</p>
+        {/if}
+      </div>
+    {/if}
+  </div>
 </section>
 
 <style>
   .section {
-    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    flex: 1;
+    border-bottom: 1px solid var(--border-subtle);
   }
 
-  .section-label {
+  .section-header {
     display: flex;
     align-items: center;
-    gap: 8px;
-    margin-bottom: 12px;
-  }
-
-  .section-rule {
-    width: 12px;
-    height: 1px;
-    background: rgba(182, 141, 94, 0.50);
+    gap: 6px;
+    padding: 12px 16px 8px;
     flex-shrink: 0;
   }
 
-  .section-name {
-    font-size: 11px;
-    font-weight: 500;
-    color: rgba(0, 0, 0, 0.35);
-    letter-spacing: 0.06em;
+  .section-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 0 16px 12px;
+  }
+
+  .section-title {
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    color: var(--text-primary);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -170,7 +176,7 @@
   .section-count {
     font-size: 10px;
     font-weight: 600;
-    color: rgba(0, 0, 0, 0.35);
+    color: var(--text-primary);
     background: var(--surface-active);
     padding: 0 5px;
     border-radius: 8px;
@@ -195,11 +201,11 @@
   }
 
   .todo-item:hover {
-    background: rgba(182, 141, 94, 0.06);
+    background: var(--surface-hover);
   }
 
   .todo-item.done {
-    opacity: 0.35;
+    opacity: 0.5;
   }
 
   .todo-check {
@@ -233,8 +239,8 @@
 
   .todo-item.done .todo-text {
     text-decoration: line-through;
-    text-decoration-color: rgba(0, 0, 0, 0.20);
-    color: rgba(0, 0, 0, 0.35);
+    text-decoration-color: var(--text-tertiary);
+    color: var(--text-tertiary);
   }
 
   .todo-link {
@@ -242,7 +248,7 @@
     align-items: center;
     gap: 3px;
     font-size: 11px;
-    color: rgba(0, 0, 0, 0.35);
+    color: var(--text-tertiary);
     font-weight: 450;
   }
 
@@ -253,7 +259,7 @@
     width: 18px;
     height: 18px;
     flex-shrink: 0;
-    color: rgba(0, 0, 0, 0.25);
+    color: var(--text-tertiary);
     border-radius: 4px;
     opacity: 0;
     transition: opacity var(--transition-fast), color var(--transition-fast);
@@ -286,17 +292,15 @@
 
   .todo-input:focus {
     border-color: var(--accent);
-    box-shadow: 0 0 0 3px rgba(182, 141, 94, 0.10);
   }
 
   .todo-input::placeholder {
-    color: rgba(0, 0, 0, 0.30);
+    color: var(--text-secondary);
   }
 
   .empty-text {
-    font-size: 12px;
-    font-style: italic;
-    color: rgba(0, 0, 0, 0.30);
+    font-size: 13px;
+    color: var(--text-tertiary);
     padding: 4px 6px;
   }
 </style>

@@ -16,7 +16,7 @@ export const CURSOR_COLORS = [
   '#10B981',
 ] as const;
 
-export type ConnectionStatus = 'connected' | 'slow' | 'offline';
+export type ConnectionStatus = 'connected' | 'slow' | 'offline' | 'local';
 export type SyncStatus = 'synced' | 'syncing' | 'local-only';
 export type PeerRole = 'owner' | 'editor' | 'viewer';
 export type AppView = 'editor' | 'settings' | 'project-overview' | 'history-review';
@@ -43,15 +43,25 @@ export interface BackendUnseenDocInfo {
   lastSeenAt: string | null;
 }
 
-export interface BackendHistorySession {
+export type VersionSignificance = 'skip' | 'minor' | 'significant' | 'named';
+export type VersionType = 'auto' | 'named';
+
+export interface BackendVersion {
   id: string;
+  docId: string;
+  project: string;
+  type: VersionType;
+  name: string;
+  label: string | null;
+  heads: string[];
   actor: string;
-  startedAt: number;
-  endedAt: number;
+  createdAt: number;
   changeCount: number;
-  opCount: number;
-  firstChangeHash: string;
-  lastChangeHash: string;
+  charsAdded: number;
+  charsRemoved: number;
+  blocksChanged: number;
+  significance: VersionSignificance;
+  seq: number;
 }
 
 export interface DiffBlock {
@@ -59,6 +69,25 @@ export interface DiffBlock {
   content: string;
   lineStart: number;
   lineEnd: number;
+}
+
+export interface BackendActorInfo {
+  alias: string | null;
+  colorIndex: number;
+}
+
+export interface BackendBlameSpan {
+  start: number;
+  end: number;
+  actor: string;
+  alias: string | null;
+  timestamp: number | null;
+}
+
+export interface BackendDocBlame {
+  textLength: number;
+  spans: BackendBlameSpan[];
+  actors: Record<string, BackendActorInfo>;
 }
 
 export interface BackendSearchResult {

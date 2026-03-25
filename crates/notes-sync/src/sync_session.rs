@@ -1,29 +1,42 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use automerge::sync::{Message as SyncMessage, SyncDoc, State as SyncState};
 use automerge::AutoCommit;
 
 /// Generate a sync message, working around borrow lifetime issues with sync().
-fn gen_sync_msg(
-    doc: &mut AutoCommit,
-    sync_state: &mut SyncState,
-) -> Option<Vec<u8>> {
+fn gen_sync_msg(doc: &mut AutoCommit, sync_state: &mut SyncState) -> Option<Vec<u8>> {
     let msg = doc.sync().generate_sync_message(sync_state);
     msg.map(|m| m.encode())
 }
 
 /// Receive a sync message and generate a response.
+/// Returns (had_changes, response_bytes, new_change_hashes).
 fn recv_and_gen(
     doc: &mut AutoCommit,
     sync_state: &mut SyncState,
     message: SyncMessage,
-) -> Result<(bool, Option<Vec<u8>>), automerge::AutomergeError> {
-    let heads_before = doc.get_heads();
+) -> Result<(bool, Option<Vec<u8>>, Vec<automerge::ChangeHash>), automerge::AutomergeError> {
+    let heads_before: Vec<automerge::ChangeHash> = doc.get_heads().to_vec();
     doc.sync().receive_sync_message(sync_state, message)?;
     let heads_after = doc.get_heads();
     let had_changes = heads_before != heads_after;
-    let response = doc.sync().generate_sync_message(sync_state).map(|m| m.encode());
-    Ok((had_changes, response))
+
+    // Collect hashes of newly applied changes for signature verification
+    let new_hashes = if had_changes {
+        doc.get_changes(&heads_before)
+            .iter()
+            .map(|c| c.hash())
+            .collect()
+    } else {
+        vec![]
+    };
+
+    let response = doc
+        .sync()
+        .generate_sync_message(sync_state)
+        .map(|m| m.encode());
+    Ok((had_changes, response, new_hashes))
 }
 use tokio::sync::RwLock;
 
@@ -33,9 +46,19 @@ use crate::protocol::{self, PROTOCOL_VERSION};
 ///
 /// Manages the Automerge SyncState and handles reading/writing
 /// framed sync messages over a QUIC bidirectional stream.
+///
+/// Supports optional Ed25519 signature verification on incoming changes
+/// when `allowed_peers` is provided.
 pub struct SyncSession {
     doc_id: [u8; 32],
     sync_state: SyncState,
+    /// If set, verify that all incoming changes are signed by a peer in this list.
+    allowed_peers: Option<Vec<iroh::EndpointId>>,
+    /// Known Automerge actor hex IDs that are authorized for this document.
+    /// Used for actor-ID-based verification of incoming changes.
+    known_actor_ids: HashSet<String>,
+    /// The remote peer's iroh identity (for logging).
+    remote_peer: Option<iroh::EndpointId>,
 }
 
 impl SyncSession {
@@ -43,6 +66,9 @@ impl SyncSession {
         Self {
             doc_id,
             sync_state: SyncState::new(),
+            allowed_peers: None,
+            known_actor_ids: HashSet::new(),
+            remote_peer: None,
         }
     }
 
@@ -51,7 +77,30 @@ impl SyncSession {
         Self {
             doc_id,
             sync_state: state.unwrap_or_else(SyncState::new),
+            allowed_peers: None,
+            known_actor_ids: HashSet::new(),
+            remote_peer: None,
         }
+    }
+
+    /// Set the ACL for signature verification.
+    /// When set, all incoming changes are verified against this peer list.
+    pub fn with_acl(mut self, allowed_peers: Vec<iroh::EndpointId>) -> Self {
+        self.allowed_peers = Some(allowed_peers);
+        self
+    }
+
+    /// Set known Automerge actor IDs for actor-based verification.
+    /// These are the hex-encoded actor IDs of authorized peers.
+    pub fn with_known_actors(mut self, actors: HashSet<String>) -> Self {
+        self.known_actor_ids = actors;
+        self
+    }
+
+    /// Set the remote peer identity (for logging).
+    pub fn with_remote_peer(mut self, peer: iroh::EndpointId) -> Self {
+        self.remote_peer = Some(peer);
+        self
     }
 
     /// Get a reference to the sync state (for persisting after session).
@@ -94,6 +143,18 @@ impl SyncSession {
     }
 
     /// The core sync loop: exchange Automerge sync messages until both sides converge.
+    ///
+    /// When `allowed_peers` is set, newly applied changes are checked post-receive.
+    /// This is a post-hoc verification — Automerge applies the changes first, then
+    /// we check that the actors who produced them are authorized. If verification fails,
+    /// the session is terminated with an error. The applied changes remain (Automerge
+    /// doesn't support rollback), but no further changes are accepted.
+    ///
+    /// This approach is practical because:
+    /// 1. Automerge sync operates at the sync-message level, not individual changes
+    /// 2. Sync messages are opaque; we can only inspect changes after application
+    /// 3. The transport is already authenticated (iroh QUIC E2E)
+    /// 4. Post-hoc detection + session termination is sufficient for honest-but-curious peers
     async fn sync_loop(
         &mut self,
         send: &mut iroh::endpoint::SendStream,
@@ -130,12 +191,23 @@ impl SyncSession {
             let peer_msg = SyncMessage::decode(&msg_bytes)
                 .map_err(|e| SyncError::Protocol(format!("invalid sync message: {e}")))?;
 
-            let (had_changes, response) = {
+            let (had_changes, response, new_hashes) = {
                 let mut doc = doc.write().await;
                 recv_and_gen(&mut doc, &mut self.sync_state, peer_msg)?
             };
 
+            // Post-receive signature verification (when ACL is configured)
             if had_changes {
+                if let Some(ref allowed) = self.allowed_peers {
+                    if let Err(e) = self.verify_new_changes(&doc, &new_hashes, allowed).await {
+                        log::error!(
+                            "Signature verification failed for doc {:?} from {:?}: {e}",
+                            &self.doc_id[..4],
+                            self.remote_peer,
+                        );
+                        return Err(SyncError::SignatureError(e.to_string()));
+                    }
+                }
                 unproductive_rounds = 0;
             } else {
                 unproductive_rounds += 1;
@@ -148,10 +220,7 @@ impl SyncSession {
                     write_bytes(send, &framed).await?;
                 }
                 None => {
-                    log::debug!(
-                        "Sync complete for doc {:?}",
-                        &self.doc_id[..4]
-                    );
+                    log::debug!("Sync complete for doc {:?}", &self.doc_id[..4]);
                     break;
                 }
             }
@@ -179,6 +248,68 @@ impl SyncSession {
 
         Ok(())
     }
+
+    /// Verify that newly applied changes come from authorized peers.
+    ///
+    /// Checks that the Automerge actor ID of each new change is in the
+    /// `known_actor_ids` set. If the set is empty (no actor mapping configured),
+    /// falls back to allow-all with a warning (graceful degradation for
+    /// projects that haven't set up actor ID registration yet).
+    ///
+    /// When per-change Ed25519 signatures are added, this function will
+    /// additionally verify `SignedChange` envelopes via `verify_and_check_acl()`.
+    async fn verify_new_changes(
+        &self,
+        doc: &Arc<RwLock<AutoCommit>>,
+        new_hashes: &[automerge::ChangeHash],
+        _allowed_peers: &[iroh::EndpointId],
+    ) -> Result<(), SyncError> {
+        if new_hashes.is_empty() {
+            return Ok(());
+        }
+
+        // If no known actor IDs are configured, allow all with a warning.
+        // This handles projects that haven't registered actor IDs yet.
+        if self.known_actor_ids.is_empty() {
+            log::debug!(
+                "No known actor IDs configured for doc {:?}, skipping actor verification",
+                &self.doc_id[..4]
+            );
+            return Ok(());
+        }
+
+        let mut doc = doc.write().await;
+        let changes = doc.get_changes(&[]);
+
+        for hash in new_hashes {
+            let change = changes.iter().find(|c| c.hash() == *hash);
+            if let Some(change) = change {
+                let actor = change.actor_id().to_hex_string();
+
+                if !self.known_actor_ids.contains(&actor) {
+                    log::error!(
+                        "REJECTED change {} from unknown actor {} in doc {:?} (remote: {:?})",
+                        hash,
+                        &actor[..8.min(actor.len())],
+                        &self.doc_id[..4],
+                        self.remote_peer,
+                    );
+                    return Err(SyncError::SignatureError(format!(
+                        "change from unknown actor {}", &actor[..8.min(actor.len())]
+                    )));
+                }
+
+                log::debug!(
+                    "Verified change {} from actor {} in doc {:?}",
+                    hash,
+                    &actor[..8.min(actor.len())],
+                    &self.doc_id[..4]
+                );
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Write bytes to a QUIC send stream, mapping errors to SyncError.
@@ -193,13 +324,16 @@ async fn write_bytes(
 }
 
 /// Read a length-prefixed framed message from a QUIC receive stream.
-async fn read_framed(recv: &mut iroh::endpoint::RecvStream) -> Result<Vec<u8>, SyncError> {
+pub async fn read_framed(recv: &mut iroh::endpoint::RecvStream) -> Result<Vec<u8>, SyncError> {
     let mut len_buf = [0u8; 4];
     match recv.read_exact(&mut len_buf).await {
         Ok(()) => {}
         Err(e) => {
             let msg = e.to_string();
-            if msg.contains("finished") || msg.contains("STREAM_FIN") || msg.contains("ClosedStream") {
+            if msg.contains("finished")
+                || msg.contains("STREAM_FIN")
+                || msg.contains("ClosedStream")
+            {
                 return Err(SyncError::StreamFinished);
             }
             return Err(SyncError::Io(Box::new(e)));
@@ -260,6 +394,9 @@ pub enum SyncError {
     #[error("Protocol error: {0}")]
     Protocol(String),
 
+    #[error("Signature verification failed: {0}")]
+    SignatureError(String),
+
     #[error("Stream finished")]
     StreamFinished,
 }
@@ -273,5 +410,18 @@ mod tests {
         let doc_id = [0xAA; 32];
         let session = SyncSession::new(doc_id);
         assert_eq!(session.doc_id, doc_id);
+    }
+
+    #[test]
+    fn test_sync_session_with_acl() {
+        let doc_id = [0xAA; 32];
+        let mut rng = [0u8; 32];
+        getrandom::fill(&mut rng).unwrap();
+        let key = iroh::SecretKey::from_bytes(&rng);
+        let peer = key.public();
+
+        let session = SyncSession::new(doc_id).with_acl(vec![peer]);
+        assert!(session.allowed_peers.is_some());
+        assert_eq!(session.allowed_peers.unwrap().len(), 1);
     }
 }

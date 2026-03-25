@@ -12,6 +12,7 @@ use iroh::EndpointId;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::events::{PeerConnectionState, PeerStatusEvent};
 use crate::sync_engine::{SyncEngine, NOTES_SYNC_ALPN};
 
 /// Manages peer connections and live sync for all projects.
@@ -27,17 +28,27 @@ pub struct PeerManager {
 
     /// Cancellation token for background tasks.
     cancel: CancellationToken,
+
+    /// Broadcast channel for peer status changes (connect/disconnect).
+    status_tx: tokio::sync::broadcast::Sender<PeerStatusEvent>,
 }
 
 impl PeerManager {
     pub fn new(endpoint: Endpoint, sync_engine: Arc<SyncEngine>) -> Self {
+        let (status_tx, _) = tokio::sync::broadcast::channel(64);
         Self {
             endpoint,
             sync_engine,
             connections: DashMap::new(),
             project_peers: DashMap::new(),
             cancel: CancellationToken::new(),
+            status_tx,
         }
+    }
+
+    /// Subscribe to peer status change events (connect/disconnect).
+    pub fn subscribe_peer_status(&self) -> tokio::sync::broadcast::Receiver<PeerStatusEvent> {
+        self.status_tx.subscribe()
     }
 
     /// Register a peer for a project.
@@ -193,6 +204,11 @@ impl PeerManager {
                                 match this.get_or_connect(peer_id).await {
                                     Ok(_) => {
                                         log::info!("Auto-reconnected to peer {peer_id}");
+                                        let _ = this.status_tx.send(PeerStatusEvent {
+                                            peer_id: peer_id.to_string(),
+                                            state: PeerConnectionState::Connected,
+                                            alias: None,
+                                        });
                                     }
                                     Err(e) => {
                                         log::debug!("Auto-reconnect failed for {peer_id}: {e}");
@@ -211,6 +227,11 @@ impl PeerManager {
 
                         for peer_id in dead_peers {
                             this.connections.remove(&peer_id);
+                            let _ = this.status_tx.send(PeerStatusEvent {
+                                peer_id: peer_id.to_string(),
+                                state: PeerConnectionState::Disconnected,
+                                alias: None,
+                            });
                         }
                     }
                 }

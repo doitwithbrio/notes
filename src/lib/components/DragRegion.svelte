@@ -40,6 +40,7 @@
       </div>
     {/if}
 
+    {#if syncState.connection !== 'local'}
     <div
       class="sync-dot"
       class:connected={syncState.connection === 'connected'}
@@ -51,6 +52,7 @@
           ? 'sync slow'
           : 'offline'}
     ></div>
+    {/if}
   </div>
 </div>
 

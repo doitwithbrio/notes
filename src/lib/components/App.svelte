@@ -3,7 +3,7 @@
 
   import { initializeApp, appSessionState, teardownAppSession } from '../state/app-session.svelte.js';
   import { closeEditorSession } from '../session/editor-session.svelte.js';
-  import { uiState } from '../state/ui.svelte.js';
+  import { uiState, toggleBlame } from '../state/ui.svelte.js';
   import { projectState } from '../state/projects.svelte.js';
   import { getActiveDoc } from '../state/documents.svelte.js';
   import { isMac } from '../utils/platform.js';
@@ -39,6 +39,10 @@
     if (mod && e.key === 'f') {
       e.preventDefault();
       uiState.quickOpenVisible = !uiState.quickOpenVisible;
+    }
+    if (mod && e.shiftKey && (e.key === 'B' || e.key === 'b')) {
+      e.preventDefault();
+      toggleBlame();
     }
     if (e.key === 'Escape') {
       uiState.quickOpenVisible = false;

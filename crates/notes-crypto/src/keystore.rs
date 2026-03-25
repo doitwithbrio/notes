@@ -102,6 +102,55 @@ impl KeyStore {
         self.key_file_path(name).exists()
     }
 
+    // ── X25519 Keypair Management ─────────────────────────────────────
+
+    /// Store an X25519 static secret key.
+    pub fn store_x25519_secret(
+        &self,
+        name: &str,
+        secret: &x25519_dalek::StaticSecret,
+    ) -> Result<(), CryptoError> {
+        self.store_key(name, secret.as_bytes())
+    }
+
+    /// Load an X25519 static secret key.
+    pub fn load_x25519_secret(
+        &self,
+        name: &str,
+    ) -> Result<x25519_dalek::StaticSecret, CryptoError> {
+        let bytes = self.load_key(name)?;
+        if bytes.len() != 32 {
+            return Err(CryptoError::InvalidData(
+                "X25519 secret key must be 32 bytes".into(),
+            ));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        Ok(x25519_dalek::StaticSecret::from(arr))
+    }
+
+    /// Get or create an X25519 keypair. If the secret key already exists
+    /// in the keystore, loads it. Otherwise, generates a new one and stores it.
+    /// Returns (secret, public).
+    pub fn get_or_create_x25519(
+        &self,
+        name: &str,
+    ) -> Result<(x25519_dalek::StaticSecret, x25519_dalek::PublicKey), CryptoError> {
+        if self.has_key(name) {
+            let secret = self.load_x25519_secret(name)?;
+            let public = x25519_dalek::PublicKey::from(&secret);
+            Ok((secret, public))
+        } else {
+            let mut rng_bytes = [0u8; 32];
+            getrandom::fill(&mut rng_bytes).map_err(|_| CryptoError::RandomFailed)?;
+            let secret = x25519_dalek::StaticSecret::from(rng_bytes);
+            let public = x25519_dalek::PublicKey::from(&secret);
+            self.store_x25519_secret(name, &secret)?;
+            log::info!("Generated new X25519 keypair '{name}'");
+            Ok((secret, public))
+        }
+    }
+
     // ── File-based fallback ──────────────────────────────────────────
 
     fn key_file_path(&self, name: &str) -> PathBuf {
@@ -251,5 +300,46 @@ mod tests {
 
         let loaded = store.load_key("key").unwrap();
         assert_eq!(loaded, b"version2");
+    }
+
+    #[test]
+    fn test_x25519_get_or_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = KeyStore::new(dir.path().to_path_buf());
+
+        let (secret1, public1) = store.get_or_create_x25519("test-x25519").unwrap();
+        let (secret2, public2) = store.get_or_create_x25519("test-x25519").unwrap();
+
+        // Should return the same keypair on second call
+        assert_eq!(public1.as_bytes(), public2.as_bytes());
+        assert_eq!(secret1.as_bytes(), secret2.as_bytes());
+    }
+
+    #[test]
+    fn test_x25519_store_load_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = KeyStore::new(dir.path().to_path_buf());
+
+        let mut rng_bytes = [0u8; 32];
+        getrandom::fill(&mut rng_bytes).unwrap();
+        let original = x25519_dalek::StaticSecret::from(rng_bytes);
+        let original_public = x25519_dalek::PublicKey::from(&original);
+
+        store.store_x25519_secret("x25519-test", &original).unwrap();
+        let loaded = store.load_x25519_secret("x25519-test").unwrap();
+        let loaded_public = x25519_dalek::PublicKey::from(&loaded);
+
+        assert_eq!(original_public.as_bytes(), loaded_public.as_bytes());
+    }
+
+    #[test]
+    fn test_x25519_different_names_different_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = KeyStore::new(dir.path().to_path_buf());
+
+        let (_, pub_a) = store.get_or_create_x25519("key-a").unwrap();
+        let (_, pub_b) = store.get_or_create_x25519("key-b").unwrap();
+
+        assert_ne!(pub_a.as_bytes(), pub_b.as_bytes());
     }
 }

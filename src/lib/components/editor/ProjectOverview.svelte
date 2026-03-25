@@ -74,10 +74,9 @@
       </div>
 
       <!-- Todos section -->
-      <div class="section-card">
-        <div class="section-label">
-          <span class="section-rule"></span>
-          <span class="section-name">todos</span>
+      <div class="section">
+        <div class="section-header">
+          <span class="section-title">todos</span>
           {#if pendingTodos.length > 0}
             <span class="section-count">{pendingTodos.length}</span>
           {/if}
@@ -146,10 +145,9 @@
       </div>
 
       <!-- Files section -->
-      <div class="section-card">
-        <div class="section-label">
-          <span class="section-rule"></span>
-          <span class="section-name">notes</span>
+      <div class="section">
+        <div class="section-header">
+          <span class="section-title">notes</span>
           {#if projectDocs.length > 0}
             <span class="section-count">{projectDocs.length}</span>
           {/if}
@@ -158,9 +156,7 @@
         <div class="file-list">
           {#each projectDocs as doc (doc.id)}
             <button class="file-row" onclick={() => openDoc(doc.id)}>
-              <span class="file-icon-box">
-                <FileText size={15} strokeWidth={1.5} />
-              </span>
+              <FileText size={14} strokeWidth={1.5} class="file-icon" />
               <span class="file-info">
                 <span class="file-name">{doc.title}</span>
                 {#if doc.wordCount > 0}
@@ -234,7 +230,7 @@
   /* ── Project Header ── */
 
   .project-header {
-    margin-bottom: 48px;
+    margin-bottom: 40px;
   }
 
   .project-title {
@@ -249,57 +245,40 @@
 
   .project-meta {
     font-size: 13px;
-    color: rgba(0, 0, 0, 0.40);
+    color: var(--text-tertiary);
     font-weight: 400;
-    letter-spacing: 0.01em;
     line-height: 1.5;
   }
 
-  /* ── Section Cards ── */
+  /* ── Sections ── */
 
-  .section-card {
-    background: var(--surface-hover);
-    border: 1px solid var(--border-subtle);
-    border-radius: 12px;
-    padding: 20px;
-    margin-bottom: 16px;
+  .section {
+    margin-bottom: 32px;
   }
 
-  .section-label {
+  .section-header {
     display: flex;
     align-items: center;
-    gap: 8px;
-    margin-bottom: 16px;
+    gap: 6px;
+    margin-bottom: 12px;
   }
 
-  .section-rule {
-    width: 12px;
-    height: 1px;
-    background: rgba(182, 141, 94, 0.50);
-    flex-shrink: 0;
-  }
-
-  .section-name {
-    font-size: 11px;
-    font-weight: 500;
-    color: rgba(0, 0, 0, 0.35);
-    letter-spacing: 0.06em;
+  .section-title {
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    color: var(--text-primary);
   }
 
   .section-count {
-    font-size: 10px;
-    font-weight: 600;
-    color: rgba(0, 0, 0, 0.35);
-    background: var(--surface-active);
-    padding: 0 6px;
-    border-radius: 8px;
-    line-height: 16px;
+    font-size: 12px;
+    color: var(--text-tertiary);
   }
 
   /* ── Todos ── */
 
   .todo-input-wrap {
-    margin-bottom: 14px;
+    margin-bottom: 12px;
   }
 
   .todo-input {
@@ -312,16 +291,15 @@
     border: 1px solid var(--border-subtle);
     border-radius: 10px;
     outline: none;
-    transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+    transition: border-color var(--transition-fast);
   }
 
   .todo-input:focus {
     border-color: var(--accent);
-    box-shadow: 0 0 0 3px rgba(182, 141, 94, 0.10);
   }
 
   .todo-input::placeholder {
-    color: rgba(0, 0, 0, 0.30);
+    color: var(--text-secondary);
   }
 
   .todo-list {
@@ -334,18 +312,19 @@
     display: flex;
     align-items: flex-start;
     gap: 10px;
-    padding: 8px 8px;
-    margin: 0 -8px;
+    padding: 6px 8px;
     border-radius: 8px;
     transition: background var(--transition-fast);
   }
 
   .todo-item:hover {
-    background: rgba(182, 141, 94, 0.06);
+    background: var(--surface-hover);
   }
 
-  .todo-item.done {
-    opacity: 0.35;
+  .todo-item.done .todo-text {
+    text-decoration: line-through;
+    text-decoration-color: var(--text-tertiary);
+    color: var(--text-tertiary);
   }
 
   .todo-check {
@@ -371,16 +350,10 @@
   }
 
   .todo-text {
-    font-size: 15px;
+    font-size: 14px;
     color: var(--text-primary);
     line-height: 1.5;
     word-break: break-word;
-  }
-
-  .todo-item.done .todo-text {
-    text-decoration: line-through;
-    text-decoration-color: rgba(0, 0, 0, 0.20);
-    color: rgba(0, 0, 0, 0.35);
   }
 
   .todo-link {
@@ -388,7 +361,7 @@
     align-items: center;
     gap: 3px;
     font-size: 11px;
-    color: rgba(0, 0, 0, 0.35);
+    color: var(--text-tertiary);
     font-weight: 450;
   }
 
@@ -399,7 +372,7 @@
     width: 20px;
     height: 20px;
     flex-shrink: 0;
-    color: rgba(0, 0, 0, 0.25);
+    color: var(--text-tertiary);
     border-radius: 4px;
     opacity: 0;
     transition: opacity var(--transition-fast), color var(--transition-fast);
@@ -424,33 +397,29 @@
   .file-row {
     display: flex;
     align-items: center;
-    gap: 12px;
-    padding: 8px 8px;
-    margin: 0 -8px;
+    gap: 10px;
+    padding: 6px 8px;
     border-radius: 8px;
     text-align: left;
-    width: calc(100% + 16px);
+    width: 100%;
     transition: background var(--transition-fast);
     cursor: pointer;
   }
 
   .file-row:hover {
-    background: rgba(182, 141, 94, 0.06);
+    background: var(--surface-hover);
   }
 
   .file-row:hover .file-name {
     color: var(--accent);
   }
 
-  .file-icon-box {
-    width: 32px;
-    height: 32px;
-    border-radius: 8px;
-    background: var(--surface-active);
-    display: flex;
-    align-items: center;
-    justify-content: center;
+  .file-row :global(svg) {
+    color: var(--text-tertiary);
     flex-shrink: 0;
+  }
+
+  .file-row:hover :global(svg) {
     color: var(--accent);
   }
 
@@ -463,8 +432,8 @@
   }
 
   .file-name {
-    font-size: 14px;
-    font-weight: 500;
+    font-size: 13px;
+    font-weight: 450;
     color: var(--text-primary);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -474,7 +443,7 @@
 
   .file-meta {
     font-size: 12px;
-    color: rgba(0, 0, 0, 0.35);
+    color: var(--text-tertiary);
     font-variant-numeric: tabular-nums;
   }
 
@@ -492,14 +461,14 @@
   }
 
   .file-peer-dot {
-    width: 6px;
-    height: 6px;
+    width: 5px;
+    height: 5px;
     border-radius: 50%;
   }
 
   .sync-dot {
-    width: 6px;
-    height: 6px;
+    width: 5px;
+    height: 5px;
     border-radius: 50%;
     flex-shrink: 0;
   }
@@ -514,15 +483,14 @@
   }
 
   .sync-dot.local-only {
-    background: rgba(0, 0, 0, 0.15);
+    background: var(--text-tertiary);
   }
 
   /* ── Empty states ── */
 
   .empty-hint {
     font-size: 13px;
-    font-style: italic;
-    color: rgba(0, 0, 0, 0.30);
-    padding: 12px 0 4px;
+    color: var(--text-tertiary);
+    padding: 4px 0;
   }
 </style>

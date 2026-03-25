@@ -185,7 +185,6 @@
       if (project) {
         await loadProjectDocs(project.id);
         documentState.activeDocId = null;
-        await closeEditorSession();
         openProjectOverview(project.id);
       }
     } catch (err) {
@@ -340,7 +339,7 @@
           oncommit={(name) => { renamingProjectId = null; /* project rename is local-only for now */ }}
           oncancel={() => { renamingProjectId = null; cancelNewProject(); }}
           onnewnote={() => startNewNote(project.id)}
-          onprojectclick={() => { documentState.activeDocId = null; void closeEditorSession(); openProjectOverview(project.id); }}
+          onprojectclick={() => { documentState.activeDocId = null; openProjectOverview(project.id); }}
           ondocopen={(docId) => openEditorSession(project.id, docId)}
           ondoccommit={(title) => {
             if (renamingDocId) {

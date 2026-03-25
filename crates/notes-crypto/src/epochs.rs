@@ -62,6 +62,23 @@ impl EpochKeys {
         })
     }
 
+    /// Create an EpochKeys from an existing key at a specific epoch.
+    /// Used when receiving a key from the invite flow.
+    pub fn from_key(epoch: u32, key: &[u8; 32]) -> Self {
+        let mut keys = HashMap::new();
+        keys.insert(
+            epoch,
+            EpochKeyEntry {
+                key_hex: hex_encode(key),
+                created_at: chrono_now(),
+            },
+        );
+        Self {
+            current_epoch: epoch,
+            epoch_keys: keys,
+        }
+    }
+
     /// Get the key for a specific epoch.
     pub fn get_key(&self, epoch: u32) -> Result<EpochKey, CryptoError> {
         let entry = self
@@ -137,6 +154,14 @@ impl EpochKeyManager {
 
     pub fn from_keys(keys: EpochKeys) -> Self {
         Self { keys }
+    }
+
+    /// Create a manager from an existing key at a specific epoch.
+    /// Used when receiving a key from the invite flow.
+    pub fn from_key(epoch: u32, key: &[u8; 32]) -> Self {
+        Self {
+            keys: EpochKeys::from_key(epoch, key),
+        }
     }
 
     /// Get the current epoch key for encryption.

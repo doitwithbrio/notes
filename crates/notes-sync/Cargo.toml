@@ -6,6 +6,9 @@ edition = "2021"
 [dependencies]
 automerge.workspace = true
 iroh.workspace = true
+notes-crypto = { path = "../notes-crypto" }
+spake2 = "0.4"
+zeroize = "1.8"
 serde.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
