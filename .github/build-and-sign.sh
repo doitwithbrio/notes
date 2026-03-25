@@ -1,23 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# This script is called by tauri-action via tauriScript.
-# tauri-action invokes it as: ./build-and-sign.sh build --target <target>
+# Called by tauri-action via tauriScript.
+# tauri-action invokes: ./build-and-sign.sh build --target <target>
 #
-# It runs the normal `cargo tauri` build, then ad-hoc codesigns the
-# resulting .app bundle so macOS doesn't report it as "damaged."
+# 1. Runs npx tauri build
+# 2. Ad-hoc codesigns the .app bundle
+# 3. Repackages .app.tar.gz with the signed bundle
+# 4. Regenerates the updater .sig file
 
-# Run the actual Tauri build (pass all arguments through)
-cargo tauri "$@"
+# Use npx tauri (installed by tauri-action as @tauri-apps/cli)
+npx tauri "$@"
 
-# Find and codesign the .app bundle
-# Parse --target from the arguments to locate the bundle
+# Parse --target from arguments
 TARGET=""
-for i in "$@"; do
-  case "$prev" in
-    --target) TARGET="$i" ;;
-  esac
-  prev="$i"
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--target" ]; then
+    TARGET="$arg"
+  fi
+  prev="$arg"
 done
 
 if [ -z "$TARGET" ]; then
@@ -44,28 +46,16 @@ TAR_GZ=$(find "$BUNDLE_DIR" -name "*.app.tar.gz" -maxdepth 1 2>/dev/null | head 
 
 if [ -n "$TAR_GZ" ]; then
   echo "Repackaging $TAR_GZ with signed app"
-  (cd "$BUNDLE_DIR" && tar czf "$(basename "$TAR_GZ")" "$APP_NAME")
+  TAR_BASENAME=$(basename "$TAR_GZ")
+  (cd "$BUNDLE_DIR" && rm -f "$TAR_BASENAME" && tar czf "$TAR_BASENAME" "$APP_NAME")
 
   # Regenerate the updater .sig file
   if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
     SIG_FILE="${TAR_GZ}.sig"
     rm -f "$SIG_FILE"
-    cargo tauri signer sign --private-key "$TAURI_SIGNING_PRIVATE_KEY" "$TAR_GZ"
+    npx tauri signer sign --private-key "$TAURI_SIGNING_PRIVATE_KEY" "$TAR_GZ"
     echo "Updater signature regenerated"
   fi
-fi
-
-# Repackage the DMG with the signed bundle
-DMG=$(find "$BUNDLE_DIR" -name "*.dmg" -maxdepth 1 2>/dev/null | head -1)
-if [ -n "$DMG" ]; then
-  echo "Recreating DMG with signed app"
-  MOUNT_POINT=$(mktemp -d)
-  hdiutil attach "$DMG" -mountpoint "$MOUNT_POINT" -quiet
-  # Copy the signed app over the unsigned one in the mounted DMG
-  rm -rf "$MOUNT_POINT/$APP_NAME"
-  cp -R "$APP_BUNDLE" "$MOUNT_POINT/$APP_NAME"
-  hdiutil detach "$MOUNT_POINT" -quiet
-  echo "DMG updated with signed app"
 fi
 
 echo "Build and sign complete"
