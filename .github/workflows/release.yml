@@ -6,91 +6,144 @@ on:
       - 'v*'
 
 jobs:
-  release:
+  build:
     permissions:
       contents: write
     strategy:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-latest
-            target: aarch64-apple-darwin
-          - platform: macos-latest
-            target: x86_64-apple-darwin
+          - target: aarch64-apple-darwin
+            arch: aarch64
+          - target: x86_64-apple-darwin
+            arch: x64
 
-    runs-on: ${{ matrix.platform }}
+    runs-on: macos-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          targets: ${{ matrix.target }}
 
-      - name: Cache Rust artifacts
+      - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
           workspaces: './src-tauri -> target'
+          shared-key: ${{ matrix.target }}
 
       - name: Install bun
         uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
 
       - name: Install frontend dependencies
         run: bun install --frozen-lockfile
 
-      - name: Verify tag matches app version
-        env:
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          python3 - <<'PY'
-          import json
-          import os
-          import pathlib
-          import re
-          
-          ref = os.environ['REF_NAME']
-          tag_version = ref[1:] if ref.startswith('v') else ref
-          cargo_toml = pathlib.Path('src-tauri/Cargo.toml').read_text()
-          cargo_match = re.search(r'^version\s*=\s*"([^"]+)"', cargo_toml, re.MULTILINE)
-          if not cargo_match:
-              raise SystemExit('Could not read version from src-tauri/Cargo.toml')
-          cargo_version = cargo_match.group(1)
-          conf_version = json.loads(pathlib.Path('src-tauri/tauri.conf.json').read_text())['version']
-          if len({tag_version, cargo_version, conf_version}) != 1:
-              raise SystemExit(
-                  f'Version mismatch: tag={tag_version}, cargo={cargo_version}, tauri.conf={conf_version}'
-              )
-          print(f'Version check passed: {tag_version}')
-          PY
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
 
-      # Uses a wrapper script (.github/build-and-sign.sh) that:
-      # 1. Runs the normal cargo tauri build
-      # 2. Ad-hoc codesigns the .app bundle (codesign -s -)
-      # 3. Repackages the .app.tar.gz updater artifact with the signed bundle
-      # 4. Regenerates the updater .sig file
-      #
-      # Without this, the .app has a broken linker-applied signature and
-      # macOS reports "is damaged and can't be opened."
-      # With ad-hoc signing, users see "unidentified developer" instead,
-      # which can be bypassed via right-click > Open.
-      #
-      # To eliminate all warnings: add Apple Developer ID signing secrets.
-      - name: Build, sign, and release
-        uses: tauri-apps/tauri-action@v0
+      - name: Verify version
+        run: |
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          CARGO_VER=$(grep '^version' src-tauri/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          CONF_VER=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+          if [ "$TAG_VER" != "$CARGO_VER" ] || [ "$TAG_VER" != "$CONF_VER" ]; then
+            echo "::error::Version mismatch: tag=$TAG_VER cargo=$CARGO_VER conf=$CONF_VER"
+            exit 1
+          fi
+          echo "Version OK: $TAG_VER"
+
+      - name: Build
+        run: cargo tauri build --target ${{ matrix.target }}
+
+      - name: Ad-hoc codesign
+        run: |
+          APP=$(find src-tauri/target/${{ matrix.target }}/release/bundle/macos -name "*.app" -maxdepth 1 | head -1)
+          codesign --force --deep -s - "$APP"
+          codesign --verify --deep --strict "$APP"
+          echo "Signed: $APP"
+
+      - name: Repackage updater tarball with signed app
+        run: |
+          DIR="src-tauri/target/${{ matrix.target }}/release/bundle/macos"
+          APP=$(basename "$(find "$DIR" -name "*.app" -maxdepth 1 | head -1)")
+          TAR=$(basename "$(find "$DIR" -name "*.app.tar.gz" -maxdepth 1 | head -1)")
+          (cd "$DIR" && rm -f "$TAR" && tar czf "$TAR" "$APP")
+          echo "Repackaged: $TAR"
+
+      - name: Sign updater tarball
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-        with:
-          tauriScript: ./.github/build-and-sign.sh
-          tagName: v__VERSION__
-          releaseName: 'notes v__VERSION__'
-          releaseBody: |
-            **macOS:** If you see "unidentified developer", right-click the app
-            and select Open, then click Open in the dialog.
-          releaseDraft: true
-          prerelease: false
-          args: --target ${{ matrix.target }}
+        run: |
+          TAR=$(find src-tauri/target/${{ matrix.target }}/release/bundle/macos -name "*.app.tar.gz" | head -1)
+          rm -f "${TAR}.sig"
+          cargo tauri signer sign --private-key "$TAURI_SIGNING_PRIVATE_KEY" "$TAR"
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "notes ${GITHUB_REF_NAME}" \
+            --notes '**macOS:** If you see "unidentified developer", right-click the app and select Open.' \
+            --draft 2>/dev/null || true
+
+      - name: Upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
+          TAG="$GITHUB_REF_NAME"
+          REPO="$GITHUB_REPOSITORY"
+
+          for f in "$DIR"/dmg/*.dmg "$DIR"/macos/*.app.tar.gz "$DIR"/macos/*.app.tar.gz.sig; do
+            [ -f "$f" ] && gh release upload "$TAG" "$f" --repo "$REPO" --clobber
+          done
+
+  updater-json:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="$GITHUB_REF_NAME"
+          REPO="$GITHUB_REPOSITORY"
+          VER="${TAG#v}"
+          BASE="https://github.com/${REPO}/releases/download/${TAG}"
+          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          # Download the .sig files from the release to read their contents
+          mkdir -p /tmp/sigs
+          gh release download "$TAG" --repo "$REPO" --pattern "*.sig" --dir /tmp/sigs 2>/dev/null || true
+
+          AARCH64_SIG=""
+          X64_SIG=""
+          [ -f /tmp/sigs/notes_aarch64.app.tar.gz.sig ] && AARCH64_SIG=$(cat /tmp/sigs/notes_aarch64.app.tar.gz.sig)
+          [ -f /tmp/sigs/notes_x64.app.tar.gz.sig ] && X64_SIG=$(cat /tmp/sigs/notes_x64.app.tar.gz.sig)
+
+          cat > /tmp/latest.json << EOF
+          {
+            "version": "${VER}",
+            "pub_date": "${NOW}",
+            "platforms": {
+              "darwin-aarch64": {
+                "url": "${BASE}/notes_aarch64.app.tar.gz",
+                "signature": "${AARCH64_SIG}"
+              },
+              "darwin-x86_64": {
+                "url": "${BASE}/notes_x64.app.tar.gz",
+                "signature": "${X64_SIG}"
+              }
+            }
+          }
+          EOF
+
+          gh release upload "$TAG" /tmp/latest.json --repo "$REPO" --clobber
