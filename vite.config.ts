@@ -30,5 +30,6 @@ export default defineConfig({
         : 'safari15',
     minify: !process.env.TAURI_ENV_DEBUG ? 'esbuild' : false,
     sourcemap: !!process.env.TAURI_ENV_DEBUG,
+    modulePreload: false,
   },
 });
