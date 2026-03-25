@@ -188,26 +188,28 @@ jobs:
             exit 1
           fi
 
-          # Find actual tarball filenames from the release
           AARCH64_TAR=$(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name' | grep 'aarch64.*app\.tar\.gz$' | head -1)
           X64_TAR=$(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name' | grep 'x64.*app\.tar\.gz$' | head -1)
 
-          cat > /tmp/latest.json <<EOF
-{
-  "version": "${VER}",
-  "pub_date": "${NOW}",
-  "platforms": {
-    "darwin-aarch64": {
-      "url": "${BASE}/${AARCH64_TAR}",
-      "signature": "${AARCH64_SIG}"
-    },
-    "darwin-x86_64": {
-      "url": "${BASE}/${X64_TAR}",
-      "signature": "${X64_SIG}"
-    }
-  }
-}
-EOF
+          python3 -c "
+          import json, sys
+          data = {
+              'version': '${VER}',
+              'pub_date': '${NOW}',
+              'platforms': {
+                  'darwin-aarch64': {
+                      'url': '${BASE}/${AARCH64_TAR}',
+                      'signature': sys.argv[1]
+                  },
+                  'darwin-x86_64': {
+                      'url': '${BASE}/${X64_TAR}',
+                      'signature': sys.argv[2]
+                  }
+              }
+          }
+          with open('/tmp/latest.json', 'w') as f:
+              json.dump(data, f, indent=2)
+          print(json.dumps(data, indent=2))
+          " "$AARCH64_SIG" "$X64_SIG"
 
-          cat /tmp/latest.json
           gh release upload "$TAG" /tmp/latest.json --repo "$REPO" --clobber
