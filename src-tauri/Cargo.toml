@@ -1,6 +1,6 @@
 [package]
 name = "notes"
-version = "0.1.8"
+version = "0.1.0"
 description = "A local-first, peer-to-peer, end-to-end encrypted markdown notes app"
 authors = ["you"]
 license = "MIT"
@@ -8,7 +8,7 @@ repository = ""
 edition = "2021"
 
 [lib]
-name = "p2p_notes_lib"
+name = "notes_lib"
 crate-type = ["cdylib", "rlib"]
 
 [build-dependencies]
