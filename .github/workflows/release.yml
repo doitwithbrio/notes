@@ -97,7 +97,7 @@ jobs:
           DIR="${{ steps.bundle.outputs.dir }}/macos"
           TAR=$(find "$DIR" -name "*.app.tar.gz" -maxdepth 1 | head -1)
           rm -f "${TAR}.sig"
-          tauri signer sign --private-key "$TAURI_SIGNING_PRIVATE_KEY" "$TAR"
+          tauri signer sign --private-key "$TAURI_SIGNING_PRIVATE_KEY" --password "" "$TAR"
           echo "Signed: ${TAR}.sig"
 
       - name: Rebuild DMG with signed app
