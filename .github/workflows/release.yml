@@ -55,6 +55,8 @@ jobs:
           echo "Version OK: $TAG_VER"
 
       - name: Build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: cargo tauri build --target ${{ matrix.target }}
 
       - name: Ad-hoc codesign
