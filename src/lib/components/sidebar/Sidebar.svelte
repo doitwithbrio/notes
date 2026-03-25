@@ -32,6 +32,7 @@
   let contextMenu = $state<{ type: 'doc' | 'project'; x: number; y: number; projectId: string; docId?: string } | null>(null);
   let renamingDocId = $state<string | null>(null);
   let renamingProjectId = $state<string | null>(null);
+  let createProjectError = $state<string | null>(null);
 
   const docsByProject = $derived.by(() => {
     const grouped = new Map<string, typeof documentState.docs>();
@@ -105,18 +106,17 @@
         await closeEditorSession();
       }
 
-      // Delete all docs in the project
+      // Delete the project on the backend (removes all docs, manifest,
+      // keys, search index, and the project directory from disk)
+      await tauriApi.deleteProject(projectId);
+
+      // Remove docs from frontend state
       const projectDocs = documentState.docs.filter((d) => d.projectId === projectId);
       for (const doc of projectDocs) {
-        try {
-          await tauriApi.deleteNote(projectId, doc.id);
-        } catch {
-          // Continue even if individual deletes fail
-        }
         removeDoc(doc.id);
       }
 
-      // Remove project from state
+      // Remove project from frontend state
       removeProject(projectId);
     } catch (err) {
       console.error('Failed to delete project:', err);
@@ -204,6 +204,7 @@
       creatingProjectName = '';
       return;
     }
+    createProjectError = null;
     try {
       const project = await createProject(trimmed);
       if (project) {
@@ -212,10 +213,20 @@
         openProjectOverview(project.id);
       }
     } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.toLowerCase().includes('already exists')) {
+        createProjectError = `a project named "${trimmed}" already exists`;
+      } else {
+        createProjectError = `could not create project: ${msg}`;
+      }
       console.error('Failed to create project:', err);
+      // Keep the input visible so the user can fix the name
+      return;
     } finally {
-      creatingProject = false;
-      creatingProjectName = '';
+      if (!createProjectError) {
+        creatingProject = false;
+        creatingProjectName = '';
+      }
     }
   }
 
@@ -254,6 +265,7 @@
   function cancelNewProject() {
     creatingProject = false;
     creatingProjectName = '';
+    createProjectError = null;
   }
 
   function cancelNewNote() {
@@ -339,7 +351,7 @@
             if (event.key === 'Enter') { event.preventDefault(); void commitNewProject(creatingProjectName); }
             if (event.key === 'Escape') { event.preventDefault(); cancelNewProject(); }
           }}
-          onblur={() => void commitNewProject(creatingProjectName)}
+          onblur={() => { if (!createProjectError) void commitNewProject(creatingProjectName); }}
         />
         <button
           class="inline-accept"
@@ -349,6 +361,9 @@
           <Check size={13} strokeWidth={2} />
         </button>
       </div>
+      {#if createProjectError}
+        <div class="inline-error">{createProjectError}</div>
+      {/if}
     {/if}
 
     {#each projectState.projects as project (project.id)}
@@ -584,6 +599,13 @@
 
   .inline-create.note {
     margin-left: 10px;
+  }
+
+  .inline-error {
+    padding: 4px 16px 2px;
+    font-size: 11px;
+    color: var(--danger-fg, #c44);
+    line-height: 1.3;
   }
 
   .inline-input {

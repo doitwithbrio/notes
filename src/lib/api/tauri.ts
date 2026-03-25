@@ -34,6 +34,7 @@ export const tauriApi = {
   listProjects: () => guardedInvoke<string[]>('list_projects'),
   listProjectSummaries: () => guardedInvoke<BackendProjectSummary[]>('list_project_summaries'),
   createProject: (name: string) => guardedInvoke<void>('create_project', { name }),
+  deleteProject: (name: string) => guardedInvoke<void>('delete_project', { name }),
   openProject: (name: string, connectPeers = false) =>
     guardedInvoke<void>('open_project', { name, connectPeers }),
   listFiles: (project: string) => guardedInvoke<BackendDocInfo[]>('list_files', { project }),
