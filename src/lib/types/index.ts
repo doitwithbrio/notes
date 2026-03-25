@@ -19,7 +19,7 @@ export const CURSOR_COLORS = [
 export type ConnectionStatus = 'connected' | 'slow' | 'offline';
 export type SyncStatus = 'synced' | 'syncing' | 'local-only';
 export type PeerRole = 'owner' | 'editor' | 'viewer';
-export type AppView = 'editor' | 'settings' | 'project-overview';
+export type AppView = 'editor' | 'settings' | 'project-overview' | 'history-review';
 
 export interface BackendProjectSummary {
   name: string;
@@ -50,6 +50,15 @@ export interface BackendHistorySession {
   endedAt: number;
   changeCount: number;
   opCount: number;
+  firstChangeHash: string;
+  lastChangeHash: string;
+}
+
+export interface DiffBlock {
+  type: 'added' | 'removed' | 'changed' | 'unchanged';
+  content: string;
+  lineStart: number;
+  lineEnd: number;
 }
 
 export interface BackendSearchResult {
@@ -91,6 +100,17 @@ export interface BackendPeerStatusSummary {
   alias: string | null;
   role: PeerRole | null;
   activeDoc: string | null;
+}
+
+export interface AppSettings {
+  displayName: string;
+  customRelays: string[];
+  theme: string;
+  fontSize: number;
+  autoSave: boolean;
+  saveIntervalSecs: number;
+  largeDocWarningWords: number;
+  idleDocTimeoutSecs: number;
 }
 
 export interface Project {

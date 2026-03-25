@@ -31,6 +31,10 @@ export async function initializeApp() {
         const active = getActiveSession();
         if (active?.docId === docId) {
           await reloadActiveSession();
+          // Refresh history sidebar after remote changes
+          if (active.projectId) {
+            await loadHistory(active.projectId, docId);
+          }
         } else {
           markDocUnread(docId, true);
         }

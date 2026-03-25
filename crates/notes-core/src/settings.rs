@@ -94,7 +94,12 @@ impl AppSettings {
         let path = base_dir.join(".p2p").join("settings.json");
         tokio::fs::create_dir_all(path.parent().unwrap()).await?;
         let json = serde_json::to_string_pretty(self)?;
-        tokio::fs::write(&path, json).await?;
+        // Atomic write
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp_path = std::path::PathBuf::from(tmp);
+        tokio::fs::write(&tmp_path, &json).await?;
+        tokio::fs::rename(&tmp_path, &path).await?;
         Ok(())
     }
 

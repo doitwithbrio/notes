@@ -4,7 +4,7 @@ use automerge::AutoCommit;
 use dashmap::DashMap;
 use iroh::endpoint::Connection;
 use iroh::protocol::AcceptError;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use uuid::Uuid;
 
 use crate::protocol;
@@ -30,6 +30,12 @@ pub enum PeerRole {
 ///
 /// Remote change notifications are sent via a `tokio::sync::broadcast` channel.
 /// Subscribe with `SyncEngine::subscribe_remote_changes()` to receive `Uuid` doc IDs.
+/// Maximum concurrent connections handled by the sync engine.
+const MAX_CONNECTIONS: usize = 32;
+
+/// Maximum concurrent bidirectional streams per connection.
+const MAX_STREAMS_PER_CONNECTION: usize = 16;
+
 pub struct SyncEngine {
     /// Documents available for sync, keyed by their 32-byte wire ID.
     docs: Arc<DashMap<[u8; 32], Arc<RwLock<AutoCommit>>>>,
@@ -37,8 +43,14 @@ pub struct SyncEngine {
     /// ACL: maps (doc_key, peer_id) -> role. If no entry, peer is unauthorized.
     acl: Arc<DashMap<([u8; 32], iroh::EndpointId), PeerRole>>,
 
+    /// Persistent sync state store (optional — if None, fresh state per session).
+    sync_state_store: Option<Arc<crate::SyncStateStore>>,
+
     /// Channel for notifying about remote changes.
     change_tx: tokio::sync::broadcast::Sender<Uuid>,
+
+    /// Semaphore limiting concurrent incoming connections.
+    connection_semaphore: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for SyncEngine {
@@ -55,8 +67,15 @@ impl SyncEngine {
         Self {
             docs: Arc::new(DashMap::new()),
             acl: Arc::new(DashMap::new()),
+            sync_state_store: None,
             change_tx,
+            connection_semaphore: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
         }
+    }
+
+    /// Set the sync state store for persistent sync states.
+    pub fn set_sync_state_store(&mut self, store: Arc<crate::SyncStateStore>) {
+        self.sync_state_store = Some(store);
     }
 
     /// Subscribe to remote change notifications.
@@ -123,8 +142,23 @@ impl SyncEngine {
             .get_doc(&key)
             .ok_or_else(|| SyncError::Protocol(format!("document {doc_id} not registered")))?;
 
-        let mut session = SyncSession::new(key);
+        // Load persisted sync state if available
+        let peer_id = connection.remote_id();
+        let initial_state = if let Some(ref store) = self.sync_state_store {
+            Some(store.load_or_create(&peer_id, &doc_id).await)
+        } else {
+            None
+        };
+
+        let mut session = SyncSession::new_with_state(key, initial_state);
         session.run_initiator(connection, doc).await?;
+
+        // Save sync state after successful sync
+        if let Some(ref store) = self.sync_state_store {
+            if let Err(e) = store.save(&peer_id, &doc_id, session.sync_state()).await {
+                log::warn!("Failed to save sync state for {doc_id}: {e}");
+            }
+        }
 
         // Notify that remote changes may have been applied
         let _ = self.change_tx.send(doc_id);
@@ -140,7 +174,14 @@ impl SyncEngine {
             connection.remote_id()
         );
 
+        let stream_semaphore = Semaphore::new(MAX_STREAMS_PER_CONNECTION);
+
         loop {
+            // Limit concurrent streams per connection
+            let _stream_permit = stream_semaphore.acquire().await.map_err(|_| {
+                SyncError::Protocol("stream semaphore closed".to_string())
+            })?;
+
             // Accept the next bidirectional stream
             let (mut send, mut recv) = match connection.accept_bi().await {
                 Ok(streams) => streams,
@@ -251,10 +292,22 @@ impl iroh::protocol::ProtocolHandler for SyncEngine {
         let engine = SyncEngine {
             docs: Arc::clone(&self.docs),
             acl: Arc::clone(&self.acl),
+            sync_state_store: self.sync_state_store.clone(),
             change_tx: self.change_tx.clone(),
+            connection_semaphore: Arc::clone(&self.connection_semaphore),
         };
+        let semaphore = Arc::clone(&self.connection_semaphore);
 
         async move {
+            // Limit concurrent connections
+            let _permit = match semaphore.try_acquire() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    log::warn!("Connection limit reached, rejecting incoming sync connection");
+                    return Ok(());
+                }
+            };
+
             if let Err(e) = engine.handle_connection(connection).await {
                 log::error!("Sync protocol error: {e}");
             }

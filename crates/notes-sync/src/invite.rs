@@ -227,11 +227,24 @@ use dashmap::DashMap;
 use iroh::endpoint::Connection;
 use iroh::protocol::AcceptError;
 
+/// Event emitted when an invite is successfully accepted.
+#[derive(Debug, Clone)]
+pub struct InviteAccepted {
+    /// The project name that was shared.
+    pub project_name: String,
+    /// The invitee's peer ID (from the iroh connection).
+    pub invitee_peer_id: String,
+    /// The role assigned to the invitee.
+    pub role: String,
+}
+
 /// Owner-side invite handler. Implements `iroh::protocol::ProtocolHandler`
 /// to accept incoming invite connections and run the handshake.
 pub struct InviteHandler {
     /// Active pending invites, keyed by passphrase.
     pending: Arc<DashMap<String, PendingInvite>>,
+    /// Channel to notify when an invite is accepted (so the app can update the manifest).
+    accepted_tx: tokio::sync::broadcast::Sender<InviteAccepted>,
 }
 
 impl std::fmt::Debug for InviteHandler {
@@ -244,9 +257,16 @@ impl std::fmt::Debug for InviteHandler {
 
 impl InviteHandler {
     pub fn new() -> Self {
+        let (accepted_tx, _) = tokio::sync::broadcast::channel(64);
         Self {
             pending: Arc::new(DashMap::new()),
+            accepted_tx,
         }
+    }
+
+    /// Subscribe to invite acceptance notifications.
+    pub fn subscribe_accepted(&self) -> tokio::sync::broadcast::Receiver<InviteAccepted> {
+        self.accepted_tx.subscribe()
     }
 
     /// Register a pending invite. Called when the owner generates an invite code.
@@ -366,11 +386,22 @@ impl InviteHandler {
 
         let _ = send.finish();
 
+        // Notify that invite was accepted (so the app can update the manifest)
+        let invitee_peer_id = connection.remote_id().to_string();
+        let _ = self.accepted_tx.send(InviteAccepted {
+            project_name: payload.project_name.clone(),
+            invitee_peer_id: invitee_peer_id.clone(),
+            role: payload.role.clone(),
+        });
+
         // Remove the one-time invite
         self.pending.remove(&passphrase);
         self.cleanup_expired();
 
-        log::info!("Invite accepted for project: {}", payload.project_name);
+        log::info!(
+            "Invite accepted for project {} by peer {invitee_peer_id}",
+            payload.project_name
+        );
         Ok(())
     }
 }
@@ -388,6 +419,7 @@ impl iroh::protocol::ProtocolHandler for InviteHandler {
     ) -> impl std::future::Future<Output = Result<(), AcceptError>> + Send {
         let handler = InviteHandler {
             pending: Arc::clone(&self.pending),
+            accepted_tx: self.accepted_tx.clone(),
         };
 
         async move {

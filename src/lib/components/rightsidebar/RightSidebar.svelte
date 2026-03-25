@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { uiState, toggleRightSidebar } from '../../state/ui.svelte.js';
-  import { PanelRightClose, PanelRightOpen, Users, CheckSquare, Clock } from 'lucide-svelte';
+  import { uiState, toggleRightSidebar, openSettings } from '../../state/ui.svelte.js';
+  import { PanelRightClose, PanelRightOpen, Users, CheckSquare, Clock, Settings } from 'lucide-svelte';
   import PeersSection from './PeersSection.svelte';
   import TodosSection from './TodosSection.svelte';
   import HistorySection from './HistorySection.svelte';
@@ -35,11 +35,22 @@
         <Clock size={15} strokeWidth={1.5} />
       </button>
     </div>
+    <div class="right-sidebar-footer">
+      <button class="collapsed-icon-btn" onclick={openSettings} aria-label="settings" title="settings">
+        <Settings size={15} strokeWidth={1.5} />
+      </button>
+    </div>
   {:else}
     <div class="right-sidebar-scroll">
       <PeersSection />
       <TodosSection />
       <HistorySection />
+    </div>
+    <div class="right-sidebar-footer expanded">
+      <button class="settings-btn" onclick={openSettings} aria-label="settings">
+        <Settings size={13} strokeWidth={1.5} />
+        <span>settings</span>
+      </button>
     </div>
   {/if}
 </aside>
@@ -117,5 +128,36 @@
     display: flex;
     flex-direction: column;
     gap: 6px;
+  }
+
+  .right-sidebar-footer {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 12px 10px 16px;
+    margin-top: auto;
+  }
+
+  .right-sidebar-footer.expanded {
+    justify-content: flex-start;
+    padding: 12px 16px 16px;
+  }
+
+  .settings-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    font-weight: 450;
+    color: var(--text-tertiary);
+    padding: 4px 8px;
+    border-radius: 6px;
+    transition: color var(--transition-fast), background var(--transition-fast);
+  }
+
+  .settings-btn:hover {
+    color: var(--text-primary);
+    background: var(--surface-hover);
   }
 </style>

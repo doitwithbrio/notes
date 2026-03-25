@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { Document } from '../../types/index.js';
   import { documentState } from '../../state/documents.svelte.js';
+  import { uiState } from '../../state/ui.svelte.js';
   import { presenceState } from '../../state/presence.svelte.js';
 
   let {
@@ -23,13 +24,20 @@
     oncontextmenu?: (detail: { x: number; y: number; docId: string }) => void;
   } = $props();
 
-  const isActive = $derived(documentState.activeDocId === doc.id);
+  const isActive = $derived(documentState.activeDocId === doc.id && uiState.view === 'editor');
 
   const peersHere = $derived(
     presenceState.peers.filter((p) => doc.activePeers.includes(p.id) && p.online),
   );
 
   let inputValue = $state('');
+
+  // Pre-populate input with current title when entering edit mode
+  $effect(() => {
+    if (editing) {
+      inputValue = doc.title;
+    }
+  });
 
   function handleInputKeydown(e: KeyboardEvent) {
     if (e.key === 'Enter') {

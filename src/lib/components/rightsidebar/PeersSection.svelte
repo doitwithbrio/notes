@@ -15,10 +15,11 @@
 </script>
 
 <section class="section">
-  <div class="section-header">
-    <span class="section-title">peers</span>
+  <div class="section-label">
+    <span class="section-rule"></span>
+    <span class="section-name">peers</span>
     {#if presenceState.peers.length > 0}
-      <span class="section-badge">{presenceState.peers.length}</span>
+      <span class="section-count">{presenceState.peers.length}</span>
     {/if}
   </div>
 
@@ -61,24 +62,31 @@
     padding: 16px;
   }
 
-  .section-header {
+  .section-label {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
     margin-bottom: 12px;
   }
 
-  .section-title {
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.04em;
-    color: var(--text-primary);
+  .section-rule {
+    width: 12px;
+    height: 1px;
+    background: rgba(182, 141, 94, 0.50);
+    flex-shrink: 0;
   }
 
-  .section-badge {
+  .section-name {
+    font-size: 11px;
+    font-weight: 500;
+    color: rgba(0, 0, 0, 0.35);
+    letter-spacing: 0.06em;
+  }
+
+  .section-count {
     font-size: 10px;
     font-weight: 600;
-    color: var(--text-primary);
+    color: rgba(0, 0, 0, 0.35);
     background: var(--surface-active);
     padding: 0 5px;
     border-radius: 8px;
@@ -103,7 +111,7 @@
   }
 
   .peer-row:hover {
-    background: var(--surface-hover);
+    background: rgba(182, 141, 94, 0.06);
   }
 
   .peer-dot {
@@ -114,7 +122,7 @@
   }
 
   .offline-dot {
-    background: var(--text-tertiary);
+    background: rgba(0, 0, 0, 0.15);
   }
 
   .peer-name {
@@ -127,13 +135,13 @@
   }
 
   .peer-row.offline .peer-name {
-    color: var(--text-primary);
-    opacity: 0.5;
+    color: rgba(0, 0, 0, 0.35);
   }
 
   .empty-text {
     font-size: 12px;
-    color: var(--text-primary);
+    font-style: italic;
+    color: rgba(0, 0, 0, 0.30);
     padding: 4px 6px;
   }
 
@@ -161,12 +169,12 @@
   }
 
   .sync-indicator.offline {
-    background: var(--text-tertiary);
+    background: rgba(0, 0, 0, 0.15);
   }
 
   .sync-label {
     font-size: 12px;
-    color: var(--text-primary);
+    color: rgba(0, 0, 0, 0.40);
   }
 
   .unsent {

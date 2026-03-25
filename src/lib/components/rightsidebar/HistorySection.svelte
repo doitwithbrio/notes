@@ -1,14 +1,37 @@
 <script lang="ts">
   import { getActiveDoc } from '../../state/documents.svelte.js';
-  import { historyState } from '../../state/history.svelte.js';
-  import { Clock } from 'lucide-svelte';
+  import { historyState, selectSession } from '../../state/history.svelte.js';
+  import { editorSessionState } from '../../session/editor-session.svelte.js';
+  import { uiState } from '../../state/ui.svelte.js';
+  import { groupByDate } from '../../utils/time.js';
+  import HistorySessionItem from './HistorySessionItem.svelte';
 
   const activeDoc = $derived(getActiveDoc());
+  const sessionCount = $derived(historyState.sessions.length);
+
+  const grouped = $derived(
+    groupByDate(historyState.sessions, (s) => s.startedAt),
+  );
+
+  function handleSelectSession(sessionId: string) {
+    if (!editorSessionState.projectId || !editorSessionState.docId) return;
+    uiState.view = 'history-review';
+    uiState.historyReviewSessionId = sessionId;
+    selectSession(
+      editorSessionState.projectId,
+      editorSessionState.docId,
+      sessionId,
+    );
+  }
 </script>
 
 <section class="section">
-  <div class="section-header">
-    <span class="section-title">history</span>
+  <div class="section-label">
+    <span class="section-rule"></span>
+    <span class="section-name">history</span>
+    {#if sessionCount > 0}
+      <span class="section-count">{sessionCount}</span>
+    {/if}
   </div>
 
   {#if activeDoc}
@@ -17,19 +40,19 @@
     {:else if historyState.error}
       <p class="empty-text">{historyState.error}</p>
     {:else if historyState.sessions.length === 0}
-      <div class="placeholder">
-        <Clock size={16} strokeWidth={1.5} />
-        <p>no saved edit sessions yet</p>
-        <p class="sub">history will appear after the first committed changes</p>
-      </div>
+      <p class="empty-text">no edit history yet</p>
     {:else}
       <div class="history-list">
-        {#each historyState.sessions as session (session.id)}
-          <div class="history-item">
-            <p class="history-title">{session.actor.slice(0, 12)} edited</p>
-            <p class="history-meta">
-              {new Date(session.startedAt * 1000).toLocaleString()} · {session.changeCount} changes
-            </p>
+        {#each grouped as [dateLabel, sessions] (dateLabel)}
+          <div class="date-group">
+            <span class="date-label">{dateLabel}</span>
+            {#each sessions as session (session.id)}
+              <HistorySessionItem
+                {session}
+                selected={historyState.selectedSessionId === session.id}
+                onclick={() => handleSelectSession(session.id)}
+              />
+            {/each}
           </div>
         {/each}
       </div>
@@ -44,64 +67,62 @@
     padding: 16px;
   }
 
-  .section-header {
+  .section-label {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
     margin-bottom: 12px;
   }
 
-  .section-title {
+  .section-rule {
+    width: 12px;
+    height: 1px;
+    background: rgba(182, 141, 94, 0.50);
+    flex-shrink: 0;
+  }
+
+  .section-name {
     font-size: 11px;
+    font-weight: 500;
+    color: rgba(0, 0, 0, 0.35);
+    letter-spacing: 0.06em;
+  }
+
+  .section-count {
+    font-size: 10px;
     font-weight: 600;
-    letter-spacing: 0.04em;
-    color: var(--text-primary);
-  }
-
-  .placeholder {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 6px;
-    padding: 20px 12px;
-    color: var(--text-primary);
-    text-align: center;
-    font-size: 12px;
-    line-height: 1.5;
-  }
-
-  .placeholder .sub {
-    font-size: 11px;
-    opacity: 0.7;
+    color: rgba(0, 0, 0, 0.35);
+    background: var(--surface-active);
+    padding: 0 5px;
+    border-radius: 8px;
+    line-height: 16px;
   }
 
   .empty-text {
     font-size: 12px;
-    color: var(--text-primary);
+    font-style: italic;
+    color: rgba(0, 0, 0, 0.30);
     padding: 4px 6px;
   }
 
   .history-list {
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 12px;
   }
 
-  .history-item {
-    padding: 10px;
-    border-radius: 8px;
-    background: var(--surface-hover);
+  .date-group {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
   }
 
-  .history-title {
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--text-primary);
-  }
-
-  .history-meta {
-    font-size: 11px;
-    color: var(--text-primary);
-    margin-top: 2px;
+  .date-label {
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    color: rgba(0, 0, 0, 0.30);
+    padding: 0 10px;
+    margin-bottom: 4px;
   }
 </style>

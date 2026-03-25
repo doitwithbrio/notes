@@ -16,7 +16,7 @@ pub mod key_wrapping;
 pub mod keystore;
 pub mod signing;
 
-pub use encryption::{decrypt_document, encrypt_document};
+pub use encryption::{decrypt_document, decrypt_snapshot, encrypt_document, encrypt_snapshot};
 pub use epochs::{EpochKeyManager, EpochKeys};
 pub use error::CryptoError;
 pub use key_wrapping::{unwrap_epoch_key, wrap_epoch_key};

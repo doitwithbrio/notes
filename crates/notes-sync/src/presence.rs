@@ -4,6 +4,9 @@
 //! positions, active document, and online status. Messages are
 //! ephemeral — not persisted, not synced, just real-time.
 
+use std::time::Instant;
+
+use dashmap::DashMap;
 use iroh::EndpointId;
 use iroh_gossip::net::Gossip;
 use iroh_gossip::TopicId;
@@ -13,6 +16,12 @@ use uuid::Uuid;
 
 /// Maximum presence updates per second per peer (throttle).
 pub const MAX_PRESENCE_RATE: u32 = 10;
+
+/// Minimum interval between updates from the same peer (100ms = 10/sec).
+const MIN_UPDATE_INTERVAL_MS: u128 = 1000 / MAX_PRESENCE_RATE as u128;
+
+/// Maximum size of a single presence message in bytes.
+const MAX_PRESENCE_MESSAGE_SIZE: usize = 1024;
 
 /// A presence update broadcast to peers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +64,8 @@ pub struct PresenceManager {
     gossip: Gossip,
     /// Channel for broadcasting received presence updates to the frontend.
     presence_tx: broadcast::Sender<PresenceUpdate>,
+    /// Per-peer rate limiter: tracks the last accepted update time per peer.
+    rate_limiters: DashMap<String, Instant>,
 }
 
 impl PresenceManager {
@@ -63,7 +74,46 @@ impl PresenceManager {
         Self {
             gossip,
             presence_tx,
+            rate_limiters: DashMap::new(),
         }
+    }
+
+    /// Check if a presence update from a peer should be accepted (rate limiting).
+    /// Returns true if the update passes the rate limit, false to drop.
+    pub fn should_accept_update(&self, peer_id: &str) -> bool {
+        let now = Instant::now();
+        if let Some(last) = self.rate_limiters.get(peer_id) {
+            if now.duration_since(*last).as_millis() < MIN_UPDATE_INTERVAL_MS {
+                return false; // Rate limited — drop this update
+            }
+        }
+        self.rate_limiters.insert(peer_id.to_string(), now);
+        true
+    }
+
+    /// Process an incoming presence update with rate limiting and validation.
+    /// Returns Some(update) if accepted, None if rate-limited or invalid.
+    pub fn process_incoming(&self, data: &[u8]) -> Option<PresenceUpdate> {
+        // Size check
+        if data.len() > MAX_PRESENCE_MESSAGE_SIZE {
+            log::warn!("Oversized presence message ({} bytes), dropping", data.len());
+            return None;
+        }
+
+        let update = PresenceUpdate::decode(data)?;
+
+        // Validate field lengths
+        if update.alias.len() > 64 || update.peer_id.len() > 128 {
+            log::warn!("Presence update with oversized fields, dropping");
+            return None;
+        }
+
+        // Rate limit
+        if !self.should_accept_update(&update.peer_id) {
+            return None;
+        }
+
+        Some(update)
     }
 
     /// Subscribe to presence updates (for the frontend event loop).

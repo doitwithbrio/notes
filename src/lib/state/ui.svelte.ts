@@ -7,6 +7,7 @@ export const uiState = $state({
   activeProjectId: null as string | null,
   quickOpenVisible: false,
   accentColorId: DEFAULT_ACCENT as AccentColorId,
+  historyReviewSessionId: null as string | null,
 });
 
 export function getAccentHex(): string {
@@ -36,4 +37,8 @@ export function toggleRightSidebar() {
 export function openProjectOverview(projectId: string) {
   uiState.view = 'project-overview';
   uiState.activeProjectId = projectId;
+}
+
+export function openSettings() {
+  uiState.view = 'settings';
 }

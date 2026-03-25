@@ -89,6 +89,11 @@ export function removeDoc(docId: string) {
   }
 }
 
+export async function deleteDoc(projectId: string, docId: string) {
+  await tauriApi.deleteNote(projectId, docId);
+  removeDoc(docId);
+}
+
 export function markDocUnread(docId: string, hasUnread = true) {
   const doc = getDocById(docId);
   if (doc) doc.hasUnread = hasUnread;

@@ -20,6 +20,8 @@
     ondoccancel,
     ondocopen,
     onreorderdocs,
+    ondoccontextmenu,
+    onprojectcontextmenu,
   }: {
     project: Project;
     docs: Document[];
@@ -35,6 +37,8 @@
     ondoccancel?: () => void;
     ondocopen?: (docId: string) => void;
     onreorderdocs?: (detail: { fromIndex: number; toIndex: number }) => void;
+    ondoccontextmenu?: (detail: { x: number; y: number; docId: string }) => void;
+    onprojectcontextmenu?: (detail: { x: number; y: number }) => void;
   } = $props();
 
   let folded = $state(false);
@@ -101,7 +105,18 @@
         />
       </div>
     {:else}
-      <div class="project-header" class:drag-mode={editMode}>
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div
+        class="project-header"
+        class:drag-mode={editMode}
+        data-drag-handle={editMode || undefined}
+        oncontextmenu={(e) => {
+          if (onprojectcontextmenu) {
+            e.preventDefault();
+            onprojectcontextmenu({ x: e.clientX, y: e.clientY });
+          }
+        }}
+      >
         <button
           class="project-name-btn"
           class:active={isActiveProject}
@@ -144,6 +159,7 @@
           onopen={ondocopen}
           oncommit={ondoccommit}
           oncancel={ondoccancel}
+          oncontextmenu={ondoccontextmenu}
         />
       {/each}
     </div>

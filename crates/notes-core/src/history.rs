@@ -148,6 +148,11 @@ pub fn get_text_at_heads(
 
 /// Restore a document to the state at given heads by creating a new change.
 /// This is non-destructive: it creates a NEW Automerge change on top of the current heads.
+///
+/// **v1 limitation**: This restores plain text only. Rich text marks (bold, italic, links,
+/// headings, code blocks, etc.) stored as Automerge marks are NOT preserved during restore.
+/// When `@automerge/prosemirror` bridge is integrated, this should be updated to use
+/// `spans_at()` or `hydrate()` + `update_object()` to preserve rich text structure.
 pub fn restore_to_heads(
     doc: &mut AutoCommit,
     target_heads: &[ChangeHash],
@@ -165,14 +170,12 @@ pub fn restore_to_heads(
         let current_text = doc.text(&text_id)?;
 
         if current_text != old_text {
-            // Clear and rewrite: splice out all content, splice in old content
+            // Use a single splice to atomically replace all content.
+            // This is better than delete-then-insert for concurrent edit safety:
+            // a single splice produces fewer interleaving issues if two peers
+            // restore concurrently.
             let current_len = doc.length(&text_id);
-            if current_len > 0 {
-                doc.splice_text(&text_id, 0, current_len, "")?;
-            }
-            if !old_text.is_empty() {
-                doc.splice_text(&text_id, 0, 0, &old_text)?;
-            }
+            doc.splice_text(&text_id, 0, current_len as isize, &old_text)?;
         }
     }
 

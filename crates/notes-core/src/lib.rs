@@ -1,6 +1,7 @@
 pub mod doc_store;
 pub mod error;
 pub mod history;
+pub mod history_store;
 pub mod manifest;
 pub mod persistence;
 pub mod project;
@@ -13,6 +14,7 @@ pub mod validation;
 pub use doc_store::DocStore;
 pub use error::CoreError;
 pub use history::HistorySession;
+pub use history_store::HistoryStore;
 pub use manifest::ProjectManifest;
 pub use project::ProjectManager;
 pub use search::{SearchIndex, SearchResult};

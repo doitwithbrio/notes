@@ -3,12 +3,14 @@
 
   import { sortable } from '../../actions/sortable.js';
   import { isMac, modKey } from '../../utils/platform.js';
-  import { documentState, loadProjectDocs, reorderDocs } from '../../state/documents.svelte.js';
-  import { createProject, projectState, reorderProject } from '../../state/projects.svelte.js';
+  import { documentState, loadProjectDocs, reorderDocs, deleteDoc, removeDoc, getDocById, setDocPath } from '../../state/documents.svelte.js';
+  import { createProject, projectState, reorderProject, removeProject } from '../../state/projects.svelte.js';
   import { uiState, openProjectOverview, toggleSidebar } from '../../state/ui.svelte.js';
-  import { openEditorSession } from '../../session/editor-session.svelte.js';
+  import { openEditorSession, closeEditorSession, editorSessionState, renameActiveDoc } from '../../session/editor-session.svelte.js';
   import { tauriApi } from '../../api/tauri.js';
   import ProjectGroup from './ProjectGroup.svelte';
+  import ContextMenu from './ContextMenu.svelte';
+  import type { MenuItem } from './ContextMenu.svelte';
 
   let creatingProject = $state(false);
   let creatingProjectName = $state('');
@@ -16,6 +18,156 @@
   let creatingNoteTitle = $state('');
   let showProjectPicker = $state(false);
   let editMode = $state(false);
+  let contextMenu = $state<{ type: 'doc' | 'project'; x: number; y: number; projectId: string; docId?: string } | null>(null);
+  let renamingDocId = $state<string | null>(null);
+  let renamingProjectId = $state<string | null>(null);
+
+  function closeContextMenu() {
+    contextMenu = null;
+  }
+
+  function buildDocMenuItems(projectId: string, docId: string): MenuItem[] {
+    const doc = getDocById(docId);
+    const otherProjects = projectState.projects.filter((p) => p.id !== projectId);
+
+    const items: MenuItem[] = [
+      {
+        label: 'rename',
+        action: () => {
+          renamingDocId = docId;
+        },
+      },
+    ];
+
+    if (otherProjects.length > 0) {
+      items.push({
+        label: 'move to...',
+        children: otherProjects.map((p) => ({
+          label: p.name,
+          action: () => void handleMoveDoc(projectId, docId, p.id),
+        })),
+      });
+    }
+
+    items.push({
+      label: 'delete',
+      danger: true,
+      action: () => void handleDeleteDoc(projectId, docId),
+    });
+
+    return items;
+  }
+
+  function buildProjectMenuItems(projectId: string): MenuItem[] {
+    return [
+      {
+        label: 'rename',
+        action: () => {
+          renamingProjectId = projectId;
+        },
+      },
+      {
+        label: 'delete',
+        danger: true,
+        action: () => void handleDeleteProject(projectId),
+      },
+    ];
+  }
+
+  async function handleDeleteProject(projectId: string) {
+    try {
+      // Close editor if active doc is in this project
+      if (editorSessionState.projectId === projectId) {
+        await closeEditorSession();
+      }
+
+      // Delete all docs in the project
+      const projectDocs = documentState.docs.filter((d) => d.projectId === projectId);
+      for (const doc of projectDocs) {
+        try {
+          await tauriApi.deleteNote(projectId, doc.id);
+        } catch {
+          // Continue even if individual deletes fail
+        }
+        removeDoc(doc.id);
+      }
+
+      // Remove project from state
+      removeProject(projectId);
+    } catch (err) {
+      console.error('Failed to delete project:', err);
+    }
+  }
+
+  async function handleDeleteDoc(projectId: string, docId: string) {
+    try {
+      // Close editor session if this doc is active
+      if (editorSessionState.docId === docId) {
+        await closeEditorSession();
+      }
+      await deleteDoc(projectId, docId);
+    } catch (err) {
+      console.error('Failed to delete doc:', err);
+    }
+  }
+
+  async function handleRenameDoc(projectId: string, docId: string, newTitle: string) {
+    const trimmed = newTitle.trim();
+    renamingDocId = null;
+    if (!trimmed) return;
+
+    const newPath = trimmed.endsWith('.md') ? trimmed : `${trimmed}.md`;
+    try {
+      await tauriApi.renameNote(projectId, docId, newPath);
+      setDocPath(docId, newPath);
+      // If this is the active doc, sync the rename in editor session
+      if (editorSessionState.docId === docId) {
+        // The path is already updated in state; renameActiveDoc also calls tauriApi
+        // so just update the local state directly since we already called the API
+      }
+    } catch (err) {
+      console.error('Failed to rename doc:', err);
+    }
+  }
+
+  async function handleMoveDoc(sourceProjectId: string, docId: string, targetProjectId: string) {
+    try {
+      const doc = getDocById(docId);
+      if (!doc) return;
+
+      // Close editor session if this doc is active
+      if (editorSessionState.docId === docId) {
+        await closeEditorSession();
+      }
+
+      // Get the doc content before deleting
+      const filename = doc.path.split('/').pop() ?? doc.path;
+
+      // Create in target project, delete from source
+      const newDocId = await tauriApi.createNote(targetProjectId, filename);
+
+      // Copy content: get binary from source, apply to target
+      try {
+        const binary = await tauriApi.getDocBinary(sourceProjectId, docId);
+        await tauriApi.openDoc(targetProjectId, newDocId);
+        await tauriApi.applyChanges(targetProjectId, newDocId, binary);
+        await tauriApi.saveDoc(targetProjectId, newDocId);
+        await tauriApi.closeDoc(targetProjectId, newDocId);
+      } catch {
+        // Content copy failed — note still created but empty
+        console.warn('Could not copy document content during move');
+      }
+
+      // Delete from source
+      await deleteDoc(sourceProjectId, docId);
+
+      // Reload both projects
+      await loadProjectDocs(sourceProjectId);
+      await loadProjectDocs(targetProjectId);
+    } catch (err) {
+      console.error('Failed to move doc:', err);
+    }
+  }
 
   function focusInput(el: HTMLInputElement) {
     requestAnimationFrame(() => el.focus());
@@ -32,6 +184,8 @@
       const project = await createProject(trimmed);
       if (project) {
         await loadProjectDocs(project.id);
+        documentState.activeDocId = null;
+        await closeEditorSession();
         openProjectOverview(project.id);
       }
     } catch (err) {
@@ -180,16 +334,30 @@
           {project}
           docs={documentState.docs.filter((doc) => doc.projectId === project.id)}
           collapsed={!uiState.sidebarOpen}
-          editing={false}
-          editingDocId={creatingNoteProjectId ? '__creating__' : null}
+          editing={renamingProjectId === project.id}
+          editingDocId={renamingDocId ?? (creatingNoteProjectId ? '__creating__' : null)}
           {editMode}
-          oncancel={cancelNewProject}
+          oncommit={(name) => { renamingProjectId = null; /* project rename is local-only for now */ }}
+          oncancel={() => { renamingProjectId = null; cancelNewProject(); }}
           onnewnote={() => startNewNote(project.id)}
-          onprojectclick={() => openProjectOverview(project.id)}
+          onprojectclick={() => { documentState.activeDocId = null; void closeEditorSession(); openProjectOverview(project.id); }}
           ondocopen={(docId) => openEditorSession(project.id, docId)}
-          ondoccommit={(title) => void commitNewNote(title)}
-          ondoccancel={cancelNewNote}
+          ondoccommit={(title) => {
+            if (renamingDocId) {
+              const docId = renamingDocId;
+              void handleRenameDoc(project.id, docId, title);
+            } else {
+              void commitNewNote(title);
+            }
+          }}
+          ondoccancel={() => { renamingDocId = null; cancelNewNote(); }}
           onreorderdocs={({ fromIndex, toIndex }) => reorderDocs(project.id, fromIndex, toIndex)}
+          ondoccontextmenu={(detail) => {
+            contextMenu = { type: 'doc', x: detail.x, y: detail.y, projectId: project.id, docId: detail.docId };
+          }}
+          onprojectcontextmenu={(detail) => {
+            contextMenu = { type: 'project', x: detail.x, y: detail.y, projectId: project.id };
+          }}
         />
 
         {#if creatingNoteProjectId === project.id}
@@ -253,6 +421,17 @@
     {/if}
   </div>
 </aside>
+
+{#if contextMenu}
+  <ContextMenu
+    x={contextMenu.x}
+    y={contextMenu.y}
+    items={contextMenu.type === 'doc' && contextMenu.docId
+      ? buildDocMenuItems(contextMenu.projectId, contextMenu.docId)
+      : buildProjectMenuItems(contextMenu.projectId)}
+    onclose={closeContextMenu}
+  />
+{/if}
 
 <style>
   .sidebar {

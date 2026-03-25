@@ -18,6 +18,7 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::XChaCha20Poly1305;
 use hkdf::Hkdf;
 use sha2::Sha256;
+use zeroize::Zeroize;
 
 use crate::error::CryptoError;
 
@@ -51,17 +52,23 @@ pub fn wrap_epoch_key(
     peer_pk: &[u8],
     epoch: u32,
 ) -> Result<Vec<u8>, CryptoError> {
-    let wrapping_key = derive_wrapping_key(owner_pk, peer_pk, epoch);
+    let mut wrapping_key = derive_wrapping_key(owner_pk, peer_pk, epoch);
     let cipher_key = chacha20poly1305::Key::from_slice(&wrapping_key);
     let cipher = XChaCha20Poly1305::new(cipher_key);
 
     let mut nonce_bytes = [0u8; 24];
-    getrandom::fill(&mut nonce_bytes).map_err(|_| CryptoError::RandomFailed)?;
+    getrandom::fill(&mut nonce_bytes).map_err(|_| {
+        wrapping_key.zeroize();
+        CryptoError::RandomFailed
+    })?;
     let nonce = chacha20poly1305::XNonce::from_slice(&nonce_bytes);
 
-    let ciphertext = cipher
-        .encrypt(nonce, epoch_key.as_ref())
-        .map_err(|_| CryptoError::EncryptionFailed)?;
+    let ciphertext = cipher.encrypt(nonce, epoch_key.as_ref()).map_err(|_| {
+        wrapping_key.zeroize();
+        CryptoError::EncryptionFailed
+    })?;
+
+    wrapping_key.zeroize();
 
     let mut result = Vec::with_capacity(24 + ciphertext.len());
     result.extend_from_slice(&nonce_bytes);
@@ -81,16 +88,19 @@ pub fn unwrap_epoch_key(
         return Err(CryptoError::InvalidData("wrapped key too short".into()));
     }
 
-    let wrapping_key = derive_wrapping_key(owner_pk, peer_pk, epoch);
+    let mut wrapping_key = derive_wrapping_key(owner_pk, peer_pk, epoch);
     let cipher_key = chacha20poly1305::Key::from_slice(&wrapping_key);
     let cipher = XChaCha20Poly1305::new(cipher_key);
 
     let nonce = chacha20poly1305::XNonce::from_slice(&wrapped[..24]);
     let ciphertext = &wrapped[24..];
 
-    let plaintext = cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|_| CryptoError::DecryptionFailed)?;
+    let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|_| {
+        wrapping_key.zeroize();
+        CryptoError::DecryptionFailed
+    })?;
+
+    wrapping_key.zeroize();
 
     if plaintext.len() != 32 {
         return Err(CryptoError::InvalidData(
@@ -100,6 +110,9 @@ pub fn unwrap_epoch_key(
 
     let mut key = [0u8; 32];
     key.copy_from_slice(&plaintext);
+    // plaintext Vec is dropped here; for defense-in-depth, zeroize it
+    let mut plaintext = plaintext;
+    plaintext.zeroize();
     Ok(key)
 }
 

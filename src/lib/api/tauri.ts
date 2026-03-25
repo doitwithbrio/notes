@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
 import type {
+  AppSettings,
   BackendDocInfo,
   BackendHistorySession,
   BackendPeerStatusEvent,
@@ -58,6 +59,12 @@ export const tauriApi = {
     guardedInvoke<BackendPeerStatusSummary[]>('get_peer_status', { project }),
   getDocHistory: (project: string, docId: string) =>
     guardedInvoke<BackendHistorySession[]>('get_doc_history', { project, docId }),
+  getSessionText: (project: string, docId: string, sessionId: string) =>
+    guardedInvoke<string>('get_session_text', { project, docId, sessionId }),
+  restoreToSession: (project: string, docId: string, sessionId: string) =>
+    guardedInvoke<void>('restore_to_session', { project, docId, sessionId }),
+  getActorAliases: (project: string) =>
+    guardedInvoke<Record<string, string>>('get_actor_aliases', { project }),
   searchNotes: (query: string, limit?: number) =>
     guardedInvoke<BackendSearchResult[]>('search_notes', { query, limit }),
   searchProjectNotes: (query: string, project: string, limit?: number) =>
@@ -66,6 +73,8 @@ export const tauriApi = {
     guardedInvoke<BackendUnseenDocInfo[]>('get_unseen_docs', { project }),
   markDocSeen: (project: string, docId: string) =>
     guardedInvoke<void>('mark_doc_seen', { project, docId }),
+  getSettings: () => guardedInvoke<AppSettings>('get_settings'),
+  updateSettings: (settings: AppSettings) => guardedInvoke<void>('update_settings', { settings }),
   onRemoteChange: (handler: (payload: BackendRemoteChangeEvent) => void): Promise<UnlistenFn> =>
     guardedListen<BackendRemoteChangeEvent>('p2p:remote-change', handler),
   onSyncStatus: (handler: (payload: BackendSyncStatusEvent) => void): Promise<UnlistenFn> =>

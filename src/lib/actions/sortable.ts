@@ -46,12 +46,21 @@ export function sortable(node: HTMLElement, options: SortableOptions) {
     if (target.closest('input, textarea, [contenteditable]')) return;
 
     items = getItems();
-    const item = target.closest(opts.itemSelector!) as HTMLElement | null;
+    // Find the drag item containing the click target.
+    // Note: closest() does not support :scope correctly, so we match against
+    // the items already found by querySelectorAll (which handles :scope fine).
+    const item = items.find((el) => el === target || el.contains(target)) ?? null;
     if (!item || !node.contains(item)) return;
 
-    // Skip if clicking a button/link that is a CHILD of the drag item (not the item itself)
-    const clickedButton = target.closest('button, a');
-    if (clickedButton && clickedButton !== item && item.contains(clickedButton)) return;
+    // Allow drag if the click is on or inside a designated drag handle
+    const dragHandle = target.closest('[data-drag-handle]');
+    if (dragHandle && item.contains(dragHandle)) {
+      // Handle found — skip button guard, allow drag
+    } else {
+      // Skip if clicking a button/link that is a CHILD of the drag item (not the item itself)
+      const clickedButton = target.closest('button, a');
+      if (clickedButton && clickedButton !== item && item.contains(clickedButton)) return;
+    }
 
     dragIndex = items.indexOf(item);
     if (dragIndex < 0) return;

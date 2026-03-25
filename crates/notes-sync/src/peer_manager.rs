@@ -42,11 +42,14 @@ impl PeerManager {
 
     /// Register a peer for a project.
     pub fn add_peer_to_project(&self, project: &str, peer_id: EndpointId) {
-        self.project_peers
+        let mut peers = self
+            .project_peers
             .entry(project.to_string())
-            .or_default()
-            .push(peer_id);
-        log::info!("Added peer {peer_id} to project {project}");
+            .or_default();
+        if !peers.contains(&peer_id) {
+            peers.push(peer_id);
+            log::info!("Added peer {peer_id} to project {project}");
+        }
     }
 
     /// Remove a peer from a project.

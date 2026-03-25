@@ -46,6 +46,19 @@ impl SyncSession {
         }
     }
 
+    /// Create a session with an existing sync state (for persistent sync).
+    pub fn new_with_state(doc_id: [u8; 32], state: Option<SyncState>) -> Self {
+        Self {
+            doc_id,
+            sync_state: state.unwrap_or_else(SyncState::new),
+        }
+    }
+
+    /// Get a reference to the sync state (for persisting after session).
+    pub fn sync_state(&self) -> &SyncState {
+        &self.sync_state
+    }
+
     /// Run the sync session as the initiator (outgoing connection).
     ///
     /// Opens the stream, sends the header, then enters the sync loop.

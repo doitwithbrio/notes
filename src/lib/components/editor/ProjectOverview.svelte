@@ -1,12 +1,10 @@
 <script lang="ts">
   import type { Project } from '../../types/index.js';
   import { documentState } from '../../state/documents.svelte.js';
-  import { uiState } from '../../state/ui.svelte.js';
   import { todoState, addTodo, toggleTodo, removeTodo } from '../../state/todos.svelte.js';
   import { presenceState } from '../../state/presence.svelte.js';
-  import { syncState } from '../../state/sync.svelte.js';
   import { openEditorSession } from '../../session/editor-session.svelte.js';
-  import { FileText, X, Users } from 'lucide-svelte';
+  import { FileText, X } from 'lucide-svelte';
 
   let { project }: { project: Project } = $props();
 
@@ -50,15 +48,19 @@
     return documentState.docs.find((d) => d.id === docId)?.title ?? null;
   }
 
-  function syncIcon(status: string): string {
-    if (status === 'synced') return '✓';
-    if (status === 'syncing') return '↻';
-    return '—';
-  }
+  const metaLine = $derived(() => {
+    const parts: string[] = [project.role];
+    if (project.shared && onlinePeerCount > 0) {
+      parts.push(`${onlinePeerCount} peer${onlinePeerCount > 1 ? 's' : ''} online`);
+    }
+    if (projectDocs.length > 0) {
+      parts.push(`${projectDocs.length} note${projectDocs.length > 1 ? 's' : ''}`);
+    }
+    return parts.join(' · ');
+  });
 </script>
 
 <div class="overview-pane">
-  <!-- Drag region (matches editor height) -->
   <div class="overview-drag" data-tauri-drag-region>
     <div class="drag-spacer" data-tauri-drag-region></div>
   </div>
@@ -68,22 +70,27 @@
       <!-- Project header -->
       <div class="project-header">
         <h1 class="project-title">{project.name}</h1>
-        {#if project.shared}
-          <div class="shared-badge">
-            <Users size={12} strokeWidth={1.5} />
-            <span>shared · {onlinePeerCount} online</span>
-          </div>
-        {/if}
-        <p class="role-line">you are the {project.role}</p>
+        <p class="project-meta">{metaLine()}</p>
       </div>
 
       <!-- Todos section -->
-      <div class="section">
-        <div class="section-header">
-          <span class="section-title">todos</span>
+      <div class="section-card">
+        <div class="section-label">
+          <span class="section-rule"></span>
+          <span class="section-name">todos</span>
           {#if pendingTodos.length > 0}
             <span class="section-count">{pendingTodos.length}</span>
           {/if}
+        </div>
+
+        <div class="todo-input-wrap">
+          <input
+            class="todo-input"
+            type="text"
+            placeholder="add a todo..."
+            bind:value={newTodoText}
+            onkeydown={handleTodoKeydown}
+          />
         </div>
 
         <div class="todo-list">
@@ -133,56 +140,56 @@
           {/each}
 
           {#if todos.length === 0}
-            <p class="empty-hint">no todos yet — add one below</p>
+            <p class="empty-hint">no todos yet</p>
           {/if}
-        </div>
-
-        <div class="todo-input-wrap">
-          <input
-            class="todo-input"
-            type="text"
-            placeholder="add a todo..."
-            bind:value={newTodoText}
-            onkeydown={handleTodoKeydown}
-          />
         </div>
       </div>
 
       <!-- Files section -->
-      <div class="section">
-        <div class="section-header">
-          <span class="section-title">files</span>
-          <span class="section-count">{projectDocs.length}</span>
+      <div class="section-card">
+        <div class="section-label">
+          <span class="section-rule"></span>
+          <span class="section-name">notes</span>
+          {#if projectDocs.length > 0}
+            <span class="section-count">{projectDocs.length}</span>
+          {/if}
         </div>
 
         <div class="file-list">
           {#each projectDocs as doc (doc.id)}
             <button class="file-row" onclick={() => openDoc(doc.id)}>
-              <FileText size={14} strokeWidth={1.5} />
-              <span class="file-name">{doc.title}</span>
-              <span class="file-meta">
-                {#if doc.wordCount > 0}
-                  <span class="word-count">{doc.wordCount}w</span>
-                {/if}
-                <span class="sync-icon" class:synced={doc.syncStatus === 'synced'} class:syncing={doc.syncStatus === 'syncing'}>
-                  {syncIcon(doc.syncStatus)}
-                </span>
+              <span class="file-icon-box">
+                <FileText size={15} strokeWidth={1.5} />
               </span>
-              {#if doc.activePeers.length > 0}
-                <span class="active-peer-dots">
-                  {#each doc.activePeers.slice(0, 3) as peerId (peerId)}
-                    {@const peer = presenceState.peers.find((p) => p.id === peerId)}
-                    {#if peer}
-                      <span class="file-peer-dot" style="background: {peer.cursorColor}"></span>
-                    {/if}
-                  {/each}
-                </span>
-              {/if}
+              <span class="file-info">
+                <span class="file-name">{doc.title}</span>
+                {#if doc.wordCount > 0}
+                  <span class="file-meta">{doc.wordCount} words</span>
+                {/if}
+              </span>
+              <span class="file-trailing">
+                {#if doc.activePeers.length > 0}
+                  <span class="active-peer-dots">
+                    {#each doc.activePeers.slice(0, 3) as peerId (peerId)}
+                      {@const peer = presenceState.peers.find((p) => p.id === peerId)}
+                      {#if peer}
+                        <span class="file-peer-dot" style="background: {peer.cursorColor}"></span>
+                      {/if}
+                    {/each}
+                  </span>
+                {/if}
+                <span
+                  class="sync-dot"
+                  class:synced={doc.syncStatus === 'synced'}
+                  class:syncing={doc.syncStatus === 'syncing'}
+                  class:local-only={doc.syncStatus === 'local-only'}
+                ></span>
+              </span>
             </button>
           {/each}
 
           {#if projectDocs.length === 0}
-            <p class="empty-hint">no files yet</p>
+            <p class="empty-hint">no notes yet</p>
           {/if}
         </div>
       </div>
@@ -191,6 +198,8 @@
 </div>
 
 <style>
+  /* ── Layout ── */
+
   .overview-pane {
     display: flex;
     flex-direction: column;
@@ -214,103 +223,129 @@
   .overview-scroll {
     flex: 1;
     overflow-y: auto;
-    padding: 0 48px 100px;
+    padding: 0 48px 80px;
   }
 
   .overview-content {
-    max-width: 660px;
+    max-width: 640px;
     margin: 0 auto;
   }
 
-  /* Project header */
+  /* ── Project Header ── */
+
   .project-header {
     margin-bottom: 48px;
   }
 
   .project-title {
     font-family: var(--font-body);
-    font-size: 34px;
-    font-weight: 700;
+    font-size: 28px;
+    font-weight: 600;
     letter-spacing: -0.02em;
     color: var(--text-primary);
-    line-height: 1.15;
-    margin-bottom: 10px;
+    line-height: 1.25;
+    margin-bottom: 6px;
   }
 
-  .shared-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    padding: 3px 10px;
-    font-size: 12px;
-    font-weight: 500;
-    color: var(--accent);
-    background: color-mix(in srgb, var(--accent) 10%, transparent);
-    border-radius: 20px;
-    margin-bottom: 8px;
-  }
-
-  .role-line {
+  .project-meta {
     font-size: 13px;
-    color: var(--text-tertiary);
+    color: rgba(0, 0, 0, 0.40);
     font-weight: 400;
+    letter-spacing: 0.01em;
+    line-height: 1.5;
   }
 
-  /* Sections */
-  .section {
-    margin-bottom: 40px;
+  /* ── Section Cards ── */
+
+  .section-card {
+    background: var(--surface-hover);
+    border: 1px solid var(--border-subtle);
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 16px;
   }
 
-  .section-header {
+  .section-label {
     display: flex;
     align-items: center;
     gap: 8px;
-    margin-bottom: 14px;
-    padding-bottom: 8px;
-    border-bottom: 1px solid var(--border-subtle);
+    margin-bottom: 16px;
   }
 
-  .section-title {
-    font-size: 12px;
-    font-weight: 600;
-    text-transform: uppercase;
+  .section-rule {
+    width: 12px;
+    height: 1px;
+    background: rgba(182, 141, 94, 0.50);
+    flex-shrink: 0;
+  }
+
+  .section-name {
+    font-size: 11px;
+    font-weight: 500;
+    color: rgba(0, 0, 0, 0.35);
     letter-spacing: 0.06em;
-    color: var(--text-tertiary);
   }
 
   .section-count {
-    font-size: 11px;
+    font-size: 10px;
     font-weight: 600;
-    color: var(--text-tertiary);
+    color: rgba(0, 0, 0, 0.35);
     background: var(--surface-active);
     padding: 0 6px;
     border-radius: 8px;
-    line-height: 18px;
+    line-height: 16px;
   }
 
-  /* Todos */
+  /* ── Todos ── */
+
+  .todo-input-wrap {
+    margin-bottom: 14px;
+  }
+
+  .todo-input {
+    width: 100%;
+    padding: 9px 12px;
+    font-family: var(--font-body);
+    font-size: 14px;
+    color: var(--text-primary);
+    background: var(--surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: 10px;
+    outline: none;
+    transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+  }
+
+  .todo-input:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(182, 141, 94, 0.10);
+  }
+
+  .todo-input::placeholder {
+    color: rgba(0, 0, 0, 0.30);
+  }
+
   .todo-list {
     display: flex;
     flex-direction: column;
-    gap: 2px;
-    margin-bottom: 12px;
+    gap: 1px;
   }
 
   .todo-item {
     display: flex;
     align-items: flex-start;
     gap: 10px;
-    padding: 6px 8px;
+    padding: 8px 8px;
+    margin: 0 -8px;
     border-radius: 8px;
     transition: background var(--transition-fast);
   }
 
   .todo-item:hover {
-    background: var(--surface-hover);
+    background: rgba(182, 141, 94, 0.06);
   }
 
   .todo-item.done {
-    opacity: 0.4;
+    opacity: 0.35;
   }
 
   .todo-check {
@@ -321,8 +356,8 @@
   }
 
   .todo-check input[type='checkbox'] {
-    width: 14px;
-    height: 14px;
+    width: 15px;
+    height: 15px;
     accent-color: var(--accent);
     cursor: pointer;
   }
@@ -336,7 +371,7 @@
   }
 
   .todo-text {
-    font-size: 14px;
+    font-size: 15px;
     color: var(--text-primary);
     line-height: 1.5;
     word-break: break-word;
@@ -344,6 +379,8 @@
 
   .todo-item.done .todo-text {
     text-decoration: line-through;
+    text-decoration-color: rgba(0, 0, 0, 0.20);
+    color: rgba(0, 0, 0, 0.35);
   }
 
   .todo-link {
@@ -351,7 +388,7 @@
     align-items: center;
     gap: 3px;
     font-size: 11px;
-    color: var(--text-tertiary);
+    color: rgba(0, 0, 0, 0.35);
     font-weight: 450;
   }
 
@@ -362,7 +399,7 @@
     width: 20px;
     height: 20px;
     flex-shrink: 0;
-    color: var(--text-tertiary);
+    color: rgba(0, 0, 0, 0.25);
     border-radius: 4px;
     opacity: 0;
     transition: opacity var(--transition-fast), color var(--transition-fast);
@@ -376,31 +413,8 @@
     color: var(--text-primary);
   }
 
-  .todo-input-wrap {
-    padding: 0 8px;
-  }
+  /* ── Files ── */
 
-  .todo-input {
-    width: 100%;
-    padding: 8px 0;
-    font-size: 14px;
-    color: var(--text-primary);
-    background: transparent;
-    border: none;
-    border-bottom: 1px solid var(--border-subtle);
-    outline: none;
-    transition: border-color var(--transition-fast);
-  }
-
-  .todo-input:focus {
-    border-color: var(--accent);
-  }
-
-  .todo-input::placeholder {
-    color: var(--text-tertiary);
-  }
-
-  /* Files */
   .file-list {
     display: flex;
     flex-direction: column;
@@ -410,63 +424,71 @@
   .file-row {
     display: flex;
     align-items: center;
-    gap: 10px;
-    padding: 8px 10px;
+    gap: 12px;
+    padding: 8px 8px;
+    margin: 0 -8px;
     border-radius: 8px;
-    font-size: 14px;
-    color: var(--text-primary);
     text-align: left;
+    width: calc(100% + 16px);
     transition: background var(--transition-fast);
-    width: 100%;
+    cursor: pointer;
   }
 
   .file-row:hover {
-    background: var(--surface-hover);
+    background: rgba(182, 141, 94, 0.06);
   }
 
-  .file-row :global(svg) {
-    color: var(--text-tertiary);
+  .file-row:hover .file-name {
+    color: var(--accent);
+  }
+
+  .file-icon-box {
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    background: var(--surface-active);
+    display: flex;
+    align-items: center;
+    justify-content: center;
     flex-shrink: 0;
+    color: var(--accent);
+  }
+
+  .file-info {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
   }
 
   .file-name {
-    flex: 1;
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--text-primary);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-weight: 450;
+    transition: color var(--transition-fast);
   }
 
   .file-meta {
+    font-size: 12px;
+    color: rgba(0, 0, 0, 0.35);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .file-trailing {
     display: flex;
     align-items: center;
     gap: 8px;
     flex-shrink: 0;
-    font-size: 12px;
-    color: var(--text-tertiary);
-  }
-
-  .word-count {
-    font-variant-numeric: tabular-nums;
-  }
-
-  .sync-icon {
-    font-size: 11px;
-  }
-
-  .sync-icon.synced {
-    color: var(--accent);
-  }
-
-  .sync-icon.syncing {
-    color: var(--text-tertiary);
   }
 
   .active-peer-dots {
     display: flex;
     align-items: center;
     gap: 3px;
-    flex-shrink: 0;
   }
 
   .file-peer-dot {
@@ -475,9 +497,32 @@
     border-radius: 50%;
   }
 
+  .sync-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .sync-dot.synced {
+    background: var(--accent);
+  }
+
+  .sync-dot.syncing {
+    background: transparent;
+    border: 1.5px solid var(--accent);
+  }
+
+  .sync-dot.local-only {
+    background: rgba(0, 0, 0, 0.15);
+  }
+
+  /* ── Empty states ── */
+
   .empty-hint {
     font-size: 13px;
-    color: var(--text-tertiary);
-    padding: 8px;
+    font-style: italic;
+    color: rgba(0, 0, 0, 0.30);
+    padding: 12px 0 4px;
   }
 </style>

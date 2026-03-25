@@ -64,16 +64,27 @@
 </script>
 
 <section class="section">
-  <div class="section-header">
-    <span class="section-title">{headerLabel}</span>
+  <div class="section-label">
+    <span class="section-rule"></span>
+    <span class="section-name">{headerLabel}</span>
     {#if pendingCount > 0}
-      <span class="section-badge">{pendingCount}</span>
+      <span class="section-count">{pendingCount}</span>
     {/if}
   </div>
 
   {#if !projectId}
     <p class="empty-text">select a project or note</p>
   {:else}
+    <div class="todo-input-wrap">
+      <input
+        class="todo-input"
+        type="text"
+        placeholder={isFileMode ? 'add a todo for this file...' : 'add a todo...'}
+        bind:value={newTodoText}
+        onkeydown={handleKeydown}
+      />
+    </div>
+
     <div class="todo-list">
       {#each pendingTodos as todo (todo.id)}
         <div class="todo-item">
@@ -124,16 +135,6 @@
         <p class="empty-text">{isFileMode ? 'no todos for this file' : 'no todos yet'}</p>
       {/if}
     </div>
-
-    <div class="todo-input-wrap">
-      <input
-        class="todo-input"
-        type="text"
-        placeholder={isFileMode ? 'add a todo for this file...' : 'add a todo...'}
-        bind:value={newTodoText}
-        onkeydown={handleKeydown}
-      />
-    </div>
   {/if}
 </section>
 
@@ -142,27 +143,34 @@
     padding: 16px;
   }
 
-  .section-header {
+  .section-label {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
     margin-bottom: 12px;
   }
 
-  .section-title {
+  .section-rule {
+    width: 12px;
+    height: 1px;
+    background: rgba(182, 141, 94, 0.50);
+    flex-shrink: 0;
+  }
+
+  .section-name {
     font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.04em;
-    color: var(--text-primary);
+    font-weight: 500;
+    color: rgba(0, 0, 0, 0.35);
+    letter-spacing: 0.06em;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
-  .section-badge {
+  .section-count {
     font-size: 10px;
     font-weight: 600;
-    color: var(--text-primary);
+    color: rgba(0, 0, 0, 0.35);
     background: var(--surface-active);
     padding: 0 5px;
     border-radius: 8px;
@@ -187,11 +195,11 @@
   }
 
   .todo-item:hover {
-    background: var(--surface-hover);
+    background: rgba(182, 141, 94, 0.06);
   }
 
   .todo-item.done {
-    opacity: 0.45;
+    opacity: 0.35;
   }
 
   .todo-check {
@@ -225,6 +233,8 @@
 
   .todo-item.done .todo-text {
     text-decoration: line-through;
+    text-decoration-color: rgba(0, 0, 0, 0.20);
+    color: rgba(0, 0, 0, 0.35);
   }
 
   .todo-link {
@@ -232,8 +242,7 @@
     align-items: center;
     gap: 3px;
     font-size: 11px;
-    color: var(--text-primary);
-    opacity: 0.55;
+    color: rgba(0, 0, 0, 0.35);
     font-weight: 450;
   }
 
@@ -244,7 +253,7 @@
     width: 18px;
     height: 18px;
     flex-shrink: 0;
-    color: var(--text-primary);
+    color: rgba(0, 0, 0, 0.25);
     border-radius: 4px;
     opacity: 0;
     transition: opacity var(--transition-fast), color var(--transition-fast);
@@ -259,32 +268,35 @@
   }
 
   .todo-input-wrap {
-    padding: 0;
+    margin-bottom: 10px;
   }
 
   .todo-input {
     width: 100%;
-    padding: 6px 6px;
+    padding: 7px 10px;
+    font-family: var(--font-body);
     font-size: 13px;
     color: var(--text-primary);
-    background: transparent;
-    border: none;
-    border-bottom: 1px solid var(--border-subtle);
+    background: var(--surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: 10px;
     outline: none;
-    transition: border-color var(--transition-fast);
+    transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
   }
 
   .todo-input:focus {
     border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(182, 141, 94, 0.10);
   }
 
   .todo-input::placeholder {
-    color: var(--text-secondary);
+    color: rgba(0, 0, 0, 0.30);
   }
 
   .empty-text {
     font-size: 12px;
-    color: var(--text-primary);
+    font-style: italic;
+    color: rgba(0, 0, 0, 0.30);
     padding: 4px 6px;
   }
 </style>

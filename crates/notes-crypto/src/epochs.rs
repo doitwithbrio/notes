@@ -33,11 +33,21 @@ struct EpochKeyEntry {
     created_at: String,
 }
 
+impl Drop for EpochKeyEntry {
+    fn drop(&mut self) {
+        // Zeroize the hex-encoded key material in memory
+        // Safety: String's as_mut_vec is safe here since we're zeroing bytes
+        unsafe {
+            self.key_hex.as_mut_vec().zeroize();
+        }
+    }
+}
+
 impl EpochKeys {
     /// Create a new EpochKeys with an initial epoch 0 key.
     pub fn new() -> Result<Self, CryptoError> {
         let mut keys = HashMap::new();
-        let key = generate_epoch_key()?;
+        let mut key = generate_epoch_key()?;
         keys.insert(
             0,
             EpochKeyEntry {
@@ -45,6 +55,7 @@ impl EpochKeys {
                 created_at: chrono_now(),
             },
         );
+        key.zeroize(); // Zeroize raw bytes after hex-encoding
         Ok(Self {
             current_epoch: 0,
             epoch_keys: keys,
@@ -57,12 +68,14 @@ impl EpochKeys {
             .epoch_keys
             .get(&epoch)
             .ok_or(CryptoError::EpochKeyNotFound(epoch))?;
-        let bytes = hex_decode(&entry.key_hex)?;
+        let mut bytes = hex_decode(&entry.key_hex)?;
         if bytes.len() != 32 {
+            bytes.zeroize();
             return Err(CryptoError::InvalidData("epoch key wrong length".into()));
         }
         let mut key = [0u8; 32];
         key.copy_from_slice(&bytes);
+        bytes.zeroize(); // Zeroize decoded bytes after copying to EpochKey
         Ok(EpochKey(key))
     }
 
@@ -75,7 +88,7 @@ impl EpochKeys {
     /// Call this when a peer is removed from the project.
     pub fn ratchet(&mut self) -> Result<u32, CryptoError> {
         let new_epoch = self.current_epoch + 1;
-        let key = generate_epoch_key()?;
+        let mut key = generate_epoch_key()?;
 
         self.epoch_keys.insert(
             new_epoch,
@@ -84,6 +97,7 @@ impl EpochKeys {
                 created_at: chrono_now(),
             },
         );
+        key.zeroize(); // Zeroize raw bytes after hex-encoding
         self.current_epoch = new_epoch;
 
         log::info!("Key ratcheted to epoch {new_epoch}");
@@ -191,6 +205,9 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(hex: &str) -> Result<Vec<u8>, CryptoError> {
+    if hex.len() % 2 != 0 {
+        return Err(CryptoError::InvalidData("odd hex length".into()));
+    }
     (0..hex.len())
         .step_by(2)
         .map(|i| {

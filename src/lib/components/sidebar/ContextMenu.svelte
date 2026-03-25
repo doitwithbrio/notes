@@ -1,4 +1,4 @@
-<script lang="ts">
+<script module lang="ts">
   import type { Component } from 'svelte';
 
   export type MenuItem = {
@@ -8,7 +8,9 @@
     children?: MenuItem[];
     action?: () => void;
   };
+</script>
 
+<script lang="ts">
   let {
     x,
     y,
@@ -26,7 +28,7 @@
 
   function handleItemClick(item: MenuItem) {
     if (item.children) {
-      return; // handled by hover
+      return;
     }
     item.action?.();
     onclose();
@@ -45,13 +47,18 @@
     }
   }
 
+  function handleBackdropContextMenu(e: MouseEvent) {
+    e.preventDefault();
+    onclose();
+  }
+
   // Clamp position to viewport
   const clampedX = $derived(Math.min(x, window.innerWidth - 200));
   const clampedY = $derived(Math.min(y, window.innerHeight - items.length * 36 - 16));
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="context-backdrop" onclick={handleBackdropClick} oncontextmenu|preventDefault={onclose} onkeydown={handleKeydown}>
+<div class="context-backdrop" onclick={handleBackdropClick} oncontextmenu={handleBackdropContextMenu} onkeydown={handleKeydown}>
   <div
     class="context-menu"
     bind:this={menuEl}
@@ -140,6 +147,7 @@
     background: none;
     border: none;
     cursor: default;
+    font-family: var(--font-body);
   }
 
   .menu-item:hover {

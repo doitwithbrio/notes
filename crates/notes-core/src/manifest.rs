@@ -267,6 +267,64 @@ impl ProjectManifest {
         Ok(())
     }
 
+    /// Set the Automerge actor ID for a peer (called on first sync).
+    pub fn set_peer_actor_id(&mut self, peer_id: &str, actor_id: &str) -> Result<(), CoreError> {
+        let section = self.owner_section_id()?;
+        let (_, peers_id) = self
+            .doc
+            .get(&section, "peers")?
+            .ok_or_else(|| CoreError::InvalidData("manifest missing peers map".into()))?;
+
+        let entry = self
+            .doc
+            .get(&peers_id, peer_id)?
+            .ok_or_else(|| CoreError::InvalidInput(format!("peer {peer_id} not found")))?;
+        let (_, entry_id) = entry;
+
+        self.doc.put(&entry_id, "actorId", actor_id)?;
+        Ok(())
+    }
+
+    /// Get a mapping of Automerge actor hex -> display alias for all peers.
+    /// Used by the version history UI to show human-readable author names.
+    pub fn get_actor_aliases(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>, CoreError> {
+        let mut aliases = std::collections::HashMap::new();
+
+        let section = self.owner_section_id()?;
+        let peers_result = self.doc.get(&section, "peers")?;
+        let (_, peers_id) = match peers_result {
+            Some(v) => v,
+            None => return Ok(aliases),
+        };
+
+        for key in self.doc.keys(&peers_id) {
+            if let Some((automerge::Value::Object(ObjType::Map), entry_id)) =
+                self.doc.get(&peers_id, key.as_str())?
+            {
+                let actor_id = self
+                    .doc
+                    .get(&entry_id, "actorId")?
+                    .and_then(|(v, _)| value_to_string(v));
+
+                let alias = self
+                    .doc
+                    .get(&entry_id, "alias")?
+                    .and_then(|(v, _)| value_to_string(v))
+                    .unwrap_or_default();
+
+                if let Some(actor) = actor_id {
+                    if !actor.is_empty() && !alias.is_empty() {
+                        aliases.insert(actor, alias);
+                    }
+                }
+            }
+        }
+
+        Ok(aliases)
+    }
+
     /// Remove a peer from the project.
     pub fn remove_peer(&mut self, peer_id: &str) -> Result<(), CoreError> {
         let section = self.owner_section_id()?;

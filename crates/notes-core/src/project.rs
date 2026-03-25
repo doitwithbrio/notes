@@ -7,8 +7,11 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use automerge::ReadDoc;
+
 use crate::doc_store::DocStore;
 use crate::error::CoreError;
+use crate::history_store::HistoryStore;
 use crate::manifest::ProjectManifest;
 use crate::persistence::Persistence;
 use crate::search::SearchIndex;
@@ -27,6 +30,8 @@ pub struct ProjectManager {
     epoch_keys: DashMap<String, Arc<RwLock<notes_crypto::EpochKeyManager>>>,
     /// Optional search index (shared across all projects).
     search_index: Option<Arc<std::sync::Mutex<SearchIndex>>>,
+    /// Optional history store (shared across all projects).
+    history_store: Option<Arc<std::sync::Mutex<HistoryStore>>>,
     /// Background save tasks.
     save_tasks: Mutex<JoinSet<()>>,
     /// Cancellation tokens for active save loops, keyed by DocId.
@@ -43,6 +48,7 @@ impl ProjectManager {
             manifests: DashMap::new(),
             epoch_keys: DashMap::new(),
             search_index: None,
+            history_store: None,
             save_tasks: Mutex::new(JoinSet::new()),
             save_tokens: DashMap::new(),
             doc_projects: DashMap::new(),
@@ -60,15 +66,138 @@ impl ProjectManager {
             manifests: DashMap::new(),
             epoch_keys: DashMap::new(),
             search_index: Some(search_index),
+            history_store: None,
             save_tasks: Mutex::new(JoinSet::new()),
             save_tokens: DashMap::new(),
             doc_projects: DashMap::new(),
         }
     }
 
+    /// Create a ProjectManager with both search index and history store.
+    pub fn with_search_and_history(
+        base_dir: PathBuf,
+        search_index: Arc<std::sync::Mutex<SearchIndex>>,
+        history_store: Arc<std::sync::Mutex<HistoryStore>>,
+    ) -> Self {
+        Self {
+            persistence: Arc::new(Persistence::new(base_dir)),
+            doc_store: Arc::new(DocStore::new()),
+            manifests: DashMap::new(),
+            epoch_keys: DashMap::new(),
+            search_index: Some(search_index),
+            history_store: Some(history_store),
+            save_tasks: Mutex::new(JoinSet::new()),
+            save_tokens: DashMap::new(),
+            doc_projects: DashMap::new(),
+        }
+    }
+
+    /// Get a reference to the history store.
+    pub fn history_store(&self) -> Option<&Arc<std::sync::Mutex<HistoryStore>>> {
+        self.history_store.as_ref()
+    }
+
     /// Get a reference to the DocStore.
     pub fn doc_store(&self) -> &DocStore {
         &self.doc_store
+    }
+
+    /// Initialize epoch keys for a project (called when sharing starts).
+    pub async fn init_epoch_keys(&self, project_name: &str) -> Result<(), CoreError> {
+        if self.epoch_keys.contains_key(project_name) {
+            return Ok(()); // Already initialized
+        }
+
+        let mgr = notes_crypto::EpochKeyManager::new()
+            .map_err(|e| CoreError::InvalidData(format!("epoch key init failed: {e}")))?;
+
+        // Persist
+        let data = mgr.serialize()
+            .map_err(|e| CoreError::InvalidData(format!("epoch key serialize failed: {e}")))?;
+        let key_path = self
+            .persistence
+            .base_dir()
+            .join(project_name)
+            .join(".p2p")
+            .join("keys")
+            .join("epochs.json");
+        tokio::fs::create_dir_all(key_path.parent().unwrap()).await?;
+        // Atomic write: tmp + rename to prevent corruption on crash
+        let tmp_path = key_path.with_extension("json.tmp");
+        tokio::fs::write(&tmp_path, &data).await?;
+        tokio::fs::rename(&tmp_path, &key_path).await?;
+
+        self.epoch_keys.insert(
+            project_name.to_string(),
+            Arc::new(RwLock::new(mgr)),
+        );
+
+        log::info!("Initialized epoch keys for project {project_name}");
+        Ok(())
+    }
+
+    /// Load epoch keys for a project from disk (if they exist).
+    pub async fn load_epoch_keys(&self, project_name: &str) -> Result<bool, CoreError> {
+        if self.epoch_keys.contains_key(project_name) {
+            return Ok(true);
+        }
+
+        let key_path = self
+            .persistence
+            .base_dir()
+            .join(project_name)
+            .join(".p2p")
+            .join("keys")
+            .join("epochs.json");
+
+        match tokio::fs::read(&key_path).await {
+            Ok(data) => {
+                let mgr = notes_crypto::EpochKeyManager::deserialize(&data)
+                    .map_err(|e| CoreError::InvalidData(format!("epoch key load failed: {e}")))?;
+                self.epoch_keys.insert(
+                    project_name.to_string(),
+                    Arc::new(RwLock::new(mgr)),
+                );
+                log::info!("Loaded epoch keys for project {project_name}");
+                Ok(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(CoreError::Io(e)),
+        }
+    }
+
+    /// Ratchet epoch keys for a project (called when a peer is removed).
+    pub async fn ratchet_epoch_keys(&self, project_name: &str) -> Result<u32, CoreError> {
+        let mgr_arc = self
+            .epoch_keys
+            .get(project_name)
+            .map(|e| Arc::clone(e.value()))
+            .ok_or_else(|| CoreError::InvalidData("no epoch keys for project".into()))?;
+
+        let new_epoch = {
+            let mut mgr = mgr_arc.write().await;
+            let epoch = mgr.ratchet()
+                .map_err(|e| CoreError::InvalidData(format!("ratchet failed: {e}")))?;
+
+            // Persist
+            let data = mgr.serialize()
+                .map_err(|e| CoreError::InvalidData(format!("serialize failed: {e}")))?;
+            let key_path = self
+                .persistence
+                .base_dir()
+                .join(project_name)
+                .join(".p2p")
+                .join("keys")
+                .join("epochs.json");
+            // Atomic write: tmp + rename to prevent corruption on crash
+            let tmp_path = key_path.with_extension("json.tmp");
+            tokio::fs::write(&tmp_path, &data).await?;
+            tokio::fs::rename(&tmp_path, &key_path).await?;
+            epoch
+        };
+
+        log::info!("Ratcheted epoch keys for {project_name} to epoch {new_epoch}");
+        Ok(new_epoch)
     }
 
     /// Get a reference to the Persistence layer.
@@ -546,12 +675,88 @@ impl ProjectManager {
     }
 
     /// Compact a document to reduce memory/disk usage.
+    /// Archives history to SQLite before compacting so version history survives.
     pub async fn compact_doc(
         &self,
         project_name: &str,
         doc_id: &DocId,
     ) -> Result<(), CoreError> {
-        self.doc_store.compact(doc_id).await?;
+        // Archive history before compaction if history store is available
+        if let Some(ref history_store) = self.history_store {
+            let doc_arc = self.doc_store.get_doc(doc_id)?;
+
+            let (sessions, text, change_count, bytes_before) = {
+                let mut doc = doc_arc.write().await;
+                let sessions = crate::history::get_document_history(&mut doc);
+                // Read text directly from the locked doc to avoid deadlock
+                // (do NOT call self.doc_store.get_text() which re-acquires the same lock)
+                let text = if let Some((automerge::Value::Object(automerge::ObjType::Text), text_id)) =
+                    doc.get(automerge::ROOT, "text").ok().flatten()
+                {
+                    doc.text(&text_id).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let change_count = crate::history::get_change_count(&mut doc);
+                let bytes_before = doc.save().len();
+                (sessions, text, change_count, bytes_before)
+            };
+
+            // Archive sessions and store snapshot synchronously (lock must not
+            // be held across .await points to keep the future Send).
+            let snapshot_result = {
+                match history_store.lock() {
+                    Ok(store) => {
+                        if let Err(e) = store.archive_sessions(&sessions, project_name, doc_id) {
+                            log::warn!("Failed to archive history sessions before compaction: {e}");
+                        }
+                        Some(store.store_snapshot(
+                            doc_id,
+                            project_name,
+                            &text,
+                            change_count,
+                            "compaction",
+                        ))
+                    }
+                    Err(_) => {
+                        log::warn!("History store lock poisoned, compacting without archiving");
+                        None
+                    }
+                }
+            }; // MutexGuard dropped here
+
+            // Now do async compaction work without holding the lock
+            match snapshot_result {
+                Some(Ok(snapshot_id)) => {
+                    self.doc_store.compact(doc_id).await?;
+                    let bytes_after = self.doc_store.save_doc(doc_id).await?.len();
+                    // Re-acquire lock briefly to log compaction
+                    if let Ok(store) = history_store.lock() {
+                        if let Err(e) = store.log_compaction(
+                            doc_id,
+                            change_count,
+                            bytes_before,
+                            bytes_after,
+                            snapshot_id,
+                        ) {
+                            log::warn!("Failed to log compaction: {e}");
+                        }
+                    }
+                }
+                Some(Err(e)) => {
+                    log::warn!("Failed to store snapshot before compaction: {e}");
+                    self.doc_store.compact(doc_id).await?;
+                }
+                None => {
+                    // Lock was poisoned
+                    self.doc_store.compact(doc_id).await?;
+                }
+            }
+        } else {
+            // No history store — compact without archiving (legacy behavior)
+            self.doc_store.compact(doc_id).await?;
+        }
+
         self.save_doc(project_name, doc_id).await?;
         Ok(())
     }
@@ -581,6 +786,48 @@ impl ProjectManager {
         }
 
         log::info!("Shutdown: saved {} documents", doc_ids.len());
+    }
+
+    /// Reindex all documents in the search index.
+    /// Call on startup to ensure the FTS5 index is up-to-date.
+    pub async fn reindex_search(&self) -> usize {
+        let search = match &self.search_index {
+            Some(s) => s,
+            None => return 0,
+        };
+
+        let projects = self.persistence.list_projects().await.unwrap_or_default();
+        let mut indexed = 0;
+
+        for project in &projects {
+            if let Err(_) = self.open_project(project).await {
+                continue;
+            }
+            let files = self.list_files(project).await.unwrap_or_default();
+            for file in files {
+                // Try to read the .md export (faster than loading automerge)
+                let md_path = self
+                    .persistence
+                    .base_dir()
+                    .join(project)
+                    .join(&file.path);
+                let content = tokio::fs::read_to_string(&md_path)
+                    .await
+                    .unwrap_or_default();
+                if let Ok(index) = search.lock() {
+                    if let Err(e) =
+                        index.index_document(&file.id, project, &file.path, &content)
+                    {
+                        log::warn!("Reindex failed for {}: {e}", file.path);
+                    } else {
+                        indexed += 1;
+                    }
+                }
+            }
+        }
+
+        log::info!("Reindexed {indexed} documents in search index");
+        indexed
     }
 
     // ── Background Save Loop ─────────────────────────────────────────

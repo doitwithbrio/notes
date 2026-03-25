@@ -108,6 +108,97 @@ pub fn decrypt_document(
     Ok((epoch, plaintext))
 }
 
+// ── History Snapshot Encryption ───────────────────────────────────────
+
+/// HKDF context for deriving history snapshot encryption keys.
+/// Separate from document keys for domain separation.
+const HISTORY_ENCRYPTION_CONTEXT: &[u8] = b"p2p-notes/v1/history-snapshot";
+
+/// Derive a key for encrypting history snapshots.
+/// Uses a distinct HKDF context from document encryption for domain separation.
+pub fn derive_history_key(epoch_key: &[u8; 32], doc_id: &[u8; 16], epoch: u32) -> [u8; 32] {
+    let mut info = Vec::with_capacity(HISTORY_ENCRYPTION_CONTEXT.len() + 16 + 4);
+    info.extend_from_slice(HISTORY_ENCRYPTION_CONTEXT);
+    info.extend_from_slice(doc_id);
+    info.extend_from_slice(&epoch.to_be_bytes());
+
+    let hk = Hkdf::<Sha256>::new(None, epoch_key);
+    let mut key = [0u8; 32];
+    hk.expand(&info, &mut key)
+        .expect("HKDF expand should not fail with 32-byte output");
+    key
+}
+
+/// Encrypt a history snapshot for at-rest storage.
+///
+/// Format: `[4 bytes: epoch (BE)][24 bytes: nonce][N bytes: ciphertext + tag]`
+/// Same wire format as `encrypt_document`, but uses history-specific HKDF context.
+pub fn encrypt_snapshot(
+    epoch_key: &[u8; 32],
+    doc_id: &[u8; 16],
+    epoch: u32,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    let mut key = derive_history_key(epoch_key, doc_id, epoch);
+
+    let cipher_key = chacha20poly1305::Key::from_slice(&key);
+    let cipher = XChaCha20Poly1305::new(cipher_key);
+
+    let mut nonce_bytes = [0u8; 24];
+    getrandom::fill(&mut nonce_bytes).map_err(|_| CryptoError::RandomFailed)?;
+    let nonce = chacha20poly1305::XNonce::from_slice(&nonce_bytes);
+
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext)
+        .map_err(|_| CryptoError::EncryptionFailed)?;
+
+    key.zeroize();
+
+    let mut output = Vec::with_capacity(4 + 24 + ciphertext.len());
+    output.extend_from_slice(&epoch.to_be_bytes());
+    output.extend_from_slice(&nonce_bytes);
+    output.extend_from_slice(&ciphertext);
+
+    Ok(output)
+}
+
+/// Decrypt a history snapshot.
+///
+/// Reads the epoch from the header, derives the history key, and decrypts.
+/// Returns `(epoch, plaintext)`.
+pub fn decrypt_snapshot(
+    epoch_key: &[u8; 32],
+    doc_id: &[u8; 16],
+    encrypted: &[u8],
+) -> Result<(u32, Vec<u8>), CryptoError> {
+    if encrypted.len() < 4 + 24 {
+        return Err(CryptoError::InvalidData(
+            "encrypted snapshot too short".into(),
+        ));
+    }
+
+    let epoch = u32::from_be_bytes(
+        encrypted[..4]
+            .try_into()
+            .map_err(|_| CryptoError::InvalidData("bad epoch header".into()))?,
+    );
+
+    let nonce = chacha20poly1305::XNonce::from_slice(&encrypted[4..28]);
+    let ciphertext = &encrypted[28..];
+
+    let mut key = derive_history_key(epoch_key, doc_id, epoch);
+    let cipher_key = chacha20poly1305::Key::from_slice(&key);
+    let cipher = XChaCha20Poly1305::new(cipher_key);
+
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|_| CryptoError::DecryptionFailed)?;
+
+    key.zeroize();
+
+    Ok((epoch, plaintext))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +301,57 @@ mod tests {
 
         let encrypted = encrypt_document(&epoch_key, &doc_id, 0, b"").unwrap();
         let (epoch, decrypted) = decrypt_document(&epoch_key, &doc_id, &encrypted).unwrap();
+        assert_eq!(epoch, 0);
+        assert_eq!(decrypted, b"");
+    }
+
+    // ── Snapshot Encryption Tests ────────────────────────────────────
+
+    #[test]
+    fn test_snapshot_encrypt_decrypt_roundtrip() {
+        let epoch_key = [0x42; 32];
+        let doc_id = [0x01; 16];
+        let epoch = 2;
+        let plaintext = b"This is secret snapshot text content with bold and italic marks";
+
+        let encrypted = encrypt_snapshot(&epoch_key, &doc_id, epoch, plaintext).unwrap();
+        assert_ne!(encrypted, plaintext);
+
+        let (dec_epoch, decrypted) = decrypt_snapshot(&epoch_key, &doc_id, &encrypted).unwrap();
+        assert_eq!(dec_epoch, epoch);
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_snapshot_wrong_key_fails() {
+        let epoch_key = [0x42; 32];
+        let wrong_key = [0x43; 32];
+        let doc_id = [0x01; 16];
+
+        let encrypted = encrypt_snapshot(&epoch_key, &doc_id, 1, b"secret snapshot").unwrap();
+        let result = decrypt_snapshot(&wrong_key, &doc_id, &encrypted);
+        assert!(matches!(result, Err(CryptoError::DecryptionFailed)));
+    }
+
+    #[test]
+    fn test_snapshot_domain_separation() {
+        let epoch_key = [0x42; 32];
+        let doc_id = [0x01; 16];
+        let doc_key = derive_document_key(&epoch_key, &doc_id, 1);
+        let hist_key = derive_history_key(&epoch_key, &doc_id, 1);
+        assert_ne!(
+            doc_key, hist_key,
+            "Document and history keys must differ for domain separation"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_encrypt_empty() {
+        let epoch_key = [0x42; 32];
+        let doc_id = [0x01; 16];
+
+        let encrypted = encrypt_snapshot(&epoch_key, &doc_id, 0, b"").unwrap();
+        let (epoch, decrypted) = decrypt_snapshot(&epoch_key, &doc_id, &encrypted).unwrap();
         assert_eq!(epoch, 0);
         assert_eq!(decrypted, b"");
     }

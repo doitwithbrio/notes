@@ -55,6 +55,7 @@ export function createEditor(
       Link.configure({
         openOnClick: false,
         autolink: true,
+        protocols: ['http', 'https', 'mailto'],
       }),
       CodeBlockLowlight.configure({
         lowlight,

@@ -39,6 +39,11 @@ export async function createProject(name: string) {
   return getProject(name);
 }
 
+export function removeProject(projectId: string) {
+  const index = projectState.projects.findIndex((p) => p.id === projectId);
+  if (index >= 0) projectState.projects.splice(index, 1);
+}
+
 export function reorderProject(fromIndex: number, toIndex: number) {
   if (fromIndex === toIndex) return;
   const [item] = projectState.projects.splice(fromIndex, 1);

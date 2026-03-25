@@ -1,12 +1,21 @@
 use std::sync::Arc;
 
 use automerge::sync::SyncDoc;
-use automerge::{transaction::Transactable, AutoCommit, ObjType, ReadDoc};
+use automerge::transaction::{CommitOptions, Transactable};
+use automerge::{AutoCommit, ObjType, ReadDoc};
 use dashmap::DashMap;
 use tokio::sync::RwLock;
 
 use crate::error::CoreError;
 use crate::types::DocId;
+
+/// Get the current Unix timestamp in seconds.
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
 
 /// Thread-safe store for Automerge documents.
 ///
@@ -175,6 +184,7 @@ impl DocStore {
                     doc.splice_text(&text_id, 0, len as isize, "")?;
                 }
                 doc.splice_text(&text_id, 0, 0, content)?;
+                doc.commit_with(CommitOptions::default().with_time(now_secs()));
                 self.dirty.insert(*id, ());
                 Ok(())
             }

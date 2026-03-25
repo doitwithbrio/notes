@@ -12,6 +12,7 @@
   import ProjectOverview from './editor/ProjectOverview.svelte';
   import QuickOpen from './sidebar/QuickOpen.svelte';
   import RightSidebar from './rightsidebar/RightSidebar.svelte';
+  import SettingsPane from './settings/SettingsPane.svelte';
 
   const activeDoc = $derived(getActiveDoc());
   const activeProject = $derived(
@@ -66,11 +67,15 @@
         <p class="body">{appSessionState.error}</p>
       </div>
     {:else}
-      <div class="main-view" class:hidden={uiState.view === 'project-overview'}>
-        <EditorPane />
-      </div>
-      {#if uiState.view === 'project-overview' && activeProject}
-        <ProjectOverview project={activeProject} />
+      {#if uiState.view === 'settings'}
+        <SettingsPane />
+      {:else}
+        <div class="main-view" class:hidden={uiState.view === 'project-overview'}>
+          <EditorPane />
+        </div>
+        {#if uiState.view === 'project-overview' && activeProject}
+          <ProjectOverview project={activeProject} />
+        {/if}
       {/if}
     {/if}
   </div>
