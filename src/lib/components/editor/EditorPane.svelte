@@ -1,50 +1,96 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
   import type { Editor } from '@tiptap/core';
-  import { createEditor } from '../../editor/setup.js';
-  import { getActiveDoc, documentState } from '../../state/documents.svelte.js';
-  import EditorHeader from './EditorHeader.svelte';
-  import Toolbar from './Toolbar.svelte';
+  import { createEditor, editorToPlainText, textToEditorHtml } from '../../editor/setup.js';
+  import { getActiveDoc } from '../../state/documents.svelte.js';
+  import { presenceState } from '../../state/presence.svelte.js';
+  import { syncState } from '../../state/sync.svelte.js';
+  import { editorSessionState, updateEditorText } from '../../session/editor-session.svelte.js';
 
   let editorElement = $state<HTMLDivElement | null>(null);
   let editor = $state<Editor | null>(null);
+  let applyingRemoteText = false;
 
   const activeDoc = $derived(getActiveDoc());
+  const peersInDoc = $derived(
+    activeDoc
+      ? presenceState.peers.filter((peer) => activeDoc.activePeers.includes(peer.id) && peer.online)
+      : [],
+  );
+  const connectionLabel = $derived(
+    syncState.connection === 'connected'
+      ? 'connected'
+      : syncState.connection === 'slow'
+        ? 'syncing'
+        : 'offline',
+  );
 
-  onMount(() => {
-    if (!editorElement) return;
-    editor = createEditor(editorElement);
+  function syncEditorContent(text: string) {
+    if (!editor) return;
+    const current = editorToPlainText(editor);
+    if (current === text) return;
 
-    // Update word count on content change
-    editor.on('update', ({ editor: e }) => {
-      const doc = getActiveDoc();
-      if (doc) {
-        const text = e.state.doc.textContent;
-        const words = text.trim() ? text.trim().split(/\s+/).length : 0;
-        const docIndex = documentState.docs.findIndex((d) => d.id === doc.id);
-        if (docIndex >= 0) {
-          documentState.docs[docIndex]!.wordCount = words;
-        }
-      }
+    applyingRemoteText = true;
+    editor.commands.setContent(textToEditorHtml(text), { emitUpdate: false });
+    applyingRemoteText = false;
+  }
+
+  $effect(() => {
+    const el = editorElement;
+    if (!el) return;
+
+    const ed = createEditor(el, editorSessionState.text, (text) => {
+      if (applyingRemoteText) return;
+      updateEditorText(text);
     });
+    editor = ed;
 
     return () => {
-      editor?.destroy();
+      ed.destroy();
+      editor = null;
     };
+  });
+
+  $effect(() => {
+    editorSessionState.revision;
+    syncEditorContent(editorSessionState.text);
   });
 </script>
 
 <div class="editor-pane">
+  <div class="editor-drag" data-tauri-drag-region>
+    <div class="drag-spacer" data-tauri-drag-region></div>
+    <div class="drag-right" style="-webkit-app-region: no-drag">
+      {#if peersInDoc.length > 0}
+        <div class="peer-avatars">
+          {#each peersInDoc.slice(0, 3) as peer (peer.id)}
+            <div class="avatar" style="background: {peer.cursorColor}" title={peer.alias}>
+              {peer.alias[0]?.toLowerCase() ?? '?'}
+            </div>
+          {/each}
+        </div>
+      {/if}
+    </div>
+  </div>
+
   {#if activeDoc}
-    <EditorHeader />
-    <Toolbar {editor} />
     <div class="editor-scroll">
-      <div class="editor-mount" bind:this={editorElement}></div>
+      <div class="editor-content-wrap">
+        <h1 class="doc-title">{activeDoc.title}</h1>
+        {#if editorSessionState.lastError}
+          <p class="editor-error">{editorSessionState.lastError}</p>
+        {/if}
+        <div class="editor-mount" bind:this={editorElement}></div>
+      </div>
+    </div>
+
+    <div class="bottom-bar">
+      <span class="md-hints">**bold  _italic_  # heading  - list  [] task  > quote  `code`</span>
+      <span class="connection-status" class:connected={syncState.connection === 'connected'} class:slow={syncState.connection === 'slow'} class:offline={syncState.connection === 'offline'}>{connectionLabel}</span>
     </div>
   {:else}
     <div class="empty-state">
-      <p class="empty-title">No document selected</p>
-      <p class="empty-hint">Pick a file from the sidebar or create a new note.</p>
+      <p class="empty-title">no document selected</p>
+      <p class="empty-hint">pick a note from the sidebar, or create a new one</p>
     </div>
   {/if}
 </div>
@@ -55,144 +101,133 @@
     flex-direction: column;
     height: 100%;
     overflow: hidden;
-    background: var(--white);
+    position: relative;
   }
+
+  .editor-drag {
+    height: 44px;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    padding: 0 20px;
+    -webkit-app-region: drag;
+  }
+
+  .drag-spacer {
+    flex: 1;
+  }
+
+  .drag-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+
+  .peer-avatars {
+    display: flex;
+    align-items: center;
+  }
+
+  .avatar {
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 9px;
+    font-weight: 500;
+    color: var(--white);
+    margin-left: -3px;
+    border: 1.5px solid var(--surface);
+  }
+
+  .avatar:first-child {
+    margin-left: 0;
+  }
+
+
 
   .editor-scroll {
     flex: 1;
     overflow-y: auto;
-    padding: 16px 24px 48px;
+    padding: 0 48px 100px;
   }
 
-  .editor-mount {
-    max-width: 720px;
+  .editor-content-wrap {
+    max-width: 660px;
     margin: 0 auto;
     min-height: 100%;
   }
 
-  /* TipTap editor content styling */
+  .doc-title {
+    font-family: var(--font-body);
+    font-size: 34px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    color: var(--text-primary);
+    margin-bottom: 24px;
+    line-height: 1.15;
+  }
+
+  .editor-error {
+    margin-bottom: 12px;
+    color: #a04130;
+    font-size: 13px;
+  }
+
   .editor-mount :global(.editor-content) {
     outline: none;
     font-family: var(--font-body);
-    font-size: 15px;
-    line-height: 1.7;
-    color: var(--black);
+    font-size: 16px;
+    line-height: 1.85;
+    letter-spacing: 0.005em;
+    color: var(--text-primary);
+    min-height: 40vh;
   }
-
-  .editor-mount :global(.editor-content h1),
-  .editor-mount :global(.editor-content h2),
-  .editor-mount :global(.editor-content h3),
-  .editor-mount :global(.editor-content h4),
-  .editor-mount :global(.editor-content h5),
-  .editor-mount :global(.editor-content h6) {
-    font-family: var(--font-display);
-    font-weight: 300;
-    color: var(--black);
-    margin-top: 1.5em;
-    margin-bottom: 0.5em;
-  }
-
-  .editor-mount :global(.editor-content h1) { font-size: 32px; }
-  .editor-mount :global(.editor-content h2) { font-size: 26px; }
-  .editor-mount :global(.editor-content h3) { font-size: 22px; }
 
   .editor-mount :global(.editor-content p) {
-    margin-bottom: 0.75em;
+    margin-bottom: 0.8em;
   }
 
-  .editor-mount :global(.editor-content a) {
-    color: var(--accent);
-    text-decoration: underline;
-  }
-
-  .editor-mount :global(.editor-content code) {
-    font-family: var(--font-mono);
-    font-size: 13px;
-    background: var(--black);
-    color: var(--white);
-    padding: 2px 5px;
-  }
-
-  .editor-mount :global(.editor-content pre) {
-    font-family: var(--font-mono);
-    font-size: 13px;
-    background: var(--black);
-    color: var(--white);
-    padding: 16px;
-    margin: 1em 0;
-    overflow-x: auto;
-  }
-
-  .editor-mount :global(.editor-content pre code) {
-    background: none;
-    padding: 0;
-  }
-
-  .editor-mount :global(.editor-content blockquote) {
-    border-left: 3px solid var(--accent);
-    padding-left: 16px;
-    margin: 1em 0;
-  }
-
-  .editor-mount :global(.editor-content hr) {
-    border: none;
-    border-top: var(--border);
-    margin: 2em 0;
-  }
-
-  .editor-mount :global(.editor-content ul),
-  .editor-mount :global(.editor-content ol) {
-    padding-left: 24px;
-    margin-bottom: 0.75em;
-  }
-
-  .editor-mount :global(.editor-content ul[data-type='taskList']) {
-    list-style: none;
-    padding-left: 0;
-  }
-
-  .editor-mount :global(.editor-content ul[data-type='taskList'] li) {
+  .bottom-bar {
+    height: 36px;
+    position: relative;
     display: flex;
-    align-items: flex-start;
-    gap: 8px;
+    align-items: center;
+    justify-content: center;
+    padding: 0 24px;
+    color: var(--text-tertiary);
+    font-size: 12px;
   }
 
-  .editor-mount :global(.editor-content ul[data-type='taskList'] input[type='checkbox']) {
-    margin-top: 4px;
-    accent-color: var(--accent);
+  .md-hints {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.02em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
-  .editor-mount :global(.editor-content img) {
-    max-width: 100%;
-    height: auto;
-    margin: 1em 0;
+  .connection-status {
+    position: absolute;
+    right: 24px;
+    font-size: 11px;
+    white-space: nowrap;
   }
 
-  .editor-mount :global(.editor-content table) {
-    border-collapse: collapse;
-    width: 100%;
-    margin: 1em 0;
+  .connection-status.connected {
+    color: var(--accent);
   }
 
-  .editor-mount :global(.editor-content th),
-  .editor-mount :global(.editor-content td) {
-    border: var(--border);
-    padding: 8px 12px;
-    text-align: left;
+  .connection-status.slow {
+    color: var(--accent);
   }
 
-  .editor-mount :global(.editor-content th) {
-    font-weight: 600;
-    background: var(--black);
-    color: var(--white);
-  }
-
-  .editor-mount :global(.editor-content .is-empty::before) {
-    content: attr(data-placeholder);
-    color: var(--black);
-    pointer-events: none;
-    float: left;
-    height: 0;
+  .connection-status.offline {
+    color: var(--text-tertiary);
   }
 
   .empty-state {
@@ -201,17 +236,13 @@
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: 8px;
+    gap: 6px;
+    color: var(--text-tertiary);
   }
 
   .empty-title {
-    font-family: var(--font-display);
-    font-size: 24px;
-    color: var(--black);
-  }
-
-  .empty-hint {
-    font-size: 13px;
-    color: var(--black);
+    color: var(--text-primary);
+    font-size: 22px;
+    font-weight: 600;
   }
 </style>

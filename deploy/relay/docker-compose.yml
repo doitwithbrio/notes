@@ -1,0 +1,42 @@
+# iroh-relay server deployment
+#
+# The relay is stateless — it facilitates peer connections
+# and relays E2E encrypted traffic when direct connections fail.
+# It CANNOT read content (all traffic is E2E encrypted by iroh).
+#
+# Deploy 2+ instances in different regions for redundancy.
+# The N0 public relays (euc1, use1, usw1, aps1) are used as fallback.
+#
+# Usage:
+#   RELAY_HOSTNAME=relay.yourdomain.com docker compose up -d
+#
+# Check logs:
+#   docker compose logs -f
+#
+# For Phase 1-2, the N0 public relays are sufficient.
+# Self-host when you need guaranteed availability.
+
+services:
+  iroh-relay:
+    image: ghcr.io/n0-computer/iroh-relay:latest
+    restart: unless-stopped
+    ports:
+      # HTTPS relay + QUIC
+      - "443:443"
+      # HTTP for ACME certificate renewal (Let's Encrypt)
+      - "80:80"
+      # STUN (UDP, for NAT traversal)
+      - "3478:3478/udp"
+    environment:
+      - IROH_RELAY_HOSTNAME=${RELAY_HOSTNAME:?Set RELAY_HOSTNAME to your domain}
+    volumes:
+      # Persist TLS certificates across restarts
+      - relay-certs:/etc/iroh-relay/certs
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+
+volumes:
+  relay-certs:

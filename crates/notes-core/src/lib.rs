@@ -1,12 +1,22 @@
 pub mod doc_store;
 pub mod error;
+pub mod history;
 pub mod manifest;
 pub mod persistence;
 pub mod project;
+pub mod search;
+pub mod seen_state;
+pub mod settings;
 pub mod types;
+pub mod validation;
 
 pub use doc_store::DocStore;
 pub use error::CoreError;
+pub use history::HistorySession;
 pub use manifest::ProjectManifest;
 pub use project::ProjectManager;
+pub use search::{SearchIndex, SearchResult};
+pub use seen_state::{ProjectSeenState, SeenStateManager, UnseenDocInfo};
+pub use settings::{AppSettings, DegradationLevel};
 pub use types::*;
+pub use validation::{validate_note_path, validate_project_name, validate_relative_path};

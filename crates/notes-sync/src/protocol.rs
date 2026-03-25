@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 /// Current wire protocol version.
 pub const PROTOCOL_VERSION: u8 = 0x01;
 
+/// Maximum sync message size (16 MB).
+pub const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
+
 /// Message types for the sync wire protocol.
 ///
 /// Wire format (stream open):
@@ -47,7 +50,7 @@ pub enum ProtocolError {
     UnknownMessageType(u8),
 
     #[error("Message too large: {0} bytes (max {1})")]
-    MessageTooLarge(u32, u32),
+    MessageTooLarge(usize, u32),
 
     #[error("Connection closed unexpectedly")]
     ConnectionClosed,
@@ -56,16 +59,20 @@ pub enum ProtocolError {
     Io(#[from] std::io::Error),
 }
 
-/// Maximum sync message size (16 MB — generous for Automerge messages).
-pub const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
-
 /// Encode a framed message: [4-byte big-endian length][payload].
-pub fn encode_framed(payload: &[u8]) -> Vec<u8> {
+/// Returns an error if the payload exceeds MAX_MESSAGE_SIZE.
+pub fn encode_framed(payload: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    if payload.len() > MAX_MESSAGE_SIZE as usize {
+        return Err(ProtocolError::MessageTooLarge(
+            payload.len(),
+            MAX_MESSAGE_SIZE,
+        ));
+    }
     let len = payload.len() as u32;
     let mut buf = Vec::with_capacity(4 + payload.len());
     buf.extend_from_slice(&len.to_be_bytes());
     buf.extend_from_slice(payload);
-    buf
+    Ok(buf)
 }
 
 /// Encode a stream header.
@@ -91,16 +98,37 @@ mod tests {
             MessageType::try_from(0x02).unwrap(),
             MessageType::ViewerSnapshot
         );
+        assert_eq!(
+            MessageType::try_from(0x03).unwrap(),
+            MessageType::PresenceUpdate
+        );
+        assert!(MessageType::try_from(0x00).is_err());
+        assert!(MessageType::try_from(0x04).is_err());
         assert!(MessageType::try_from(0xFF).is_err());
     }
 
     #[test]
     fn test_encode_framed() {
         let payload = b"hello";
-        let framed = encode_framed(payload);
+        let framed = encode_framed(payload).unwrap();
         assert_eq!(framed.len(), 4 + 5);
         assert_eq!(&framed[0..4], &5_u32.to_be_bytes());
         assert_eq!(&framed[4..], b"hello");
+    }
+
+    #[test]
+    fn test_encode_framed_empty() {
+        let framed = encode_framed(&[]).unwrap();
+        assert_eq!(framed, &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_encode_framed_too_large() {
+        let big = vec![0u8; MAX_MESSAGE_SIZE as usize + 1];
+        assert!(matches!(
+            encode_framed(&big),
+            Err(ProtocolError::MessageTooLarge(_, _))
+        ));
     }
 
     #[test]

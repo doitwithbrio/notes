@@ -1,10 +1,11 @@
 import { defineConfig } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
+import wasm from 'vite-plugin-wasm';
 
 const host = process.env.TAURI_DEV_HOST;
 
 export default defineConfig({
-  plugins: [svelte()],
+  plugins: [wasm(), svelte()],
   clearScreen: false,
   server: {
     port: 5173,
@@ -26,7 +27,7 @@ export default defineConfig({
     target:
       process.env.TAURI_ENV_PLATFORM === 'windows'
         ? 'chrome105'
-        : 'safari13',
+        : 'safari15',
     minify: !process.env.TAURI_ENV_DEBUG ? 'esbuild' : false,
     sourcemap: !!process.env.TAURI_ENV_DEBUG,
   },

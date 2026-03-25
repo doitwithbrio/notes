@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { documentState, setActiveDoc } from '../../state/documents.svelte.js';
+  import { documentState } from '../../state/documents.svelte.js';
   import { uiState } from '../../state/ui.svelte.js';
-  import { modKey } from '../../utils/platform.js';
+  import { openEditorSession } from '../../session/editor-session.svelte.js';
 
   let query = $state('');
   let inputEl: HTMLInputElement;
@@ -16,8 +16,10 @@
 
   const selectedIndex = $state({ value: 0 });
 
-  function select(docId: string) {
-    setActiveDoc(docId);
+  async function select(docId: string) {
+    const doc = documentState.docs.find((entry) => entry.id === docId);
+    if (!doc) return;
+    await openEditorSession(doc.projectId, doc.id);
     uiState.quickOpenVisible = false;
     query = '';
   }
@@ -31,12 +33,11 @@
       selectedIndex.value = Math.max(selectedIndex.value - 1, 0);
     } else if (e.key === 'Enter' && filtered[selectedIndex.value]) {
       e.preventDefault();
-      select(filtered[selectedIndex.value]!.id);
+      void select(filtered[selectedIndex.value]!.id);
     }
   }
 
   $effect(() => {
-    // Reset selection when query changes
     query;
     selectedIndex.value = 0;
   });
@@ -50,31 +51,29 @@
 <div class="quick-open-backdrop" onclick={() => (uiState.quickOpenVisible = false)} onkeydown={handleKeydown}>
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <div class="quick-open" onclick={(e) => e.stopPropagation()}>
-    <div class="search-row">
-      <input
-        bind:this={inputEl}
-        bind:value={query}
-        class="search-input"
-        placeholder="Search notes... ({modKey}+P)"
-        type="text"
-        onkeydown={handleKeydown}
-      />
-    </div>
+    <input
+      bind:this={inputEl}
+      bind:value={query}
+      class="search-input"
+      placeholder="search notes..."
+      type="text"
+      onkeydown={handleKeydown}
+    />
 
     <div class="results">
       {#each filtered as doc, i (doc.id)}
         <button
           class="result-item"
           class:selected={i === selectedIndex.value}
-          onclick={() => select(doc.id)}
+          onclick={() => void select(doc.id)}
         >
-          <span class="result-title">{doc.title}</span>
+          <span class="result-title">{doc.title.toLowerCase()}</span>
           <span class="result-path">{doc.path}</span>
         </button>
       {/each}
 
       {#if filtered.length === 0}
-        <div class="no-results">No matching notes</div>
+        <div class="no-results">no matching notes</div>
       {/if}
     </div>
   </div>
@@ -87,36 +86,58 @@
     z-index: 100;
     display: flex;
     justify-content: center;
-    padding-top: 80px;
-    background: none;
+    padding-top: 100px;
+    background: rgba(250, 247, 242, 0.6);
+    backdrop-filter: blur(2px);
+    -webkit-backdrop-filter: blur(2px);
+    animation: fadeIn 150ms ease;
+  }
+
+  @keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
   }
 
   .quick-open {
-    width: 480px;
-    max-height: 360px;
-    background: var(--white);
-    border: 2px solid var(--black);
+    width: 560px;
+    max-height: 440px;
+    background: var(--surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: 16px;
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    animation: quickOpenIn 200ms var(--ease-out-expo);
   }
 
-  .search-row {
-    padding: 8px;
-    border-bottom: var(--border);
+  @keyframes quickOpenIn {
+    from {
+      opacity: 0;
+      transform: scale(0.97) translateY(-4px);
+    }
+    to {
+      opacity: 1;
+      transform: scale(1) translateY(0);
+    }
   }
 
   .search-input {
-    width: 100%;
-    padding: 8px 12px;
-    font-size: 15px;
+    padding: 16px 24px;
+    font-size: 16px;
+    font-weight: 400;
     border: none;
     outline: none;
+    background: transparent;
+  }
+
+  .search-input::placeholder {
+    color: var(--text-tertiary);
   }
 
   .results {
     flex: 1;
     overflow-y: auto;
+    border-top: 1px solid var(--border-subtle);
   }
 
   .result-item {
@@ -124,36 +145,38 @@
     align-items: center;
     justify-content: space-between;
     width: 100%;
-    padding: 8px 16px;
+    padding: 11px 24px;
     text-align: left;
-    font-size: 13px;
-    color: var(--black);
-    background: var(--white);
+    font-size: 14px;
+    color: var(--text-primary);
+    background: transparent;
+    transition: background var(--transition-fast);
   }
 
-  .result-item:hover,
+  .result-item:hover {
+    background: var(--surface-hover);
+  }
+
   .result-item.selected {
-    background: var(--accent);
-    color: var(--white);
+    background: var(--surface-active);
+    box-shadow: inset 2px 0 0 var(--accent);
   }
 
   .result-title {
-    font-weight: 500;
+    font-weight: 450;
   }
 
   .result-path {
-    font-size: 11px;
-  }
-
-  .result-item:hover .result-path,
-  .result-item.selected .result-path {
-    color: var(--white);
+    font-size: 12px;
+    font-weight: 400;
+    color: var(--text-tertiary);
   }
 
   .no-results {
-    padding: 16px;
+    padding: 24px;
     text-align: center;
-    font-size: 13px;
-    color: var(--black);
+    font-size: 14px;
+    font-weight: 400;
+    color: var(--text-tertiary);
   }
 </style>

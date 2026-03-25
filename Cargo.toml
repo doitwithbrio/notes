@@ -3,15 +3,29 @@ members = [
     "src-tauri",
     "crates/notes-core",
     "crates/notes-sync",
+    "crates/notes-crypto",
 ]
 resolver = "2"
 
 [workspace.dependencies]
-automerge = "0.5"
+automerge = "0.7"
+iroh = { version = "0.97", features = ["address-lookup-mdns"] }
+iroh-blobs = "0.99"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["sync", "fs", "time", "rt", "macros", "rt-multi-thread"] }
+tokio-util = "0.7"
 log = "0.4"
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "2"
 dashmap = "6"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+opt-level = "s"
+panic = "abort"
+
+[profile.dev.package."*"]
+opt-level = 2

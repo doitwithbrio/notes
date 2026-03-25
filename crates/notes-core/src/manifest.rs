@@ -26,22 +26,27 @@ pub struct ProjectManifest {
 
 impl ProjectManifest {
     /// Create a new project manifest.
-    pub fn new(name: &str) -> Self {
+    pub fn new(name: &str) -> Result<Self, CoreError> {
         let mut doc = AutoCommit::new();
         let project_id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
 
-        doc.put(automerge::ROOT, "schemaVersion", 1_u64)
-            .expect("put schemaVersion");
-        doc.put(automerge::ROOT, "projectId", project_id.as_str())
-            .expect("put projectId");
-        doc.put(automerge::ROOT, "name", name).expect("put name");
-        doc.put(automerge::ROOT, "created", now.as_str())
-            .expect("put created");
-        doc.put_object(automerge::ROOT, "files", ObjType::Map)
-            .expect("put files");
+        doc.put(automerge::ROOT, "schemaVersion", 1_u64)?;
+        doc.put(automerge::ROOT, "projectId", project_id.as_str())?;
+        doc.put(automerge::ROOT, "name", name)?;
+        doc.put(automerge::ROOT, "created", now.as_str())?;
+        doc.put_object(automerge::ROOT, "files", ObjType::Map)?;
 
-        Self { doc }
+        // _ownerControlled section (for shared projects)
+        let owner_section = doc.put_object(automerge::ROOT, "_ownerControlled", ObjType::Map)?;
+        doc.put(&owner_section, "owner", "")?; // Set when sharing is enabled
+        doc.put_object(&owner_section, "peers", ObjType::Map)?;
+        doc.put(&owner_section, "keyEpoch", 0_u64)?;
+        doc.put_object(&owner_section, "epochKeys", ObjType::Map)?;
+        let sharing = doc.put_object(&owner_section, "sharing", ObjType::Map)?;
+        doc.put(&sharing, "group", "single")?;
+
+        Ok(Self { doc })
     }
 
     /// Load a manifest from saved binary data.
@@ -220,6 +225,131 @@ impl ProjectManifest {
             .ok_or_else(|| CoreError::InvalidData("file entry missing path".into()))
     }
 
+    // ── Owner-controlled section ──────────────────────────────────────
+
+    /// Helper to get the `_ownerControlled` map ID.
+    fn owner_section_id(&self) -> Result<automerge::ObjId, CoreError> {
+        self.doc
+            .get(automerge::ROOT, "_ownerControlled")?
+            .map(|(_, id)| id)
+            .ok_or_else(|| CoreError::InvalidData("manifest missing _ownerControlled".into()))
+    }
+
+    /// Set the project owner (peer ID string).
+    pub fn set_owner(&mut self, owner_peer_id: &str) -> Result<(), CoreError> {
+        let section = self.owner_section_id()?;
+        self.doc.put(&section, "owner", owner_peer_id)?;
+        Ok(())
+    }
+
+    /// Get the project owner peer ID.
+    pub fn get_owner(&self) -> Result<String, CoreError> {
+        let section = self.owner_section_id()?;
+        self.doc
+            .get(&section, "owner")?
+            .and_then(|(v, _)| value_to_string(v))
+            .ok_or_else(|| CoreError::InvalidData("manifest missing owner".into()))
+    }
+
+    /// Add a peer to the project.
+    pub fn add_peer(&mut self, peer_id: &str, role: &str, alias: &str) -> Result<(), CoreError> {
+        let section = self.owner_section_id()?;
+        let (_, peers_id) = self
+            .doc
+            .get(&section, "peers")?
+            .ok_or_else(|| CoreError::InvalidData("manifest missing peers map".into()))?;
+
+        let peer_obj = self.doc.put_object(&peers_id, peer_id, ObjType::Map)?;
+        let now = Utc::now().to_rfc3339();
+        self.doc.put(&peer_obj, "role", role)?;
+        self.doc.put(&peer_obj, "alias", alias)?;
+        self.doc.put(&peer_obj, "since", now.as_str())?;
+        Ok(())
+    }
+
+    /// Remove a peer from the project.
+    pub fn remove_peer(&mut self, peer_id: &str) -> Result<(), CoreError> {
+        let section = self.owner_section_id()?;
+        let (_, peers_id) = self
+            .doc
+            .get(&section, "peers")?
+            .ok_or_else(|| CoreError::InvalidData("manifest missing peers map".into()))?;
+
+        self.doc.delete(&peers_id, peer_id)?;
+        Ok(())
+    }
+
+    /// List all peers in the project.
+    pub fn list_peers(&self) -> Result<Vec<PeerInfo>, CoreError> {
+        let section = self.owner_section_id()?;
+        let (_, peers_id) = self
+            .doc
+            .get(&section, "peers")?
+            .ok_or_else(|| CoreError::InvalidData("manifest missing peers map".into()))?;
+
+        let mut result = Vec::new();
+        for key in self.doc.keys(&peers_id) {
+            if let Some((automerge::Value::Object(ObjType::Map), entry_id)) =
+                self.doc.get(&peers_id, key.as_str())?
+            {
+                let role_str = self
+                    .doc
+                    .get(&entry_id, "role")?
+                    .and_then(|(v, _)| value_to_string(v))
+                    .unwrap_or_else(|| "editor".to_string());
+
+                let role = match role_str.as_str() {
+                    "owner" => PeerRole::Owner,
+                    "viewer" => PeerRole::Viewer,
+                    _ => PeerRole::Editor,
+                };
+
+                let alias = self
+                    .doc
+                    .get(&entry_id, "alias")?
+                    .and_then(|(v, _)| value_to_string(v))
+                    .unwrap_or_default();
+
+                let since_str = self
+                    .doc
+                    .get(&entry_id, "since")?
+                    .and_then(|(v, _)| value_to_string(v))
+                    .unwrap_or_default();
+
+                let since = chrono::DateTime::parse_from_rfc3339(&since_str)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| Utc::now());
+
+                result.push(PeerInfo {
+                    peer_id: key,
+                    role,
+                    alias,
+                    since,
+                });
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Set the current key epoch number.
+    pub fn set_key_epoch(&mut self, epoch: u64) -> Result<(), CoreError> {
+        let section = self.owner_section_id()?;
+        self.doc.put(&section, "keyEpoch", epoch)?;
+        Ok(())
+    }
+
+    /// Get the current key epoch number.
+    pub fn get_key_epoch(&self) -> Result<u64, CoreError> {
+        let section = self.owner_section_id()?;
+        self.doc
+            .get(&section, "keyEpoch")?
+            .and_then(|(v, _)| v.to_u64())
+            .ok_or_else(|| CoreError::InvalidData("manifest missing keyEpoch".into()))
+    }
+
+    // ── Accessors ────────────────────────────────────────────────────
+
     /// Get a reference to the underlying Automerge document.
     pub fn doc(&self) -> &AutoCommit {
         &self.doc
@@ -237,14 +367,14 @@ mod tests {
 
     #[test]
     fn test_create_manifest() {
-        let manifest = ProjectManifest::new("test-project");
+        let manifest = ProjectManifest::new("test-project").unwrap();
         assert_eq!(manifest.name().unwrap(), "test-project");
         assert!(manifest.list_files().unwrap().is_empty());
     }
 
     #[test]
     fn test_add_and_list_files() {
-        let mut manifest = ProjectManifest::new("test-project");
+        let mut manifest = ProjectManifest::new("test-project").unwrap();
         let id1 = manifest.add_file("notes/hello.md", FileType::Note).unwrap();
         let id2 = manifest.add_file("notes/world.md", FileType::Note).unwrap();
 
@@ -256,7 +386,7 @@ mod tests {
 
     #[test]
     fn test_rename_file() {
-        let mut manifest = ProjectManifest::new("test-project");
+        let mut manifest = ProjectManifest::new("test-project").unwrap();
         let id = manifest.add_file("old-name.md", FileType::Note).unwrap();
         manifest.rename_file(&id, "new-name.md").unwrap();
         let path = manifest.get_file_path(&id).unwrap();
@@ -265,7 +395,7 @@ mod tests {
 
     #[test]
     fn test_remove_file() {
-        let mut manifest = ProjectManifest::new("test-project");
+        let mut manifest = ProjectManifest::new("test-project").unwrap();
         let id = manifest.add_file("to-delete.md", FileType::Note).unwrap();
         assert_eq!(manifest.list_files().unwrap().len(), 1);
         manifest.remove_file(&id).unwrap();
@@ -274,7 +404,7 @@ mod tests {
 
     #[test]
     fn test_save_and_load() {
-        let mut manifest = ProjectManifest::new("test-project");
+        let mut manifest = ProjectManifest::new("test-project").unwrap();
         manifest.add_file("hello.md", FileType::Note).unwrap();
         let data = manifest.save();
         let loaded = ProjectManifest::load(&data).unwrap();
@@ -284,9 +414,9 @@ mod tests {
 
     #[test]
     fn test_duplicate_path_rejected() {
-        let mut manifest = ProjectManifest::new("test-project");
+        let mut manifest = ProjectManifest::new("test-project").unwrap();
         manifest.add_file("hello.md", FileType::Note).unwrap();
         let result = manifest.add_file("hello.md", FileType::Note);
-        assert!(result.is_err());
+        assert!(matches!(result, Err(CoreError::FileAlreadyExists(_))));
     }
 }

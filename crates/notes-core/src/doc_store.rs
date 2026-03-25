@@ -4,7 +4,6 @@ use automerge::sync::SyncDoc;
 use automerge::{transaction::Transactable, AutoCommit, ObjType, ReadDoc};
 use dashmap::DashMap;
 use tokio::sync::RwLock;
-use uuid::Uuid;
 
 use crate::error::CoreError;
 use crate::types::DocId;
@@ -15,34 +14,44 @@ use crate::types::DocId;
 /// and tokio RwLock per document for concurrent reads / exclusive writes.
 pub struct DocStore {
     docs: DashMap<DocId, Arc<RwLock<AutoCommit>>>,
+    /// Set of document IDs that have unsaved changes.
+    dirty: DashMap<DocId, ()>,
 }
 
 impl DocStore {
     pub fn new() -> Self {
         Self {
             docs: DashMap::new(),
+            dirty: DashMap::new(),
         }
     }
 
-    /// Create a new empty Automerge document and insert it into the store.
-    /// Returns the new document's ID.
-    pub fn create_doc(&self) -> DocId {
-        let id = Uuid::new_v4();
+    /// Create a new empty Automerge document with a specific ID.
+    /// Returns an error if a document with this ID already exists.
+    pub fn create_doc_with_id(&self, id: DocId) -> Result<(), CoreError> {
         let mut doc = AutoCommit::new();
+        doc.put(automerge::ROOT, "schemaVersion", 1_u64)?;
+        doc.put_object(automerge::ROOT, "text", ObjType::Text)?;
 
-        doc.put(automerge::ROOT, "schemaVersion", 1_u64)
-            .expect("failed to set schemaVersion");
-        doc.put_object(automerge::ROOT, "text", ObjType::Text)
-            .expect("failed to create text object");
-
-        self.docs.insert(id, Arc::new(RwLock::new(doc)));
-        id
+        // Use entry API to avoid TOCTOU race
+        use dashmap::mapref::entry::Entry;
+        match self.docs.entry(id) {
+            Entry::Occupied(_) => Err(CoreError::DocAlreadyExists(id)),
+            Entry::Vacant(e) => {
+                e.insert(Arc::new(RwLock::new(doc)));
+                Ok(())
+            }
+        }
     }
 
     /// Load an existing Automerge document from binary data.
+    /// If a document with this ID already exists, the entry is kept (no overwrite).
     pub fn load_doc(&self, id: DocId, data: &[u8]) -> Result<(), CoreError> {
         let doc = AutoCommit::load(data)?;
-        self.docs.insert(id, Arc::new(RwLock::new(doc)));
+        // Atomic insert-if-absent to avoid TOCTOU race
+        self.docs
+            .entry(id)
+            .or_insert_with(|| Arc::new(RwLock::new(doc)));
         Ok(())
     }
 
@@ -59,38 +68,54 @@ impl DocStore {
         self.docs.contains_key(id)
     }
 
-    /// Remove a document from the store, returning it if present.
-    pub fn remove_doc(&self, id: &DocId) -> Option<Arc<RwLock<AutoCommit>>> {
-        self.docs.remove(id).map(|(_, v)| v)
+    /// Remove a document from the store.
+    pub fn remove_doc(&self, id: &DocId) {
+        self.docs.remove(id);
+        self.dirty.remove(id);
     }
 
-    /// Get a full binary save of the document (for persistence or sync).
+    /// Serialize the full document to binary.
+    ///
+    /// Takes a read lock and clones the document before serializing
+    /// to minimize lock hold time. The clone is cheap relative to
+    /// the serialization.
     pub async fn save_doc(&self, id: &DocId) -> Result<Vec<u8>, CoreError> {
         let doc_arc = self.get_doc(id)?;
-        let mut doc = doc_arc.write().await;
-        Ok(doc.save())
-    }
-
-    /// Get an incremental save since the last save (for efficient IPC to frontend).
-    pub async fn save_incremental(&self, id: &DocId) -> Result<Vec<u8>, CoreError> {
-        let doc_arc = self.get_doc(id)?;
-        let mut doc = doc_arc.write().await;
-        Ok(doc.save_incremental())
+        let mut snapshot = {
+            let doc = doc_arc.read().await;
+            doc.clone()
+        };
+        // Serialize outside the lock
+        Ok(snapshot.save())
     }
 
     /// Apply incremental changes from the frontend WASM Automerge instance.
+    /// Marks the document as dirty for the background save loop.
     pub async fn apply_incremental(
         &self,
         id: &DocId,
         data: &[u8],
     ) -> Result<(), CoreError> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        const MAX_INCREMENTAL_SIZE: usize = 16 * 1024 * 1024; // 16 MB
+        if data.len() > MAX_INCREMENTAL_SIZE {
+            return Err(CoreError::InvalidInput(format!(
+                "incremental data too large: {} bytes (max {MAX_INCREMENTAL_SIZE})",
+                data.len()
+            )));
+        }
         let doc_arc = self.get_doc(id)?;
         let mut doc = doc_arc.write().await;
         doc.load_incremental(data)?;
+        self.dirty.insert(*id, ());
         Ok(())
     }
 
     /// Generate a sync message for a peer.
+    ///
+    /// Requires write lock because AutoCommit::sync() needs &mut self in automerge 0.5.
     pub async fn generate_sync_message(
         &self,
         id: &DocId,
@@ -111,8 +136,8 @@ impl DocStore {
     ) -> Result<(), CoreError> {
         let doc_arc = self.get_doc(id)?;
         let mut doc = doc_arc.write().await;
-        doc.sync()
-            .receive_sync_message(sync_state, message)?;
+        doc.sync().receive_sync_message(sync_state, message)?;
+        self.dirty.insert(*id, ());
         Ok(())
     }
 
@@ -133,8 +158,9 @@ impl DocStore {
         }
     }
 
-    /// Update the text content of a document (used for manual .md import).
-    pub async fn set_text(&self, id: &DocId, content: &str) -> Result<(), CoreError> {
+    /// Replace the text content of a document (used for manual .md import).
+    /// WARNING: This is a destructive operation — it tombstones all existing text.
+    pub async fn replace_text(&self, id: &DocId, content: &str) -> Result<(), CoreError> {
         let doc_arc = self.get_doc(id)?;
         let mut doc = doc_arc.write().await;
 
@@ -149,6 +175,7 @@ impl DocStore {
                     doc.splice_text(&text_id, 0, len as isize, "")?;
                 }
                 doc.splice_text(&text_id, 0, 0, content)?;
+                self.dirty.insert(*id, ());
                 Ok(())
             }
             _ => Err(CoreError::InvalidData("text field is not Text type".into())),
@@ -156,13 +183,27 @@ impl DocStore {
     }
 
     /// Compact a document by saving and reloading.
+    /// Sheds intermediate ops to reduce memory usage.
+    /// Note: resets incremental save state — next save will be a full payload.
     pub async fn compact(&self, id: &DocId) -> Result<(), CoreError> {
         let doc_arc = self.get_doc(id)?;
         let mut doc = doc_arc.write().await;
         let bytes = doc.save();
         *doc = AutoCommit::load(&bytes)?;
+        self.dirty.insert(*id, ());
         log::info!("Compacted document {id}: {} bytes", bytes.len());
         Ok(())
+    }
+
+    /// Check if a document has unsaved changes and clear the dirty flag.
+    /// Returns true if the document was dirty.
+    pub fn take_dirty(&self, id: &DocId) -> bool {
+        self.dirty.remove(id).is_some()
+    }
+
+    /// Mark a document as dirty (has unsaved changes).
+    pub fn mark_dirty(&self, id: &DocId) {
+        self.dirty.insert(*id, ());
     }
 
     /// List all document IDs currently loaded.
@@ -188,20 +229,34 @@ impl Default for DocStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn test_create_and_get_text() {
         let store = DocStore::new();
-        let id = store.create_doc();
+        let id = Uuid::new_v4();
+        store.create_doc_with_id(id).unwrap();
         let text = store.get_text(&id).await.unwrap();
         assert_eq!(text, "");
     }
 
     #[tokio::test]
+    async fn test_create_duplicate_id_rejected() {
+        let store = DocStore::new();
+        let id = Uuid::new_v4();
+        store.create_doc_with_id(id).unwrap();
+        assert!(matches!(
+            store.create_doc_with_id(id),
+            Err(CoreError::DocAlreadyExists(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn test_set_and_get_text() {
         let store = DocStore::new();
-        let id = store.create_doc();
-        store.set_text(&id, "Hello, world!").await.unwrap();
+        let id = Uuid::new_v4();
+        store.create_doc_with_id(id).unwrap();
+        store.replace_text(&id, "Hello, world!").await.unwrap();
         let text = store.get_text(&id).await.unwrap();
         assert_eq!(text, "Hello, world!");
     }
@@ -209,8 +264,9 @@ mod tests {
     #[tokio::test]
     async fn test_save_and_load() {
         let store = DocStore::new();
-        let id = store.create_doc();
-        store.set_text(&id, "Persistent content").await.unwrap();
+        let id = Uuid::new_v4();
+        store.create_doc_with_id(id).unwrap();
+        store.replace_text(&id, "Persistent content").await.unwrap();
         let data = store.save_doc(&id).await.unwrap();
 
         let store2 = DocStore::new();
@@ -222,37 +278,78 @@ mod tests {
     #[tokio::test]
     async fn test_compact() {
         let store = DocStore::new();
-        let id = store.create_doc();
-        store.set_text(&id, "Before compact").await.unwrap();
+        let id = Uuid::new_v4();
+        store.create_doc_with_id(id).unwrap();
+        store.replace_text(&id, "Before compact").await.unwrap();
         store.compact(&id).await.unwrap();
         let text = store.get_text(&id).await.unwrap();
         assert_eq!(text, "Before compact");
     }
 
     #[tokio::test]
-    async fn test_incremental_sync() {
+    async fn test_dirty_tracking() {
         let store = DocStore::new();
-        let id = store.create_doc();
-        store.set_text(&id, "Hello").await.unwrap();
+        let id = Uuid::new_v4();
+        store.create_doc_with_id(id).unwrap();
 
-        let full = store.save_doc(&id).await.unwrap();
-        let store2 = DocStore::new();
-        store2.load_doc(id, &full).unwrap();
+        // New doc is not dirty
+        assert!(!store.take_dirty(&id));
 
-        store.set_text(&id, "Hello, updated").await.unwrap();
-        let inc2 = store.save_incremental(&id).await.unwrap();
+        // After modification, it is dirty
+        store.replace_text(&id, "modified").await.unwrap();
+        assert!(store.take_dirty(&id));
 
-        store2.apply_incremental(&id, &inc2).await.unwrap();
-        let text = store2.get_text(&id).await.unwrap();
-        assert_eq!(text, "Hello, updated");
+        // After taking dirty, it's clean
+        assert!(!store.take_dirty(&id));
+    }
+
+    #[tokio::test]
+    async fn test_get_nonexistent_doc() {
+        let store = DocStore::new();
+        let id = Uuid::new_v4();
+        assert!(matches!(
+            store.get_text(&id).await,
+            Err(CoreError::DocNotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_load_corrupted_data() {
+        let store = DocStore::new();
+        let id = Uuid::new_v4();
+        let result = store.load_doc(id, &[0xFF; 100]);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_apply_incremental_oversized() {
+        let store = DocStore::new();
+        let id = Uuid::new_v4();
+        store.create_doc_with_id(id).unwrap();
+        let big = vec![0u8; 17 * 1024 * 1024]; // > 16 MB
+        assert!(matches!(
+            store.apply_incremental(&id, &big).await,
+            Err(CoreError::InvalidInput(_))
+        ));
     }
 
     #[tokio::test]
     async fn test_remove_doc() {
         let store = DocStore::new();
-        let id = store.create_doc();
+        let id = Uuid::new_v4();
+        store.create_doc_with_id(id).unwrap();
         assert!(store.contains(&id));
         store.remove_doc(&id);
         assert!(!store.contains(&id));
+    }
+
+    #[tokio::test]
+    async fn test_unicode_text() {
+        let store = DocStore::new();
+        let id = Uuid::new_v4();
+        store.create_doc_with_id(id).unwrap();
+        store.replace_text(&id, "Hello 🌍🔥 日本語テスト").await.unwrap();
+        let text = store.get_text(&id).await.unwrap();
+        assert_eq!(text, "Hello 🌍🔥 日本語テスト");
     }
 }

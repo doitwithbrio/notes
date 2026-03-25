@@ -14,15 +14,39 @@ import { common, createLowlight } from 'lowlight';
 
 const lowlight = createLowlight(common);
 
-export function createEditor(element: HTMLElement): Editor {
+function escapeHtml(value: string) {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+export function textToEditorHtml(text: string) {
+  if (!text.trim()) return '<p></p>';
+  const paragraphs = text.split(/\n{2,}/).map((paragraph) => paragraph.replace(/\n/g, '<br />'));
+  return paragraphs.map((paragraph) => `<p>${escapeHtml(paragraph)}</p>`).join('');
+}
+
+export function editorToPlainText(editor: Editor) {
+  return editor.getText({ blockSeparator: '\n\n' });
+}
+
+export function createEditor(
+  element: HTMLElement,
+  initialText: string,
+  onTextChange: (text: string) => void,
+): Editor {
   return new Editor({
     element,
     extensions: [
       StarterKit.configure({
-        // Disable default codeBlock in favor of lowlight version
         codeBlock: false,
         dropcursor: false,
         gapcursor: false,
+        // Disable undo/redo — Automerge handles this
+        undoRedo: false,
       }),
       Image.configure({
         inline: true,
@@ -46,20 +70,23 @@ export function createEditor(element: HTMLElement): Editor {
         nested: true,
       }),
       Placeholder.configure({
-        placeholder: 'Start writing...',
+        placeholder: 'begin writing...',
       }),
       Typography,
       Dropcursor.configure({
-        color: '#2AC994',
+        color: '#B68D5E',
         width: 2,
       }),
       Gapcursor,
     ],
-    content: '',
+    content: textToEditorHtml(initialText),
     editorProps: {
       attributes: {
         class: 'editor-content',
       },
+    },
+    onUpdate: ({ editor }) => {
+      onTextChange(editorToPlainText(editor));
     },
   });
 }

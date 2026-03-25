@@ -1,9 +1,27 @@
 <script lang="ts">
   import type { Document } from '../../types/index.js';
-  import { documentState, setActiveDoc } from '../../state/documents.svelte.js';
+  import { documentState } from '../../state/documents.svelte.js';
   import { presenceState } from '../../state/presence.svelte.js';
 
-  let { doc }: { doc: Document } = $props();
+  let {
+    doc,
+    collapsed = false,
+    editing = false,
+    editMode = false,
+    onopen,
+    oncommit,
+    oncancel,
+    oncontextmenu: onCtxMenu,
+  }: {
+    doc: Document;
+    collapsed?: boolean;
+    editing?: boolean;
+    editMode?: boolean;
+    onopen?: (docId: string) => void;
+    oncommit?: (title: string) => void;
+    oncancel?: () => void;
+    oncontextmenu?: (detail: { x: number; y: number; docId: string }) => void;
+  } = $props();
 
   const isActive = $derived(documentState.activeDocId === doc.id);
 
@@ -11,54 +29,146 @@
     presenceState.peers.filter((p) => doc.activePeers.includes(p.id) && p.online),
   );
 
-  const syncIcon = $derived(
-    doc.syncStatus === 'synced'
-      ? '\u2713'
-      : doc.syncStatus === 'syncing'
-        ? '\u21BB'
-        : '\u2601\u0338',
-  );
+  let inputValue = $state('');
+
+  function handleInputKeydown(e: KeyboardEvent) {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      commitEdit();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      oncancel?.();
+    }
+  }
+
+  function handleInputBlur() {
+    commitEdit();
+  }
+
+  function commitEdit() {
+    const trimmed = inputValue.trim();
+    if (trimmed) {
+      oncommit?.(trimmed);
+    } else {
+      oncancel?.();
+    }
+  }
+
+  function focusInput(el: HTMLInputElement) {
+    // Tick delay to ensure it's in the DOM
+    requestAnimationFrame(() => el.focus());
+  }
 </script>
 
-<button class="file-item" class:active={isActive} onclick={() => setActiveDoc(doc.id)}>
-  <span class="file-name">{doc.title}</span>
-
-  <span class="file-meta">
-    {#if peersHere.length > 0}
-      <span class="presence-dots">
-        {#each peersHere.slice(0, 3) as peer (peer.id)}
-          <span class="dot" style="background: {peer.cursorColor}"></span>
-        {/each}
-        {#if peersHere.length > 3}
-          <span class="dot-overflow">+{peersHere.length - 3}</span>
-        {/if}
+{#if editing}
+  <div class="file-item editing">
+    <input
+      class="inline-input"
+      type="text"
+      placeholder="note title"
+      bind:value={inputValue}
+      onkeydown={handleInputKeydown}
+      onblur={handleInputBlur}
+      use:focusInput
+    />
+  </div>
+{:else}
+  <button
+    class="file-item"
+    class:active={isActive && !editMode}
+    class:collapsed
+    class:drag-mode={editMode}
+    onclick={() => { if (!editMode) onopen?.(doc.id); }}
+    oncontextmenu={(e) => {
+      if (onCtxMenu) {
+        e.preventDefault();
+        onCtxMenu({ x: e.clientX, y: e.clientY, docId: doc.id });
+      }
+    }}
+  >
+    {#if collapsed}
+      <span class="file-initial" class:has-unread={doc.hasUnread} class:has-peers={peersHere.length > 0}>
+        {doc.title[0]?.toLowerCase() ?? '?'}
       </span>
-    {/if}
+    {:else}
+      {#if doc.hasUnread}
+        <span class="unread-dot"></span>
+      {/if}
+      <span class="file-name">{doc.title}</span>
 
-    <span class="sync-icon" class:syncing={doc.syncStatus === 'syncing'}>{syncIcon}</span>
-  </span>
-</button>
+      {#if peersHere.length > 0}
+        <span class="peer-indicators">
+          {#each peersHere.slice(0, 3) as peer (peer.id)}
+            <span class="peer-dot" style="background: {peer.cursorColor}"></span>
+          {/each}
+        </span>
+      {/if}
+    {/if}
+  </button>
+{/if}
 
 <style>
   .file-item {
     display: flex;
     align-items: center;
-    justify-content: space-between;
     width: 100%;
-    padding: 4px 16px 4px 20px;
+    padding: 6px 10px;
     font-size: 13px;
     text-align: left;
-    color: var(--black);
-    background: var(--white);
+    color: var(--text-primary);
+    position: relative;
+    border-radius: 8px;
+    transition: background var(--transition-fast);
+    gap: 8px;
   }
 
-  .file-item:hover {
-    color: var(--accent);
+  .file-item.editing {
+    padding: 4px 10px;
+  }
+
+  .file-item.collapsed {
+    padding: 4px 8px;
+    justify-content: center;
+  }
+
+  .file-item:hover:not(.drag-mode) {
+    background: var(--surface-hover);
   }
 
   .file-item.active {
+    background: var(--surface-active);
+    font-weight: 500;
+  }
+
+  .file-item.drag-mode {
+    cursor: grab;
+    user-select: none;
+  }
+
+  .file-item.drag-mode:active {
+    cursor: grabbing;
+  }
+
+  .file-initial {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-primary);
+    position: relative;
+  }
+
+  .file-initial.has-unread::after {
+    content: '';
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
     background: var(--accent);
-    color: var(--white);
+    position: absolute;
+    top: -1px;
+    right: 4px;
   }
 
   .file-name {
@@ -68,51 +178,49 @@
     white-space: nowrap;
   }
 
-  .file-meta {
-    display: flex;
-    align-items: center;
-    gap: 6px;
+  /* Unread: static accent dot to the left of file name */
+  .unread-dot {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--accent);
     flex-shrink: 0;
   }
 
-  .presence-dots {
+  /* Peers: small colored dots on the right */
+  .peer-indicators {
     display: flex;
     align-items: center;
-    gap: 2px;
+    gap: 3px;
+    flex-shrink: 0;
+    margin-left: auto;
   }
 
-  .dot {
-    width: 6px;
-    height: 6px;
+  .peer-dot {
+    width: 5px;
+    height: 5px;
     border-radius: 50%;
   }
 
-  .dot-overflow {
-    font-size: 9px;
-    color: var(--black);
+  /* Inline editing input */
+  .inline-input {
+    width: 100%;
+    font-family: var(--font-body);
+    font-size: 13px;
+    color: var(--text-primary);
+    background: var(--surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: 10px;
+    outline: none;
+    padding: 9px 12px;
+    transition: border-color var(--transition-fast);
   }
 
-  .file-item.active .dot-overflow {
-    color: var(--white);
+  .inline-input:focus {
+    border-color: var(--accent);
   }
 
-  .sync-icon {
-    font-size: 11px;
-    width: 14px;
-    text-align: center;
-  }
-
-  .sync-icon.syncing {
-    color: var(--accent);
-    animation: spin 1s linear infinite;
-  }
-
-  .file-item.active .sync-icon {
-    color: var(--white);
-  }
-
-  @keyframes spin {
-    from { transform: rotate(0deg); }
-    to { transform: rotate(360deg); }
+  .inline-input::placeholder {
+    color: var(--text-secondary);
   }
 </style>

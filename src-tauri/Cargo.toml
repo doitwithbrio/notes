@@ -9,18 +9,24 @@ edition = "2021"
 
 [lib]
 name = "p2p_notes_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+crate-type = ["cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
 notes-core = { path = "../crates/notes-core" }
+notes-sync = { path = "../crates/notes-sync" }
+notes-crypto = { path = "../crates/notes-crypto" }
+iroh.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 log.workspace = true
-tokio.workspace = true
 uuid.workspace = true
+tokio.workspace = true
 tauri = { version = "2", features = [] }
 tauri-plugin-log = "2"
 dirs = "6"
+anyhow = "1"
+getrandom = "0.3"
+chrono = "0.4"

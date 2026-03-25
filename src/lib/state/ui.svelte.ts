@@ -3,6 +3,8 @@ import { ACCENT_COLORS, DEFAULT_ACCENT, type AccentColorId, type AppView } from 
 export const uiState = $state({
   view: 'editor' as AppView,
   sidebarOpen: true,
+  rightSidebarOpen: false,
+  activeProjectId: null as string | null,
   quickOpenVisible: false,
   accentColorId: DEFAULT_ACCENT as AccentColorId,
 });
@@ -25,4 +27,13 @@ export function toggleSidebar() {
 
 export function toggleQuickOpen() {
   uiState.quickOpenVisible = !uiState.quickOpenVisible;
+}
+
+export function toggleRightSidebar() {
+  uiState.rightSidebarOpen = !uiState.rightSidebarOpen;
+}
+
+export function openProjectOverview(projectId: string) {
+  uiState.view = 'project-overview';
+  uiState.activeProjectId = projectId;
 }

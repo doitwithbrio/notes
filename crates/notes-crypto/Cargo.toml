@@ -1,0 +1,25 @@
+[package]
+name = "notes-crypto"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+zeroize = { version = "1.8", features = ["derive"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+log.workspace = true
+getrandom = "0.3"
+iroh.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# libsecret via keyring — deferred, use file-based storage with restrictive permissions for now
+
+[dev-dependencies]
+tempfile = "3"

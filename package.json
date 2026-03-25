@@ -11,12 +11,16 @@
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^7.0.0",
     "esbuild": "^0.27.4",
+    "rollup": "^4.60.0",
     "svelte": "^5.55.0",
     "svelte-check": "^4.4.5",
     "typescript": "^6.0.2",
-    "vite": "^8.0.2"
+    "vite": "^8.0.2",
+    "vite-plugin-top-level-await": "^1.6.0",
+    "vite-plugin-wasm": "^3.6.0"
   },
   "dependencies": {
+    "@automerge/automerge": "^3.2.4",
     "@tauri-apps/api": "^2.10.1",
     "@tauri-apps/plugin-log": "^2.8.0",
     "@tiptap/core": "^3.20.4",
@@ -37,6 +41,7 @@
     "@tiptap/extension-typography": "^3.20.4",
     "@tiptap/pm": "^3.20.4",
     "@tiptap/starter-kit": "^3.20.4",
-    "lowlight": "^3.3.0"
+    "lowlight": "^3.3.0",
+    "lucide-svelte": "^1.0.1"
   }
 }
