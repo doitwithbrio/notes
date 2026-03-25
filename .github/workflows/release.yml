@@ -14,9 +14,9 @@ jobs:
       matrix:
         include:
           - platform: macos-latest
-            args: --target aarch64-apple-darwin
+            target: aarch64-apple-darwin
           - platform: macos-latest
-            args: --target x86_64-apple-darwin
+            target: x86_64-apple-darwin
 
     runs-on: ${{ matrix.platform }}
 
@@ -67,20 +67,30 @@ jobs:
           print(f'Version check passed: {tag_version}')
           PY
 
-      - name: Build and create release draft
+      # Uses a wrapper script (.github/build-and-sign.sh) that:
+      # 1. Runs the normal cargo tauri build
+      # 2. Ad-hoc codesigns the .app bundle (codesign -s -)
+      # 3. Repackages the .app.tar.gz updater artifact with the signed bundle
+      # 4. Regenerates the updater .sig file
+      #
+      # Without this, the .app has a broken linker-applied signature and
+      # macOS reports "is damaged and can't be opened."
+      # With ad-hoc signing, users see "unidentified developer" instead,
+      # which can be bypassed via right-click > Open.
+      #
+      # To eliminate all warnings: add Apple Developer ID signing secrets.
+      - name: Build, sign, and release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         with:
+          tauriScript: ./.github/build-and-sign.sh
           tagName: v__VERSION__
           releaseName: 'notes v__VERSION__'
           releaseBody: |
-            Signed updater artifacts for notes.
-
-            After publishing this draft release, installed apps will discover it
-            automatically during their background update check and via the
-            Settings > Updates manual check flow.
+            **macOS:** If you see "unidentified developer", right-click the app
+            and select Open, then click Open in the dialog.
           releaseDraft: true
           prerelease: false
-          args: ${{ matrix.args }}
+          args: --target ${{ matrix.target }}
