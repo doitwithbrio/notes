@@ -131,7 +131,11 @@ export async function acceptInvite(passphrase: string, ownerPeerId: string) {
   inviteState.acceptResult = null;
 
   try {
-    const result = await tauriApi.acceptInvite(normalizePassphrase(passphrase), ownerPeerId.trim());
+    // Strip ALL whitespace (not just leading/trailing) from the peer ID — a
+    // peer ID pasted from a line-wrapped UI or a mobile share sheet may contain
+    // internal spaces or newlines that .trim() alone would miss.
+    const normalizedPeerId = ownerPeerId.replace(/\s+/g, '');
+    const result = await tauriApi.acceptInvite(normalizePassphrase(passphrase), normalizedPeerId);
     inviteState.acceptResult = result;
 
     // Reload projects and docs to include the newly joined project.

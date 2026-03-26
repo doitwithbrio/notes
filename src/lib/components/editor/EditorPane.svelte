@@ -6,9 +6,9 @@
   import { presenceState } from '../../state/presence.svelte.js';
   import { syncState } from '../../state/sync.svelte.js';
   import { editorSessionState, updateEditorText, reloadActiveSession } from '../../session/editor-session.svelte.js';
-  import { uiState } from '../../state/ui.svelte.js';
   import { versionState, leaveHistoryReview, showSavePrompt } from '../../state/versions.svelte.js';
   import { computeBlockDiff } from '../../utils/diff.js';
+  import { getWorkspaceRoute, isHistoryRoute } from '../../navigation/workspace-router.svelte.js';
   import TimelineScrubber from './TimelineScrubber.svelte';
   import SaveVersionBar from './SaveVersionBar.svelte';
   import ChangeMinibar from './ChangeMinibar.svelte';
@@ -19,7 +19,7 @@
   let applyingRemoteText = false;
 
   const activeDoc = $derived(getActiveDoc());
-  const isHistoryReview = $derived(uiState.view === 'history-review');
+  const isHistoryReview = $derived.by(() => isHistoryRoute(getWorkspaceRoute()));
   const peersInDoc = $derived(
     activeDoc
       ? presenceState.peers.filter((peer) => activeDoc.activePeers.includes(peer.id) && peer.online)

@@ -1,31 +1,27 @@
 <script lang="ts">
   import { ChevronLeft, ChevronRight } from 'lucide-svelte';
   import { editorSessionState } from '../../session/editor-session.svelte.js';
-  import { uiState } from '../../state/ui.svelte.js';
   import {
     versionState,
     getSignificantVersions,
-    selectVersion,
     selectPrevVersion,
     selectNextVersion,
-    leaveHistoryReview,
   } from '../../state/versions.svelte.js';
   import { formatShortTime } from '../../utils/time.js';
+  import { getWorkspaceRoute, isHistoryRoute, navigateBackToLive, navigateToHistory } from '../../navigation/workspace-router.svelte.js';
 
   const versions = $derived(getSignificantVersions());
   const hasVersions = $derived(versions.length > 0);
-  const isReviewing = $derived(uiState.view === 'history-review');
+  const isReviewing = $derived.by(() => isHistoryRoute(getWorkspaceRoute()));
   const selectedIdx = $derived(versionState.selectedVersionIndex);
 
   // Are we at the oldest/newest version?
   const canGoPrev = $derived(selectedIdx < versions.length - 1);
-  const canGoNext = $derived(selectedIdx > 0);
+  const canGoNext = $derived(selectedIdx > 0 || isReviewing);
 
   function handleTickClick(versionId: string) {
     if (!editorSessionState.projectId || !editorSessionState.docId) return;
-    uiState.view = 'history-review';
-    uiState.historyReviewSessionId = versionId;
-    selectVersion(
+    void navigateToHistory(
       editorSessionState.projectId,
       editorSessionState.docId,
       versionId,
@@ -34,20 +30,28 @@
 
   function handlePrev() {
     if (!editorSessionState.projectId || !editorSessionState.docId) return;
+    if (!isReviewing && versions.length > 0) {
+      void navigateToHistory(
+        editorSessionState.projectId,
+        editorSessionState.docId,
+        versions[0]!.id,
+      );
+      return;
+    }
     selectPrevVersion(editorSessionState.projectId, editorSessionState.docId);
   }
 
   function handleNext() {
     if (!editorSessionState.projectId || !editorSessionState.docId) return;
     if (selectedIdx <= 0) {
-      leaveHistoryReview();
+      navigateBackToLive();
       return;
     }
     selectNextVersion(editorSessionState.projectId, editorSessionState.docId);
   }
 
   function handleBackToLive() {
-    leaveHistoryReview();
+    navigateBackToLive();
   }
 
   // Get position percentage for a version on the timeline (0 = oldest, 100 = newest)

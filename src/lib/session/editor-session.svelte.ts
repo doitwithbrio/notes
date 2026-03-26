@@ -22,6 +22,16 @@ function concatChunks(chunks: Uint8Array[]) {
   return output;
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 function getDocText(doc: Automerge.Doc<NotesDoc>) {
   return typeof doc.text === 'string' ? doc.text : String(doc.text ?? '');
 }
@@ -42,6 +52,9 @@ let applyTimer: ReturnType<typeof setTimeout> | null = null;
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let idleVersionTimer: ReturnType<typeof setTimeout> | null = null;
 let wordCountTimer: ReturnType<typeof setTimeout> | null = null;
+let sessionIntentId = 0;
+let transitionQueue: Promise<void> = Promise.resolve();
+const supersedeResolvers = new Map<number, () => void>();
 
 /** 15 minutes idle = auto-create a version. */
 const IDLE_VERSION_TIMEOUT_MS = 15 * 60 * 1000;
@@ -108,62 +121,207 @@ export function getActiveSession() {
   };
 }
 
-async function loadBinary(projectId: string, docId: string) {
-  const binary = await tauriApi.getDocBinary(projectId, docId);
-  const doc = Automerge.load<NotesDoc>(binary);
-  // Set stable device actor ID if available
-  if (versionState.deviceActorId) {
-    currentDoc = Automerge.clone(doc, { actor: versionState.deviceActorId });
-  } else {
-    currentDoc = doc;
-  }
-  editorSessionState.text = getDocText(currentDoc);
-  editorSessionState.revision += 1;
-  setDocWordCount(docId, editorSessionState.text);
+function queueSessionTransition<T>(work: () => Promise<T>): Promise<T> {
+  const run = transitionQueue.then(work, work);
+  transitionQueue = run.then(() => undefined, () => undefined);
+  return run;
 }
 
-export async function openEditorSession(projectId: string, docId: string) {
-  if (editorSessionState.projectId === projectId && editorSessionState.docId === docId) {
-    // Session already loaded — just ensure the UI view is restored
-    // (user may have navigated to project-overview or settings and come back)
-    leaveHistoryReview();
-    setActiveDoc(docId);
+function bumpSessionIntent() {
+  sessionIntentId += 1;
+  for (const [intentId, resolve] of supersedeResolvers.entries()) {
+    if (intentId < sessionIntentId) {
+      supersedeResolvers.delete(intentId);
+      resolve();
+    }
+  }
+  return sessionIntentId;
+}
+
+async function raceWithSuperseded<T>(intentId: number, promise: Promise<T>) {
+  if (intentId !== sessionIntentId) {
+    return { superseded: true } as const;
+  }
+
+  const signal = deferred<void>();
+  supersedeResolvers.set(intentId, signal.resolve);
+
+  try {
+    return await Promise.race([
+      promise.then((value) => ({ superseded: false as const, value })),
+      signal.promise.then(() => ({ superseded: true as const })),
+    ]);
+  } finally {
+    if (supersedeResolvers.get(intentId) === signal.resolve) {
+      supersedeResolvers.delete(intentId);
+    }
+  }
+}
+
+async function closeSessionInternal(intentId: number, options?: { preserveLoading?: boolean }) {
+  leaveHistoryReview();
+
+  flushWordCount();
+  clearTimers();
+
+  if (!editorSessionState.projectId || !editorSessionState.docId) {
+    currentDoc = null;
+    pendingChunks = [];
+    if (intentId === sessionIntentId && !options?.preserveLoading) {
+      editorSessionState.loading = false;
+    }
     return;
   }
 
-  await closeEditorSession();
+  const { projectId, docId } = editorSessionState;
+  await saveNow().catch(() => undefined);
 
-  editorSessionState.loading = true;
-  editorSessionState.lastError = null;
+  await createVersion(projectId, docId).catch(() => undefined);
+  await tauriApi.closeDoc(projectId, docId).catch(() => undefined);
 
-  try {
-    await tauriApi.openProject(projectId, true);
-    await tauriApi.openDoc(projectId, docId);
-    await tauriApi.markDocSeen(projectId, docId);
-    await loadBinary(projectId, docId);
-    editorSessionState.projectId = projectId;
-    editorSessionState.docId = docId;
-    setActiveDoc(docId);
-    markDocUnread(docId, false);
-    await loadVersions(docId);
-  } catch (error) {
-    if (error instanceof TauriRuntimeUnavailableError) {
-      editorSessionState.lastError = null;
-      return;
-    }
-    editorSessionState.lastError = error instanceof Error ? error.message : 'Failed to open note';
-    throw error;
-  } finally {
+  if (editorSessionState.projectId === projectId && editorSessionState.docId === docId) {
+    currentDoc = null;
+    pendingChunks = [];
+    editorSessionState.projectId = null;
+    editorSessionState.docId = null;
+    editorSessionState.text = '';
+    editorSessionState.revision += 1;
+  }
+
+  if (intentId === sessionIntentId && !options?.preserveLoading) {
     editorSessionState.loading = false;
   }
 }
 
+async function loadBinary(projectId: string, docId: string) {
+  const binary = await tauriApi.getDocBinary(projectId, docId);
+  const doc = Automerge.load<NotesDoc>(binary);
+  const loadedDoc = versionState.deviceActorId
+    ? Automerge.clone(doc, { actor: versionState.deviceActorId })
+    : doc;
+
+  return {
+    doc: loadedDoc,
+    text: getDocText(loadedDoc),
+  };
+}
+
+export async function openEditorSession(projectId: string, docId: string) {
+  const intentId = bumpSessionIntent();
+  editorSessionState.loading = true;
+  editorSessionState.lastError = null;
+  leaveHistoryReview();
+  setActiveDoc(docId);
+  uiState.activeProjectId = projectId;
+
+  return queueSessionTransition(async () => {
+    if (intentId !== sessionIntentId) return;
+
+    const sameDocAlreadyOpen =
+      editorSessionState.projectId === projectId
+      && editorSessionState.docId === docId
+      && currentDoc !== null;
+
+    if (sameDocAlreadyOpen) {
+      leaveHistoryReview();
+      setActiveDoc(docId);
+      editorSessionState.loading = false;
+      return;
+    }
+
+    await closeSessionInternal(intentId, { preserveLoading: true });
+    if (intentId !== sessionIntentId) return;
+
+    let backendDocOpened = false;
+
+    try {
+      const openProjectResult = await raceWithSuperseded(intentId, tauriApi.openProject(projectId, true));
+      if (openProjectResult.superseded) return;
+
+      const openDocPromise = tauriApi.openDoc(projectId, docId);
+      const openDocResult = await raceWithSuperseded(intentId, openDocPromise);
+      if (openDocResult.superseded) {
+        void openDocPromise
+          .then(() => tauriApi.closeDoc(projectId, docId))
+          .catch(() => undefined);
+        return;
+      }
+      backendDocOpened = true;
+      if (intentId !== sessionIntentId) {
+        await tauriApi.closeDoc(projectId, docId).catch(() => undefined);
+        return;
+      }
+
+      const markSeenResult = await raceWithSuperseded(intentId, tauriApi.markDocSeen(projectId, docId));
+      if (markSeenResult.superseded) {
+        await tauriApi.closeDoc(projectId, docId).catch(() => undefined);
+        return;
+      }
+
+      const loadBinaryResult = await raceWithSuperseded(intentId, loadBinary(projectId, docId));
+      if (loadBinaryResult.superseded) {
+        await tauriApi.closeDoc(projectId, docId).catch(() => undefined);
+        return;
+      }
+      const loaded = loadBinaryResult.value;
+
+      currentDoc = loaded.doc;
+      editorSessionState.text = loaded.text;
+      editorSessionState.revision += 1;
+      setDocWordCount(docId, loaded.text);
+      editorSessionState.projectId = projectId;
+      editorSessionState.docId = docId;
+      setActiveDoc(docId);
+      markDocUnread(docId, false);
+      await loadVersions(docId);
+    } catch (error) {
+      if (backendDocOpened) {
+        await tauriApi.closeDoc(projectId, docId).catch(() => undefined);
+      }
+      if (error instanceof TauriRuntimeUnavailableError) {
+        editorSessionState.lastError = null;
+        return;
+      }
+      editorSessionState.lastError = error instanceof Error ? error.message : 'Failed to open note';
+      throw error;
+    } finally {
+      if (intentId === sessionIntentId) {
+        editorSessionState.loading = false;
+      }
+    }
+  });
+}
+
 export async function reloadActiveSession() {
   if (!editorSessionState.projectId || !editorSessionState.docId) return;
+  const projectId = editorSessionState.projectId;
+  const docId = editorSessionState.docId;
+  const intentId = sessionIntentId;
+
   try {
-    await loadBinary(editorSessionState.projectId, editorSessionState.docId);
-    await tauriApi.markDocSeen(editorSessionState.projectId, editorSessionState.docId);
-    markDocUnread(editorSessionState.docId, false);
+    const loaded = await loadBinary(projectId, docId);
+    if (
+      intentId !== sessionIntentId
+      || editorSessionState.projectId !== projectId
+      || editorSessionState.docId !== docId
+    ) {
+      return;
+    }
+
+    currentDoc = loaded.doc;
+    editorSessionState.text = loaded.text;
+    editorSessionState.revision += 1;
+    setDocWordCount(docId, loaded.text);
+    await tauriApi.markDocSeen(projectId, docId);
+    if (
+      intentId !== sessionIntentId
+      || editorSessionState.projectId !== projectId
+      || editorSessionState.docId !== docId
+    ) {
+      return;
+    }
+
+    markDocUnread(docId, false);
   } catch (error) {
     if (!(error instanceof TauriRuntimeUnavailableError)) {
       throw error;
@@ -232,35 +390,11 @@ export async function saveNow() {
 }
 
 export async function closeEditorSession() {
-  // Exit any review modes immediately (before async work)
-  leaveHistoryReview();
-
-  flushWordCount();
-  clearTimers();
-
-  if (!editorSessionState.projectId || !editorSessionState.docId) {
-    currentDoc = null;
-    pendingChunks = [];
-    return;
-  }
-
-  const { projectId, docId } = editorSessionState;
-  await saveNow().catch(() => undefined);
-
-  // Create an auto-version on document switch/close (if there are changes)
-  await createVersion(projectId, docId).catch(() => undefined);
-
-  await tauriApi.closeDoc(projectId, docId).catch(() => undefined);
-
-  // Only clear state if no newer session was opened while we were awaiting
-  if (editorSessionState.projectId === projectId && editorSessionState.docId === docId) {
-    currentDoc = null;
-    pendingChunks = [];
-    editorSessionState.projectId = null;
-    editorSessionState.docId = null;
-    editorSessionState.text = '';
-    editorSessionState.revision += 1;
-  }
+  const intentId = bumpSessionIntent();
+  return queueSessionTransition(async () => {
+    if (intentId !== sessionIntentId) return;
+    await closeSessionInternal(intentId);
+  });
 }
 
 export async function renameActiveDoc(newPath: string) {

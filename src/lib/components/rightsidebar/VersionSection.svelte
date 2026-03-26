@@ -1,14 +1,13 @@
 <script lang="ts">
   import { getActiveDoc } from '../../state/documents.svelte.js';
   import { editorSessionState } from '../../session/editor-session.svelte.js';
-  import { uiState } from '../../state/ui.svelte.js';
   import {
     versionState,
     getSignificantVersions,
-    selectVersion,
   } from '../../state/versions.svelte.js';
   import { groupByDate } from '../../utils/time.js';
   import { formatShortTime } from '../../utils/time.js';
+  import { navigateToHistory } from '../../navigation/workspace-router.svelte.js';
 
 
   const activeDoc = $derived(getActiveDoc());
@@ -21,9 +20,7 @@
 
   function handleSelectVersion(versionId: string) {
     if (!editorSessionState.projectId || !editorSessionState.docId) return;
-    uiState.view = 'history-review';
-    uiState.historyReviewSessionId = versionId;
-    selectVersion(
+    void navigateToHistory(
       editorSessionState.projectId,
       editorSessionState.docId,
       versionId,

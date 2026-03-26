@@ -1,8 +1,8 @@
 <script lang="ts">
   import type { Document } from '../../types/index.js';
   import { documentState } from '../../state/documents.svelte.js';
-  import { uiState } from '../../state/ui.svelte.js';
   import { getPeerById } from '../../state/presence.svelte.js';
+  import { getWorkspaceRoute, isDocRoute } from '../../navigation/workspace-router.svelte.js';
 
   let {
     doc,
@@ -24,7 +24,10 @@
     oncontextmenu?: (detail: { x: number; y: number; docId: string }) => void;
   } = $props();
 
-  const isActive = $derived(documentState.activeDocId === doc.id && uiState.view === 'editor');
+  const isActive = $derived.by(() => {
+    const route = getWorkspaceRoute();
+    return isDocRoute(route) && route.docId === doc.id;
+  });
 
   const peersHere = $derived.by(() =>
     doc.activePeers

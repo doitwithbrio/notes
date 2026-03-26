@@ -115,6 +115,10 @@ export function setActiveDoc(docId: string | null) {
   uiState.activeProjectId = doc.projectId;
 }
 
+export function clearActiveDocSelection() {
+  documentState.activeDocId = null;
+}
+
 export async function loadProjectDocs(
   projectId: string,
   options?: { force?: boolean; connectPeers?: boolean },

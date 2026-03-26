@@ -13,12 +13,14 @@
     hasHydratedProject,
     isProjectLoading,
     setDocPath,
+    clearActiveDocSelection,
   } from '../../state/documents.svelte.js';
   import { createProject, projectState, reorderProject, removeProject } from '../../state/projects.svelte.js';
   import { uiState, openProjectOverview, toggleSidebar } from '../../state/ui.svelte.js';
-  import { openEditorSession, closeEditorSession, editorSessionState, renameActiveDoc } from '../../session/editor-session.svelte.js';
+  import { openEditorSession, closeEditorSession, editorSessionState } from '../../session/editor-session.svelte.js';
   import { tauriApi } from '../../api/tauri.js';
   import { openJoinDialog } from '../../state/invite.svelte.js';
+  import { navigateToDoc, navigateToProject } from '../../navigation/workspace-router.svelte.js';
   import ProjectGroup from './ProjectGroup.svelte';
   import ContextMenu from './ContextMenu.svelte';
   import type { MenuItem } from './ContextMenu.svelte';
@@ -208,9 +210,7 @@
     try {
       const project = await createProject(trimmed);
       if (project) {
-        await loadProjectDocs(project.id, { force: true });
-        documentState.activeDocId = null;
-        openProjectOverview(project.id);
+        await navigateToProject(project.id);
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -302,6 +302,10 @@
       showProjectPicker = false;
     }
   }
+
+  async function handleOpenProject(projectId: string) {
+    await navigateToProject(projectId);
+  }
 </script>
 
 <svelte:window onclick={handleWindowClick} onkeydown={handleKeydown} />
@@ -380,17 +384,8 @@
           oncommit={(name) => { renamingProjectId = null; /* project rename is local-only for now */ }}
           oncancel={() => { renamingProjectId = null; cancelNewProject(); }}
           onnewnote={() => startNewNote(project.id)}
-          onprojectclick={() => {
-            void closeEditorSession();
-            documentState.activeDocId = null;
-            openProjectOverview(project.id);
-            if (!hasHydratedProject(project.id)) {
-              void loadProjectDocs(project.id, { connectPeers: true });
-            } else {
-              void tauriApi.openProject(project.id, true);
-            }
-          }}
-          ondocopen={(docId) => openEditorSession(project.id, docId)}
+          onprojectclick={() => void handleOpenProject(project.id)}
+          ondocopen={(docId) => void navigateToDoc(project.id, docId)}
           ondoccommit={(title) => {
             if (renamingDocId) {
               const docId = renamingDocId;

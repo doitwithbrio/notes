@@ -9,7 +9,7 @@
     installUpdate,
     updateState,
   } from '../../state/updates.svelte.js';
-  import { uiState } from '../../state/ui.svelte.js';
+  import { navigateBackFromSettings } from '../../navigation/workspace-router.svelte.js';
   import { ACCENT_COLORS, type AppSettings, type ThemeMode } from '../../types/index.js';
 
   let relayInput = $state('');
@@ -163,7 +163,7 @@
   }
 
   function goBack() {
-    uiState.view = 'editor';
+    navigateBackFromSettings();
   }
 </script>
 

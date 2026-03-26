@@ -1,9 +1,10 @@
 <script lang="ts">
-  import { uiState, toggleRightSidebar, openSettings } from '../../state/ui.svelte.js';
+  import { uiState, toggleRightSidebar } from '../../state/ui.svelte.js';
   import { PanelRightClose, PanelRightOpen, Users, CheckSquare, Clock, Settings } from 'lucide-svelte';
   import PeersSection from './PeersSection.svelte';
   import TodosSection from './TodosSection.svelte';
   import VersionSection from './VersionSection.svelte';
+  import { navigateToSettings } from '../../navigation/workspace-router.svelte.js';
 
   const collapsed = $derived(!uiState.rightSidebarOpen);
 </script>
@@ -36,7 +37,7 @@
       </button>
     </div>
     <div class="right-sidebar-footer">
-      <button class="collapsed-icon-btn" onclick={openSettings} aria-label="settings" title="settings">
+      <button class="collapsed-icon-btn" onclick={navigateToSettings} aria-label="settings" title="settings">
         <Settings size={15} strokeWidth={1.5} />
       </button>
     </div>
@@ -47,7 +48,7 @@
       <VersionSection />
     </div>
     <div class="right-sidebar-footer expanded">
-      <button class="settings-btn" onclick={openSettings} aria-label="settings">
+      <button class="settings-btn" onclick={navigateToSettings} aria-label="settings">
         <Settings size={13} strokeWidth={1.5} />
         <span>settings</span>
       </button>

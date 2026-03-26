@@ -1,9 +1,9 @@
 <script lang="ts">
   import type { Project, Document } from '../../types/index.js';
-  import { uiState } from '../../state/ui.svelte.js';
   import FileItem from './FileItem.svelte';
   import { sortable } from '../../actions/sortable.js';
   import { FilePlus, ChevronRight } from 'lucide-svelte';
+  import { getWorkspaceRoute, isProjectRoute } from '../../navigation/workspace-router.svelte.js';
 
   let {
     project,
@@ -91,7 +91,10 @@
     folded = !folded;
   }
 
-  const isActiveProject = $derived(uiState.activeProjectId === project.id && uiState.view === 'project-overview');
+  const isActiveProject = $derived.by(() => {
+    const route = getWorkspaceRoute();
+    return isProjectRoute(route) && route.projectId === project.id;
+  });
 </script>
 
 <div class="project-group">

@@ -8,6 +8,7 @@
   import { projectState } from '../state/projects.svelte.js';
   import { getActiveDoc } from '../state/documents.svelte.js';
   import { isMac } from '../utils/platform.js';
+  import { getWorkspaceRoute, isProjectRoute } from '../navigation/workspace-router.svelte.js';
   import Sidebar from './sidebar/Sidebar.svelte';
   import ProjectOverview from './editor/ProjectOverview.svelte';
   import RightSidebar from './rightsidebar/RightSidebar.svelte';
@@ -15,8 +16,11 @@
   import { inviteState } from '../state/invite.svelte.js';
 
   const activeDoc = $derived(getActiveDoc());
+  const route = $derived(getWorkspaceRoute());
   const activeProject = $derived(
-    projectState.projects.find((project) => project.id === uiState.activeProjectId) ?? null,
+    isProjectRoute(route)
+      ? (projectState.projects.find((project) => project.id === route.projectId) ?? null)
+      : null,
   );
 
   let editorPanePromise = $state<Promise<typeof import('./editor/EditorPane.svelte')> | null>(null);
@@ -82,7 +86,7 @@
 
 <svelte:window onkeydown={handleKeydown} />
 
-<div class="shell">
+<div class="shell" data-testid="app-shell">
   <div
     class="sidebar-panel"
     style="width: {uiState.sidebarOpen ? 'var(--sidebar-width)' : 'var(--sidebar-collapsed)'};"
@@ -98,8 +102,8 @@
         <p class="body">{appSessionState.error}</p>
       </div>
     {:else}
-      {#if uiState.view === 'settings'}
-        {#if settingsPanePromise}
+        {#if route?.kind === 'settings'}
+          {#if settingsPanePromise}
           {#await settingsPanePromise then settingsPaneModule}
             {@const SettingsPane = settingsPaneModule.default}
             <SettingsPane />
@@ -111,10 +115,14 @@
           {/await}
         {/if}
       {:else}
-        <div class="main-view" class:hidden={uiState.view === 'project-overview'}>
+        <div class="main-view" class:hidden={isProjectRoute(route)}>
           {#if !appSessionState.ready}
-            <div class="app-message inline-message">
+            <div class="app-message inline-message" data-testid="workspace-loading">
               <p class="title">loading workspace...</p>
+            </div>
+          {:else if editorSessionState.loading}
+            <div class="app-message inline-message" data-testid="editor-loading">
+              <p class="title">loading editor...</p>
             </div>
           {:else if activeDoc}
             {#if editorPanePromise}
@@ -133,13 +141,13 @@
               {/await}
             {/if}
           {:else}
-            <div class="empty-state">
+            <div class="empty-state" data-testid="empty-editor-state">
               <p class="title">no document selected</p>
               <p class="body">pick a note from the sidebar, or create a new one</p>
             </div>
           {/if}
         </div>
-        {#if uiState.view === 'project-overview' && activeProject}
+        {#if isProjectRoute(route) && activeProject}
           <ProjectOverview project={activeProject} />
         {/if}
       {/if}

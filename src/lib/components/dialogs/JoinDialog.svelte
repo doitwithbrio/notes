@@ -1,7 +1,7 @@
 <script lang="ts">
   import { inviteState, acceptInvite, closeJoinDialog } from '../../state/invite.svelte.js';
-  import { openProjectOverview } from '../../state/ui.svelte.js';
   import { Loader2 } from 'lucide-svelte';
+  import { navigateToProject } from '../../navigation/workspace-router.svelte.js';
 
   let passphrase = $state('');
   let ownerPeerId = $state('');
@@ -22,7 +22,7 @@
 
   function handleOpenProject() {
     if (inviteState.acceptResult) {
-      openProjectOverview(inviteState.acceptResult.projectName);
+      void navigateToProject(inviteState.acceptResult.projectName);
     }
     closeJoinDialog();
   }
@@ -38,6 +38,7 @@
 <div class="backdrop" onclick={closeJoinDialog}>
   <div
     class="panel"
+    data-testid="join-dialog"
     role="dialog"
     tabindex="-1"
     aria-modal="true"
@@ -51,7 +52,7 @@
       <div class="panel-body">
         <p class="hint">you are now an {inviteState.acceptResult.role} on this project</p>
         <div class="actions">
-          <button class="btn-primary" onclick={handleOpenProject}>open project</button>
+          <button class="btn-primary" data-testid="join-open-project" onclick={handleOpenProject}>open project</button>
           <button class="btn-muted" onclick={closeJoinDialog}>close</button>
         </div>
       </div>
@@ -65,6 +66,7 @@
           <input
             bind:this={inputEl}
             id="passphrase-input"
+            data-testid="join-passphrase-input"
             class="text-input"
             type="text"
             placeholder="tiger-marble-ocean-violet-canyon-frost"
@@ -78,6 +80,7 @@
           <label class="field-label" for="peerid-input">owner's peer ID</label>
           <input
             id="peerid-input"
+            data-testid="join-peer-id-input"
             class="text-input mono"
             type="text"
             placeholder="paste the owner's peer ID"
@@ -87,7 +90,7 @@
         </div>
 
         {#if inviteState.acceptError}
-          <div class="error-row">{inviteState.acceptError}</div>
+          <div class="error-row" data-testid="join-error">{inviteState.acceptError}</div>
         {/if}
 
         <div class="actions">
@@ -97,11 +100,12 @@
               connecting...
             </button>
           {:else}
-            <button
-              class="btn-primary"
-              onclick={handleSubmit}
-              disabled={!passphrase.trim() || !ownerPeerId.trim()}
-            >join</button>
+              <button
+                class="btn-primary"
+                data-testid="join-submit"
+                onclick={handleSubmit}
+                disabled={!passphrase.trim() || !ownerPeerId.trim()}
+              >join</button>
           {/if}
           <button class="btn-muted" onclick={closeJoinDialog} disabled={inviteState.accepting}>cancel</button>
         </div>

@@ -257,6 +257,8 @@ pub struct InviteHandler {
     pending: Arc<DashMap<String, PendingInvite>>,
     /// Channel to notify when an invite is accepted (so the app can update the manifest).
     accepted_tx: tokio::sync::broadcast::Sender<InviteAccepted>,
+    #[cfg(test)]
+    completed_tx: tokio::sync::broadcast::Sender<()>,
 }
 
 impl std::fmt::Debug for InviteHandler {
@@ -270,15 +272,24 @@ impl std::fmt::Debug for InviteHandler {
 impl InviteHandler {
     pub fn new() -> Self {
         let (accepted_tx, _) = tokio::sync::broadcast::channel(64);
+        #[cfg(test)]
+        let (completed_tx, _) = tokio::sync::broadcast::channel(64);
         Self {
             pending: Arc::new(DashMap::new()),
             accepted_tx,
+            #[cfg(test)]
+            completed_tx,
         }
     }
 
     /// Subscribe to invite acceptance notifications.
     pub fn subscribe_accepted(&self) -> tokio::sync::broadcast::Receiver<InviteAccepted> {
         self.accepted_tx.subscribe()
+    }
+
+    #[cfg(test)]
+    pub fn subscribe_completed(&self) -> tokio::sync::broadcast::Receiver<()> {
+        self.completed_tx.subscribe()
     }
 
     /// Register a pending invite. Called when the owner generates an invite code.
@@ -304,7 +315,22 @@ impl InviteHandler {
     ///    - If decryption succeeds on the invitee side, the handshake worked
     /// 3. The invitee cannot distinguish wrong-passphrase from right-passphrase
     ///    until they try to decrypt (authenticated encryption).
+    /// 4. After sending the payload the owner waits for a one-byte ACK from the
+    ///    invitee proving the payload decrypted successfully. This prevents a
+    ///    wrong passphrase or early disconnect from consuming the one-time code.
     async fn handle_connection(&self, connection: Connection) -> Result<(), InviteError> {
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            self.handle_connection_inner(connection),
+        )
+        .await
+        .map_err(|_| InviteError::Connection("invite handshake timed out (30s)".into()))?
+    }
+
+    async fn handle_connection_inner(
+        &self,
+        connection: Connection,
+    ) -> Result<(), InviteError> {
         let (mut send, mut recv) = connection
             .accept_bi()
             .await
@@ -447,6 +473,14 @@ impl InviteHandler {
 
         let _ = send.finish();
 
+        let mut ack = [0u8; 1];
+        recv.read_exact(&mut ack)
+            .await
+            .map_err(|e| InviteError::Connection(format!("read invitee ack: {e}")))?;
+        if ack[0] != 1 {
+            return Err(InviteError::VerificationFailed);
+        }
+
         // Notify that invite was accepted
         let invitee_peer_id = connection.remote_id().to_string();
         let _ = self.accepted_tx.send(InviteAccepted {
@@ -481,12 +515,17 @@ impl iroh::protocol::ProtocolHandler for InviteHandler {
         let handler = InviteHandler {
             pending: Arc::clone(&self.pending),
             accepted_tx: self.accepted_tx.clone(),
+            #[cfg(test)]
+            completed_tx: self.completed_tx.clone(),
         };
 
         async move {
             let remote_id = connection.remote_id();
             log::info!("Invite handler: incoming connection from peer {remote_id}");
-            if let Err(e) = handler.handle_connection(connection).await {
+            let result = handler.handle_connection(connection).await;
+            #[cfg(test)]
+            let _ = handler.completed_tx.send(());
+            if let Err(e) = result {
                 log::error!("Invite handler: connection from {remote_id} failed: {e}");
             }
             Ok(())
@@ -525,6 +564,345 @@ pub enum InviteError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::time::Duration;
+
+    use iroh::{Endpoint, RelayMode, address_lookup::memory::MemoryLookup, endpoint::presets};
+    use iroh::protocol::Router;
+    use tokio::io::AsyncWriteExt;
+
+    struct InviteTestHarness {
+        owner_ep: Endpoint,
+        invitee_ep: Endpoint,
+        owner_router: iroh::protocol::Router,
+        pending_map: Arc<DashMap<String, PendingInvite>>,
+        completed_rx: tokio::sync::Mutex<tokio::sync::broadcast::Receiver<()>>,
+    }
+
+    impl InviteTestHarness {
+        async fn new(invites: Vec<(String, PendingInvite)>) -> Self {
+            let owner_lookup = MemoryLookup::new();
+            let owner_ep = Endpoint::builder(presets::N0)
+                .relay_mode(RelayMode::Disabled)
+                .address_lookup(owner_lookup.clone())
+                .bind()
+                .await
+                .expect("owner endpoint bind");
+
+            let owner_handler = InviteHandler::new();
+            let pending_map = owner_handler.pending.clone();
+            let completed_rx = owner_handler.subscribe_completed();
+            for (passphrase, invite) in invites {
+                owner_handler.add_pending(passphrase, invite);
+            }
+
+            let owner_router = Router::builder(owner_ep.clone())
+                .accept(INVITE_ALPN, owner_handler)
+                .spawn();
+
+            let owner_addr = owner_ep.addr();
+            owner_lookup.add_endpoint_info(owner_addr.clone());
+
+            let invitee_lookup = MemoryLookup::new();
+            invitee_lookup.add_endpoint_info(owner_addr);
+            let invitee_ep = Endpoint::builder(presets::N0)
+                .relay_mode(RelayMode::Disabled)
+                .address_lookup(invitee_lookup)
+                .bind()
+                .await
+                .expect("invitee endpoint bind");
+
+            Self {
+                owner_ep,
+                invitee_ep,
+                owner_router,
+                pending_map,
+                completed_rx: tokio::sync::Mutex::new(completed_rx),
+            }
+        }
+
+        async fn run_invitee(
+            &self,
+            invitee_passphrase: &str,
+            ack_byte: Option<u8>,
+        ) -> Result<InvitePayload, String> {
+            let connection = self
+                .invitee_ep
+                .connect(self.owner_ep.id(), INVITE_ALPN)
+                .await
+                .map_err(|e| format!("connect: {e}"))?;
+
+            let (mut send, mut recv) = connection
+                .open_bi()
+                .await
+                .map_err(|e| format!("open_bi: {e}"))?;
+
+            let (invitee_state, invitee_msg) = start_invitee_handshake(invitee_passphrase);
+            let len = (invitee_msg.len() as u32).to_be_bytes();
+            send.write_all(&len)
+                .await
+                .map_err(|e| format!("send len: {e}"))?;
+            send.write_all(&invitee_msg)
+                .await
+                .map_err(|e| format!("send msg: {e}"))?;
+
+            let mut owner_msg_len_buf = [0u8; 4];
+            recv.read_exact(&mut owner_msg_len_buf)
+                .await
+                .map_err(|e| format!("read owner len: {e}"))?;
+            let owner_msg_len = u32::from_be_bytes(owner_msg_len_buf) as usize;
+            let mut owner_msg = vec![0u8; owner_msg_len];
+            recv.read_exact(&mut owner_msg)
+                .await
+                .map_err(|e| format!("read owner msg: {e}"))?;
+
+            let shared_key = finish_handshake(invitee_state, &owner_msg)
+                .map_err(|e| format!("finish handshake: {e}"))?;
+
+            let mut len_buf = [0u8; 4];
+            recv.read_exact(&mut len_buf)
+                .await
+                .map_err(|e| format!("read payload len: {e}"))?;
+            let payload_len = u32::from_be_bytes(len_buf) as usize;
+            let mut encrypted = vec![0u8; payload_len];
+            recv.read_exact(&mut encrypted)
+                .await
+                .map_err(|e| format!("read payload: {e}"))?;
+
+            let plaintext = decrypt_payload(&shared_key, &encrypted)
+                .map_err(|e| format!("decrypt payload: {e}"))?;
+            let payload: InvitePayload = serde_json::from_slice(&plaintext)
+                .map_err(|e| format!("deserialize payload: {e}"))?;
+
+            if let Some(ack_byte) = ack_byte {
+                send.write_all(&[ack_byte])
+                    .await
+                    .map_err(|e| format!("send ack: {e}"))?;
+                send.flush()
+                    .await
+                    .map_err(|e| format!("flush ack: {e}"))?;
+                let _ = send.finish();
+                tokio::task::yield_now().await;
+            }
+
+            Ok(payload)
+        }
+
+        async fn shutdown(self) {
+            self.owner_router.shutdown().await.ok();
+            self.owner_ep.close().await;
+            self.invitee_ep.close().await;
+        }
+
+        async fn wait_for_invite_present(&self, passphrase: &str, expected_present: bool) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let present = self.pending_map.get(passphrase).is_some();
+                    if present == expected_present {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("timed out waiting for invite state");
+        }
+
+        async fn wait_for_connection_completion(&self) {
+            let mut rx = self.completed_rx.lock().await;
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("timed out waiting for connection completion")
+                .expect("completion channel closed");
+        }
+    }
+
+    fn make_pending_invite(
+        owner_peer_id: String,
+        passphrase: &str,
+        project_name: &str,
+        project_id: &str,
+        manifest_data: Vec<u8>,
+    ) -> PendingInvite {
+        PendingInvite {
+            code: InviteCode {
+                passphrase: passphrase.to_string(),
+                peer_id: owner_peer_id,
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(10),
+            },
+            created_at: Instant::now(),
+            attempts: 0,
+            project_name: project_name.to_string(),
+            project_id: project_id.to_string(),
+            manifest_data,
+            invite_role: "editor".to_string(),
+            owner_x25519_public: None,
+            epoch_key: None,
+            current_epoch: 0,
+        }
+    }
+
+    // ── End-to-end invite flow test ────────────────────────────────────────
+    //
+    // Spins up two real iroh endpoints in-process (no relay, direct loopback
+    // connection via MemoryLookup so there are no network dependencies) and
+    // runs the complete invite handshake:
+    //
+    //   owner:   InviteHandler registered via Router, PendingInvite inserted
+    //   invitee: connect → SPAKE2 → read payload → send.finish()
+    //   owner:   recv.read_to_end() unblocks → invite consumed
+    //
+    // This test catches regression of Bug 1 (owner drops connection before
+    // invitee reads payload) and validates the full wire protocol end-to-end.
+    #[tokio::test]
+    async fn test_invite_end_to_end() {
+        let passphrase = "tiger-marble-ocean-violet-canyon-frost";
+
+        // Build a large fake manifest payload so the invitee is definitely still
+        // reading when the owner would regressively drop the connection.
+        let fake_manifest_bytes = vec![0xAB; 512 * 1024];
+        let fake_manifest_hex: String = fake_manifest_bytes
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+
+        let harness = InviteTestHarness::new(vec![(
+            passphrase.to_string(),
+            make_pending_invite(
+                "owner-peer".to_string(),
+                passphrase,
+                "test-project",
+                "test-uuid-1234",
+                fake_manifest_bytes.clone(),
+            ),
+        )])
+        .await;
+
+        let expected_manifest_hex = fake_manifest_hex.clone();
+        let invitee_result = tokio::time::timeout(Duration::from_secs(10), async {
+            harness.run_invitee(passphrase, Some(1)).await
+        })
+        .await
+        .expect("invitee timed out")
+        .expect("invitee flow failed");
+
+        // ── Assert payload contents ───────────────────────────────────────
+        assert_eq!(invitee_result.project_name, "test-project");
+        assert_eq!(invitee_result.project_id, "test-uuid-1234");
+        assert_eq!(invitee_result.role, "editor");
+        assert_eq!(invitee_result.manifest_hex, expected_manifest_hex);
+
+        // ── Assert the invite was consumed (one-time use) ─────────────────
+        harness.wait_for_invite_present(passphrase, false).await;
+
+        // A second connection with the same passphrase should find no pending invite.
+        // The dedicated malformed/no-ACK/wrong-passphrase tests assert the opposite side:
+        // after a single failed attempt, the invite remains pending and usable.
+        // Together these tests pin the current consumption behavior for the refactor.
+        // The handler removes the invite after acceptance; a second connection
+        // with the same passphrase should find no pending invite and fail.
+        let harness_ref = &harness;
+        let second_attempt = tokio::time::timeout(Duration::from_secs(5), async move {
+            harness_ref.run_invitee(passphrase, Some(1)).await
+        })
+        .await
+        .expect("second attempt timed out");
+
+        // The second attempt must fail — the owner dropped the connection
+        // with no matching invite.
+        assert!(
+            second_attempt.is_err(),
+            "second use of a consumed one-time invite code should fail"
+        );
+
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_wrong_passphrase_does_not_consume_invite() {
+        let passphrase = "correct-horse-battery-staple-ocean-frost";
+        let wrong_passphrase = "wrong-horse-battery-staple-ocean-frost";
+        let project_name = "wrong-passphrase-project";
+        let harness = InviteTestHarness::new(vec![(
+            passphrase.to_string(),
+            make_pending_invite(
+                "owner-peer".to_string(),
+                passphrase,
+                project_name,
+                "proj-wrong",
+                vec![1; 128],
+            ),
+        )])
+        .await;
+
+        let result = harness.run_invitee(wrong_passphrase, None).await;
+        assert!(result.is_err(), "wrong passphrase should fail to decrypt payload");
+
+        harness.wait_for_connection_completion().await;
+        harness.wait_for_invite_present(passphrase, true).await;
+
+        let retry = harness.run_invitee(passphrase, Some(1)).await;
+        assert!(retry.is_ok(), "invite should still be usable after wrong passphrase");
+        harness.wait_for_invite_present(passphrase, false).await;
+
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_invite_without_ack_is_not_consumed() {
+        let passphrase = "invitee-disconnect-without-ack-ocean-frost";
+        let harness = InviteTestHarness::new(vec![(
+            passphrase.to_string(),
+            make_pending_invite(
+                "owner-peer".to_string(),
+                passphrase,
+                "no-ack-project",
+                "proj-no-ack",
+                vec![2; 256],
+            ),
+        )])
+        .await;
+
+        let result = harness.run_invitee(passphrase, None).await;
+        assert!(result.is_ok(), "invitee should still be able to read payload before dropping");
+
+        harness.wait_for_connection_completion().await;
+        harness.wait_for_invite_present(passphrase, true).await;
+
+        let retry = harness.run_invitee(passphrase, Some(1)).await;
+        assert!(retry.is_ok(), "invite should still be usable after a missing ACK");
+        harness.wait_for_invite_present(passphrase, false).await;
+
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_malformed_ack_does_not_consume_invite() {
+        let passphrase = "invitee-malformed-ack-ocean-frost-canyon";
+        let harness = InviteTestHarness::new(vec![(
+            passphrase.to_string(),
+            make_pending_invite(
+                "owner-peer".to_string(),
+                passphrase,
+                "bad-ack-project",
+                "proj-bad-ack",
+                vec![3; 256],
+            ),
+        )])
+        .await;
+
+        let result = harness.run_invitee(passphrase, Some(7)).await;
+        assert!(result.is_ok(), "invitee can still read payload before sending bad ack");
+
+        harness.wait_for_connection_completion().await;
+        harness.wait_for_invite_present(passphrase, true).await;
+
+        let retry = harness.run_invitee(passphrase, Some(1)).await;
+        assert!(retry.is_ok(), "invite should still be usable after malformed ACK");
+        harness.wait_for_invite_present(passphrase, false).await;
+
+        harness.shutdown().await;
+    }
 
     #[test]
     fn test_generate_passphrase() {
