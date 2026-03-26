@@ -1,6 +1,6 @@
 //! # notes-crypto
 //!
-//! Encryption, signing, and key management for the P2P notes app.
+//! Encryption, signing, and key management for the notes app.
 //!
 //! - `encryption` — XChaCha20-Poly1305 at-rest encryption with HKDF key derivation
 //! - `epochs` — Epoch-based key ratcheting for forward secrecy on peer removal

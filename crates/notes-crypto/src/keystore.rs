@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use crate::error::CryptoError;
 
 /// Service name for keychain entries.
-const KEYCHAIN_SERVICE: &str = "com.p2pnotes.app";
+const KEYCHAIN_SERVICE: &str = "com.doitwithbrio.notes";
 
 /// Key storage backend.
 pub struct KeyStore {

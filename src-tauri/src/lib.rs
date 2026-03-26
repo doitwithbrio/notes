@@ -1896,7 +1896,7 @@ fn resolve_notes_dir() -> Result<std::path::PathBuf, String> {
         return Ok(home.join("Notes"));
     }
     if let Some(doc_dir) = dirs::document_dir() {
-        return Ok(doc_dir.join("P2P Notes"));
+        return Ok(doc_dir.join("Notes"));
     }
     Err("Could not determine a suitable notes directory".to_string())
 }
