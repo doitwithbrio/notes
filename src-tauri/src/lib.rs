@@ -25,7 +25,7 @@ struct AppState {
     #[allow(dead_code)] // Used by sync sessions — wired via SyncEngine in Phase 2+
     sync_state_store: Arc<SyncStateStore>,
     search_index: Arc<std::sync::Mutex<notes_core::SearchIndex>>,
-    version_store: Option<Arc<std::sync::Mutex<notes_core::VersionStore>>>,
+    version_store: Arc<std::sync::Mutex<notes_core::VersionStore>>,
     blob_store: Arc<notes_sync::blobs::BlobStore>,
     /// Stable device actor ID (hex string) for the frontend to use.
     device_actor_hex: String,
@@ -39,11 +39,7 @@ struct AppState {
 fn require_version_store(
     state: &AppState,
 ) -> Result<Arc<std::sync::Mutex<notes_core::VersionStore>>, CoreError> {
-    state.version_store.as_ref().cloned().ok_or_else(|| {
-        CoreError::InvalidData(
-            "version history is temporarily unavailable; existing version data was preserved".into(),
-        )
-    })
+    Ok(Arc::clone(&state.version_store))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1645,14 +1641,15 @@ async fn accept_invite(
             }
         })?;
 
-        // Save the received manifest (overwriting the fresh one)
+        // Save the received manifest (overwriting the fresh one) and reload it
+        // into memory. We must use reload_manifest() instead of open_project()
+        // because open_project() short-circuits when the project is already cached.
         if !manifest_bytes.is_empty() {
             pm.persistence()
                 .save_manifest(&project_name, &manifest_bytes)
                 .await?;
-            // Reload the manifest in memory
-            let _ = pm.open_project(&project_name).await;
-            log::info!("Saved received manifest for project {project_name}");
+            pm.reload_manifest(&project_name).await?;
+            log::info!("Saved and reloaded received manifest for project {project_name}");
         }
 
         // Add the owner as a peer in PeerManager for sync
@@ -1695,6 +1692,55 @@ async fn accept_invite(
                             "Imported epoch key (epoch {}) for project {project_name}",
                             payload.epoch
                         );
+                    }
+                }
+            }
+        }
+
+        // Prepare for initial sync: create empty local docs for each file
+        // listed in the manifest and register them with the sync engine.
+        // The actual content will arrive when we sync with the owner peer.
+        {
+            let manifest_arc = pm.get_manifest_for_ui(&project_name)?;
+            let files = {
+                let manifest = manifest_arc.read().await;
+                manifest.list_files().unwrap_or_default()
+            };
+            log::info!(
+                "Initial sync: preparing {} docs for {project_name}",
+                files.len()
+            );
+
+            for file_info in &files {
+                let doc_id = file_info.id;
+
+                // Create an empty Automerge doc as a merge target
+                if pm.doc_store().get_doc(&doc_id).is_err() {
+                    if let Err(e) = pm.doc_store().create_doc_with_id(doc_id) {
+                        log::warn!("Failed to create placeholder doc {doc_id}: {e}");
+                        continue;
+                    }
+                }
+
+                // Register with sync engine + populate ACL
+                if let Ok(doc_arc) = pm.doc_store().get_doc(&doc_id) {
+                    state.sync_engine.register_doc(doc_id, doc_arc);
+                    populate_doc_acl(&state, &project_name, doc_id).await;
+                }
+            }
+
+            // Eagerly sync each doc with the owner peer
+            for file_info in &files {
+                let results = state
+                    .peer_manager
+                    .sync_doc_with_project_peers(&project_name, file_info.id)
+                    .await;
+                let ok = results.iter().filter(|(_, r)| r.is_ok()).count();
+                if ok > 0 {
+                    log::info!("Synced doc {} from owner", file_info.id);
+                    // Save the synced doc to disk
+                    if let Err(e) = pm.save_doc(&project_name, &file_info.id).await {
+                        log::warn!("Failed to save synced doc {}: {e}", file_info.id);
                     }
                 }
             }
@@ -2019,41 +2065,99 @@ pub fn run() {
 
             // Initialize the version store (encrypted with device key).
             // Preserve-first behavior: if an existing versions.db is legacy plaintext,
-            // keyed with a different device identity, or otherwise unreadable, keep the
-            // file untouched and continue startup with version history disabled.
+            // keyed with a different device identity, or otherwise unreadable, back it up
+            // and create a fresh store so version history remains available.
             let version_db_path = notes_dir.join(".p2p").join("versions.db");
             let legacy_history_db_path = notes_dir.join(".p2p").join("history.db");
             let version_store = match notes_core::VersionStore::open(&version_db_path, Some(&device_db_key)) {
-                Ok(store) => {
-                    log::info!("Version store opened (encrypted)");
-                    match store.migrate_from_legacy_history_db(&legacy_history_db_path) {
-                        Ok(count) if count > 0 => log::info!("Migrated {count} old history sessions to versions"),
-                        Ok(_) => {},
-                        Err(e) => log::warn!("History migration failed (non-fatal): {e}"),
-                    }
-                    Some(Arc::new(std::sync::Mutex::new(store)))
-                }
+                Ok(store) => store,
                 Err(e) => {
-                    if version_db_path.exists()
-                        && notes_core::VersionStore::looks_like_plaintext_sqlite(&version_db_path)
-                    {
-                        log::error!(
-                            "Version history database at {} appears to be a legacy plaintext SQLite file. \
-                             Preserving it and starting with version history disabled until a migration is added. Error: {}",
-                            version_db_path.display(),
-                            e
-                        );
-                    } else {
-                        log::error!(
-                            "Failed to open version store at {}. Preserving existing files and starting with \
-                             version history disabled. Error: {}",
-                            version_db_path.display(),
-                            e
-                        );
+                    log::warn!(
+                        "Failed to open version store at {}. Backing it up and creating a fresh store. Error: {}",
+                        version_db_path.display(),
+                        e
+                    );
+
+                    if version_db_path.exists() {
+                        let backup_suffix = chrono::Utc::now().timestamp();
+                        let backup_path = version_db_path.with_extension(format!("db.bak.{backup_suffix}"));
+
+                        match std::fs::rename(&version_db_path, &backup_path) {
+                            Ok(()) => {
+                                log::warn!(
+                                    "Backed up unreadable version store to {}",
+                                    backup_path.display()
+                                );
+                            }
+                            Err(rename_err) => {
+                                log::warn!(
+                                    "Rename backup failed for unreadable version store at {}: {}. Trying copy+remove fallback.",
+                                    version_db_path.display(),
+                                    rename_err
+                                );
+                                std::fs::copy(&version_db_path, &backup_path)
+                                    .map_err(|copy_err| anyhow::anyhow!(
+                                        "Failed to preserve unreadable version store at {} via rename ({}) and copy ({}).",
+                                        version_db_path.display(),
+                                        rename_err,
+                                        copy_err,
+                                    ))?;
+                                std::fs::remove_file(&version_db_path)
+                                    .map_err(|remove_err| anyhow::anyhow!(
+                                        "Copied unreadable version store to {}, but failed to remove original {}: {}",
+                                        backup_path.display(),
+                                        version_db_path.display(),
+                                        remove_err,
+                                    ))?;
+                                log::warn!(
+                                    "Copied unreadable version store to {} and removed original {}",
+                                    backup_path.display(),
+                                    version_db_path.display()
+                                );
+                            }
+                        }
+
+                        for suffix in ["-wal", "-shm"] {
+                            let companion = std::path::PathBuf::from(format!(
+                                "{}{}",
+                                version_db_path.display(),
+                                suffix
+                            ));
+                            if companion.exists() {
+                                let companion_backup = std::path::PathBuf::from(format!(
+                                    "{}.bak.{backup_suffix}",
+                                    companion.display()
+                                ));
+                                if let Err(companion_err) =
+                                    std::fs::rename(&companion, &companion_backup)
+                                {
+                                    log::warn!(
+                                        "Failed to back up companion version store file {}: {}",
+                                        companion.display(),
+                                        companion_err
+                                    );
+                                }
+                            }
+                        }
                     }
-                    None
+
+                    notes_core::VersionStore::open(&version_db_path, Some(&device_db_key))
+                        .map_err(|fresh_err| anyhow::anyhow!(
+                            "Failed to create fresh version store at {}: {}",
+                            version_db_path.display(),
+                            fresh_err
+                        ))?
                 }
             };
+            log::info!("Version store opened (encrypted)");
+            match version_store.migrate_from_legacy_history_db(&legacy_history_db_path) {
+                Ok(count) if count > 0 => {
+                    log::info!("Migrated {count} old history sessions to versions")
+                }
+                Ok(_) => {}
+                Err(e) => log::warn!("History migration failed (non-fatal): {e}"),
+            }
+            let version_store = Arc::new(std::sync::Mutex::new(version_store));
 
             // Load or create stable device actor ID
             let p2p_dir = notes_dir.join(".p2p");
@@ -2087,10 +2191,38 @@ pub fn run() {
             let invite_handler_for_router = Arc::clone(&invite_handler);
             let app_handle = app.handle().clone();
 
+            // Load settings for relay configuration before creating the endpoint.
+            let startup_settings = tauri::async_runtime::block_on(
+                notes_core::AppSettings::load(&notes_dir)
+            );
+
             let (endpoint, router) = tauri::async_runtime::block_on(async {
-                let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+                let mut builder = Endpoint::builder(iroh::endpoint::presets::N0)
                     .secret_key(secret_key)
-                    .address_lookup(iroh::address_lookup::MdnsAddressLookupBuilder::default())
+                    .address_lookup(iroh::address_lookup::MdnsAddressLookupBuilder::default());
+
+                // Apply custom relay servers from settings.
+                // This overrides the default N0 relay with user-configured relays,
+                // while keeping the N0 DNS address lookup for peer discovery.
+                if !startup_settings.custom_relays.is_empty() {
+                    let mut relay_urls = Vec::new();
+                    for url_str in &startup_settings.custom_relays {
+                        match url_str.parse::<iroh::RelayUrl>() {
+                            Ok(url) => {
+                                log::info!("Using custom relay: {url_str}");
+                                relay_urls.push(url);
+                            }
+                            Err(e) => {
+                                log::warn!("Invalid custom relay URL '{url_str}': {e}");
+                            }
+                        }
+                    }
+                    if !relay_urls.is_empty() {
+                        builder = builder.relay_mode(iroh::RelayMode::custom(relay_urls));
+                    }
+                }
+
+                let endpoint = builder
                     .bind()
                     .await
                     .expect("failed to bind iroh endpoint");
@@ -2190,22 +2322,50 @@ pub fn run() {
                                     accepted.invitee_peer_id,
                                     accepted.project_name
                                 );
-                                if let Ok(manifest_arc) = pm.get_manifest_for_ui(&accepted.project_name) {
-                                    let mut manifest = manifest_arc.write().await;
-                                    let _ = manifest.add_peer(
-                                        &accepted.invitee_peer_id,
-                                        &accepted.role,
-                                        "",
-                                    );
-                                    let data = manifest.save();
-                                    drop(manifest);
-                                    let _ = pm
-                                        .persistence()
-                                        .save_manifest(&accepted.project_name, &data)
-                                        .await;
+                                match pm.get_manifest_for_ui(&accepted.project_name) {
+                                    Ok(manifest_arc) => {
+                                        let mut manifest = manifest_arc.write().await;
+                                        if let Err(e) = manifest.add_peer(
+                                            &accepted.invitee_peer_id,
+                                            &accepted.role,
+                                            "",
+                                        ) {
+                                            log::error!(
+                                                "Failed to add peer {} to manifest for {}: {e}",
+                                                accepted.invitee_peer_id,
+                                                accepted.project_name
+                                            );
+                                        }
+                                        let data = manifest.save();
+                                        drop(manifest);
+                                        if let Err(e) = pm
+                                            .persistence()
+                                            .save_manifest(&accepted.project_name, &data)
+                                            .await
+                                        {
+                                            log::error!(
+                                                "Failed to save manifest after adding peer to {}: {e}",
+                                                accepted.project_name
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::error!(
+                                            "Failed to get manifest for {} after invite acceptance: {e}",
+                                            accepted.project_name
+                                        );
+                                    }
                                 }
-                                if let Ok(peer_id) = accepted.invitee_peer_id.parse::<iroh::EndpointId>() {
-                                    peer_mgr.add_peer_to_project(&accepted.project_name, peer_id);
+                                match accepted.invitee_peer_id.parse::<iroh::EndpointId>() {
+                                    Ok(peer_id) => {
+                                        peer_mgr.add_peer_to_project(&accepted.project_name, peer_id);
+                                    }
+                                    Err(e) => {
+                                        log::error!(
+                                            "Failed to parse invitee peer ID '{}': {e}",
+                                            accepted.invitee_peer_id
+                                        );
+                                    }
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,

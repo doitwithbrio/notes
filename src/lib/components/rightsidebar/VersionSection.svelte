@@ -52,11 +52,7 @@
     {#if activeDoc}
       {#if !versionState.supported}
         <p class="empty-text">
-          {#if versionState.availabilityReason === 'temporarily-unavailable'}
-            version history is temporarily unavailable while notes preserves an older history database
-          {:else}
-            restart the desktop app to reload the updated version-history backend
-          {/if}
+          restart the desktop app to reload the updated version-history backend
         </p>
       {:else if versionState.loading}
         <p class="empty-text">loading versions...</p>

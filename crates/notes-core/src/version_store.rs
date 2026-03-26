@@ -9,7 +9,7 @@ use std::path::Path;
 use crate::error::CoreError;
 use crate::types::DocId;
 use crate::version::{Version, VersionSignificance, VersionType};
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 
 const VERSION_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS versions (
     id              TEXT PRIMARY KEY,
@@ -61,27 +61,6 @@ impl VersionStore {
         Self::initialize_schema(&conn)?;
 
         Ok(Self { conn })
-    }
-
-    /// Best-effort detection for a legacy plaintext SQLite version store.
-    ///
-    /// This is used only for diagnostics so startup can preserve the file and
-    /// degrade gracefully instead of crashing. It does not mutate the DB.
-    pub fn looks_like_plaintext_sqlite(db_path: &Path) -> bool {
-        let Ok(conn) = Connection::open_with_flags(
-            db_path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        ) else {
-            return false;
-        };
-
-        conn.query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'versions' LIMIT 1",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|value| value == 1)
-        .unwrap_or(false)
     }
 
     /// Open an in-memory version store (for testing).

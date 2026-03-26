@@ -381,6 +381,17 @@ impl ProjectManager {
         Ok(())
     }
 
+    /// Reload a project's manifest from disk, replacing the in-memory cache.
+    /// Use this after externally writing a new manifest (e.g. after accepting an invite).
+    pub async fn reload_manifest(&self, name: &str) -> Result<(), CoreError> {
+        let data = self.persistence.load_manifest(name).await?;
+        let manifest = ProjectManifest::load(&data)?;
+        self.manifests
+            .insert(name.to_string(), Arc::new(RwLock::new(manifest)));
+        log::info!("Reloaded manifest for project: {name}");
+        Ok(())
+    }
+
     /// Open an existing project: load manifest and make it ready for use.
     pub async fn open_project(&self, name: &str) -> Result<(), CoreError> {
         validation::validate_project_name(name)?;

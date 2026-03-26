@@ -17,7 +17,6 @@ export const versionState = $state({
   error: null as string | null,
   activeDocId: null as string | null,
   supported: true,
-  availabilityReason: null as null | 'restart-required' | 'temporarily-unavailable',
 
   // Version review mode
   selectedVersionId: null as string | null,
@@ -51,17 +50,11 @@ function isMissingVersionCommand(error: unknown): boolean {
     || message.includes('Command restore_to_version_cmd not found');
 }
 
-function isTemporarilyUnavailable(error: unknown): boolean {
-  return getErrorMessage(error).includes('version history is temporarily unavailable');
-}
-
 function disableVersionFeatures(
   message: string,
   reason?: unknown,
-  availabilityReason: 'restart-required' | 'temporarily-unavailable' = 'temporarily-unavailable',
 ) {
   versionState.supported = false;
-  versionState.availabilityReason = availabilityReason;
   versionState.loading = false;
   versionState.error = message;
   versionState.versions = [];
@@ -78,7 +71,6 @@ function disableVersionApi(reason: unknown) {
   disableVersionFeatures(
     'Version history requires a desktop app restart so the Rust backend can pick up the new commands.',
     reason,
-    'restart-required',
   );
   if (!warnedUnsupportedVersionApi) {
     warnedUnsupportedVersionApi = true;
@@ -112,14 +104,6 @@ export async function loadDeviceActorId() {
       disableVersionApi(error);
       return;
     }
-    if (isTemporarilyUnavailable(error)) {
-      disableVersionFeatures(
-        'Version history is temporarily unavailable while notes preserves an older history database.',
-        error,
-        'temporarily-unavailable',
-      );
-      return;
-    }
     console.warn('Failed to load device actor ID:', error);
   }
 }
@@ -139,14 +123,6 @@ export async function loadVersions(docId: string) {
     if (error instanceof TauriRuntimeUnavailableError) return;
     if (isMissingVersionCommand(error)) {
       disableVersionApi(error);
-      return;
-    }
-    if (isTemporarilyUnavailable(error)) {
-      disableVersionFeatures(
-        'Version history is temporarily unavailable while notes preserves an older history database.',
-        error,
-        'temporarily-unavailable',
-      );
       return;
     }
     if (versionState.activeDocId === docId) {
@@ -198,14 +174,6 @@ export async function createVersion(
       disableVersionApi(error);
       return null;
     }
-    if (isTemporarilyUnavailable(error)) {
-      disableVersionFeatures(
-        'Version history is temporarily unavailable while notes preserves an older history database.',
-        error,
-        'temporarily-unavailable',
-      );
-      return null;
-    }
     // "no significant changes" is expected for auto-versions — don't log as error
     const msg = getErrorMessage(error);
     if (msg.includes('no significant changes')) return null;
@@ -244,14 +212,6 @@ export async function selectVersion(
     }
     if (isMissingVersionCommand(error)) {
       disableVersionApi(error);
-      return;
-    }
-    if (isTemporarilyUnavailable(error)) {
-      disableVersionFeatures(
-        'Version history is temporarily unavailable while notes preserves an older history database.',
-        error,
-        'temporarily-unavailable',
-      );
       return;
     }
     versionState.previewError =
@@ -301,14 +261,6 @@ export async function restoreVersion(
       disableVersionApi(error);
       return;
     }
-    if (isTemporarilyUnavailable(error)) {
-      disableVersionFeatures(
-        'Version history is temporarily unavailable while notes preserves an older history database.',
-        error,
-        'temporarily-unavailable',
-      );
-      return;
-    }
     throw error;
   }
 }
@@ -342,7 +294,6 @@ export function clearVersions() {
   versionState.versions = [];
   versionState.activeDocId = null;
   versionState.error = null;
-  versionState.availabilityReason = null;
   versionState.savePromptVisible = false;
   exitVersionReview();
 }

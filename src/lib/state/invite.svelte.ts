@@ -4,6 +4,19 @@ import { loadProjects } from './projects.svelte.js';
 import { loadProjectDocs } from './documents.svelte.js';
 import type { GenerateInviteResult, AcceptInviteResult } from '../types/index.js';
 
+/** Extract a human-readable message from a Tauri IPC error.
+ *  Backend CoreError is serialized as { code, message }, not a JS Error. */
+function extractErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error) return error.message;
+  if (error && typeof error === 'object') {
+    const obj = error as Record<string, unknown>;
+    if (typeof obj.message === 'string' && obj.message) return obj.message;
+    if (typeof obj.code === 'string' && obj.code) return obj.code;
+  }
+  if (typeof error === 'string' && error) return error;
+  return fallback;
+}
+
 export const inviteState = $state({
   // Generate flow (owner side)
   generating: false,
@@ -60,7 +73,7 @@ export async function generateInvite(projectId: string, role: 'editor' | 'viewer
       inviteState.localPeerId = 'mock-local-peer-id';
       return;
     }
-    inviteState.generateError = error instanceof Error ? error.message : 'failed to generate invite';
+    inviteState.generateError = extractErrorMessage(error, 'failed to generate invite');
   } finally {
     inviteState.generating = false;
   }
@@ -98,9 +111,10 @@ export async function acceptInvite(passphrase: string, ownerPeerId: string) {
     const result = await tauriApi.acceptInvite(passphrase.trim(), ownerPeerId.trim());
     inviteState.acceptResult = result;
 
-    // Reload projects and docs to include the newly joined project
+    // Reload projects and docs to include the newly joined project.
+    // Project state/APIs are keyed by project name, not manifest UUID.
     await loadProjects();
-    await loadProjectDocs(result.projectId, { force: true, connectPeers: true });
+    await loadProjectDocs(result.projectName, { force: true, connectPeers: true });
   } catch (error) {
     if (error instanceof TauriRuntimeUnavailableError) {
       // Dev mode — show mock success
@@ -111,7 +125,7 @@ export async function acceptInvite(passphrase: string, ownerPeerId: string) {
       };
       return;
     }
-    inviteState.acceptError = error instanceof Error ? error.message : 'failed to join project';
+    inviteState.acceptError = extractErrorMessage(error, 'failed to join project');
   } finally {
     inviteState.accepting = false;
   }

@@ -22,7 +22,7 @@
 
   function handleOpenProject() {
     if (inviteState.acceptResult) {
-      openProjectOverview(inviteState.acceptResult.projectId);
+      openProjectOverview(inviteState.acceptResult.projectName);
     }
     closeJoinDialog();
   }
