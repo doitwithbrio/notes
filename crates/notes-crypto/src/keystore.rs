@@ -11,6 +11,14 @@ use crate::error::CryptoError;
 
 /// Service name for keychain entries.
 const KEYCHAIN_SERVICE: &str = "com.doitwithbrio.notes";
+const LEGACY_KEYCHAIN_SERVICES: &[&str] = &["com.p2pnotes.app"];
+
+#[cfg(target_os = "macos")]
+enum KeychainLookup {
+    Found(Vec<u8>),
+    NotFound,
+    Error(CryptoError),
+}
 
 /// Key storage backend.
 pub struct KeyStore {
@@ -54,12 +62,17 @@ impl KeyStore {
 
     /// Retrieve a key. Tries OS keychain first (release only), falls back to file.
     pub fn load_key(&self, name: &str) -> Result<Vec<u8>, CryptoError> {
+        self.load_key_impl(name, Self::use_keychain())
+    }
+
+    fn load_key_impl(&self, name: &str, use_keychain: bool) -> Result<Vec<u8>, CryptoError> {
         // Try OS keychain first (release builds only)
         #[cfg(target_os = "macos")]
-        if Self::use_keychain() {
-            if let Ok(key) = load_keychain_macos(name) {
-                log::debug!("Loaded key '{name}' from macOS Keychain");
-                return Ok(key);
+        if use_keychain {
+            match load_keychain_with_legacy_migration(name) {
+                KeychainLookup::Found(key) => return Ok(key),
+                KeychainLookup::NotFound => {}
+                KeychainLookup::Error(err) => return Err(err),
             }
         }
 
@@ -72,6 +85,9 @@ impl KeyStore {
         #[cfg(target_os = "macos")]
         if Self::use_keychain() {
             let _ = delete_keychain_macos(name);
+            for legacy_service in LEGACY_KEYCHAIN_SERVICES {
+                let _ = delete_keychain_macos_for_service(legacy_service, name);
+            }
         }
 
         let path = self.key_file_path(name);
@@ -92,10 +108,15 @@ impl KeyStore {
 
     /// Check if a key exists.
     pub fn has_key(&self, name: &str) -> bool {
+        self.has_key_impl(name, Self::use_keychain())
+    }
+
+    fn has_key_impl(&self, name: &str, use_keychain: bool) -> bool {
         #[cfg(target_os = "macos")]
-        if Self::use_keychain() {
-            if load_keychain_macos(name).is_ok() {
-                return true;
+        if use_keychain {
+            match load_keychain_with_legacy_migration(name) {
+                KeychainLookup::Found(_) => return true,
+                KeychainLookup::NotFound | KeychainLookup::Error(_) => {}
             }
         }
 
@@ -136,18 +157,21 @@ impl KeyStore {
         &self,
         name: &str,
     ) -> Result<(x25519_dalek::StaticSecret, x25519_dalek::PublicKey), CryptoError> {
-        if self.has_key(name) {
-            let secret = self.load_x25519_secret(name)?;
-            let public = x25519_dalek::PublicKey::from(&secret);
-            Ok((secret, public))
-        } else {
-            let mut rng_bytes = [0u8; 32];
-            getrandom::fill(&mut rng_bytes).map_err(|_| CryptoError::RandomFailed)?;
-            let secret = x25519_dalek::StaticSecret::from(rng_bytes);
-            let public = x25519_dalek::PublicKey::from(&secret);
-            self.store_x25519_secret(name, &secret)?;
-            log::info!("Generated new X25519 keypair '{name}'");
-            Ok((secret, public))
+        match self.load_x25519_secret(name) {
+            Ok(secret) => {
+                let public = x25519_dalek::PublicKey::from(&secret);
+                Ok((secret, public))
+            }
+            Err(CryptoError::KeyNotFound(_)) => {
+                let mut rng_bytes = [0u8; 32];
+                getrandom::fill(&mut rng_bytes).map_err(|_| CryptoError::RandomFailed)?;
+                let secret = x25519_dalek::StaticSecret::from(rng_bytes);
+                let public = x25519_dalek::PublicKey::from(&secret);
+                self.store_x25519_secret(name, &secret)?;
+                log::info!("Generated new X25519 keypair '{name}'");
+                Ok((secret, public))
+            }
+            Err(err) => Err(err),
         }
     }
 
@@ -201,18 +225,52 @@ impl KeyStore {
 
 #[cfg(target_os = "macos")]
 fn store_keychain_macos(name: &str, key: &[u8]) -> Result<(), CryptoError> {
-    use security_framework::passwords::{delete_generic_password, set_generic_password};
-    // Delete existing entry first (set_generic_password errors if it exists)
-    let _ = delete_generic_password(KEYCHAIN_SERVICE, name);
-    set_generic_password(KEYCHAIN_SERVICE, name, key)
-        .map_err(|e| CryptoError::KeychainError(e.to_string()))
+    store_keychain_macos_for_service(KEYCHAIN_SERVICE, name, key)
 }
 
 #[cfg(target_os = "macos")]
-fn load_keychain_macos(name: &str) -> Result<Vec<u8>, CryptoError> {
+fn load_keychain_with_legacy_migration(name: &str) -> KeychainLookup {
+    match load_keychain_lookup(KEYCHAIN_SERVICE, name) {
+        KeychainLookup::Found(key) => {
+            log::debug!("Loaded key '{name}' from macOS Keychain");
+            return KeychainLookup::Found(key);
+        }
+        KeychainLookup::Error(err) => return KeychainLookup::Error(err),
+        KeychainLookup::NotFound => {}
+    }
+
+    for legacy_service in LEGACY_KEYCHAIN_SERVICES {
+        match load_keychain_lookup(legacy_service, name) {
+            KeychainLookup::Found(key) => {
+                log::info!(
+                    "Loaded key '{name}' from legacy macOS Keychain service '{legacy_service}', migrating"
+                );
+                if let Err(err) = store_keychain_macos(name, &key) {
+                    return KeychainLookup::Error(err);
+                }
+                if let Err(err) = delete_keychain_macos_for_service(legacy_service, name) {
+                    return KeychainLookup::Error(err);
+                }
+                return KeychainLookup::Found(key);
+            }
+            KeychainLookup::Error(err) => return KeychainLookup::Error(err),
+            KeychainLookup::NotFound => {}
+        }
+    }
+
+    KeychainLookup::NotFound
+}
+
+#[cfg(target_os = "macos")]
+fn load_keychain_lookup(service: &str, name: &str) -> KeychainLookup {
     use security_framework::passwords::get_generic_password;
-    get_generic_password(KEYCHAIN_SERVICE, name)
-        .map_err(|e| CryptoError::KeychainError(e.to_string()))
+    use security_framework_sys::base::errSecItemNotFound;
+
+    match get_generic_password(service, name) {
+        Ok(key) => KeychainLookup::Found(key),
+        Err(err) if err.code() == errSecItemNotFound => KeychainLookup::NotFound,
+        Err(err) => KeychainLookup::Error(CryptoError::KeychainError(err.to_string())),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -342,4 +400,56 @@ mod tests {
 
         assert_ne!(pub_a.as_bytes(), pub_b.as_bytes());
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_load_key_migrates_from_legacy_keychain_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = KeyStore::new(dir.path().to_path_buf());
+        let name = format!("legacy-migration-{}", std::process::id());
+        let key = b"legacy-secret-key-material-123456";
+
+        let _ = delete_keychain_macos(&name);
+        for service in LEGACY_KEYCHAIN_SERVICES {
+            let _ = delete_keychain_macos_for_service(service, &name);
+        }
+
+        store_keychain_macos_for_service(LEGACY_KEYCHAIN_SERVICES[0], &name, key).unwrap();
+
+        let loaded = store.load_key_impl(&name, true).unwrap();
+        assert_eq!(loaded, key);
+
+        let migrated = match load_keychain_lookup(KEYCHAIN_SERVICE, &name) {
+            KeychainLookup::Found(key) => key,
+            KeychainLookup::NotFound => panic!("migrated key missing from current service"),
+            KeychainLookup::Error(err) => panic!("current service lookup failed: {err}"),
+        };
+        assert_eq!(migrated, key);
+        assert!(matches!(
+            load_keychain_lookup(LEGACY_KEYCHAIN_SERVICES[0], &name),
+            KeychainLookup::NotFound
+        ));
+
+        let _ = delete_keychain_macos(&name);
+        for service in LEGACY_KEYCHAIN_SERVICES {
+            let _ = delete_keychain_macos_for_service(service, &name);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn store_keychain_macos_for_service(
+    service: &str,
+    name: &str,
+    key: &[u8],
+) -> Result<(), CryptoError> {
+    use security_framework::passwords::{delete_generic_password, set_generic_password};
+    let _ = delete_generic_password(service, name);
+    set_generic_password(service, name, key).map_err(|e| CryptoError::KeychainError(e.to_string()))
+}
+
+#[cfg(target_os = "macos")]
+fn delete_keychain_macos_for_service(service: &str, name: &str) -> Result<(), CryptoError> {
+    use security_framework::passwords::delete_generic_password;
+    delete_generic_password(service, name).map_err(|e| CryptoError::KeychainError(e.to_string()))
 }

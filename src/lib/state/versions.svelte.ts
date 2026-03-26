@@ -9,6 +9,7 @@
 
 import { tauriApi } from '../api/tauri.js';
 import { TauriRuntimeUnavailableError } from '../runtime/tauri.js';
+import { uiState } from './ui.svelte.js';
 import type { BackendVersion, DiffBlock } from '../types/index.js';
 
 export const versionState = $state({
@@ -35,6 +36,7 @@ export const versionState = $state({
 
 const refreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let warnedUnsupportedVersionApi = false;
+let previewRequestToken = 0;
 
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
@@ -190,6 +192,7 @@ export async function selectVersion(
   versionId: string,
 ) {
   if (!versionState.supported) return;
+  const requestToken = ++previewRequestToken;
   versionState.selectedVersionId = versionId;
   versionState.previewLoading = true;
   versionState.previewError = null;
@@ -204,20 +207,28 @@ export async function selectVersion(
 
   try {
     const text = await tauriApi.getVersionText(project, docId, versionId);
-    versionState.previewText = text;
+    if (requestToken === previewRequestToken && versionState.selectedVersionId === versionId) {
+      versionState.previewText = text;
+    }
   } catch (error) {
     if (error instanceof TauriRuntimeUnavailableError) {
-      versionState.previewText = '';
+      if (requestToken === previewRequestToken && versionState.selectedVersionId === versionId) {
+        versionState.previewText = '';
+      }
       return;
     }
     if (isMissingVersionCommand(error)) {
       disableVersionApi(error);
       return;
     }
-    versionState.previewError =
-      getErrorMessage(error) || 'Failed to load version';
+    if (requestToken === previewRequestToken && versionState.selectedVersionId === versionId) {
+      versionState.previewError =
+        getErrorMessage(error) || 'Failed to load version';
+    }
   } finally {
-    versionState.previewLoading = false;
+    if (requestToken === previewRequestToken && versionState.selectedVersionId === versionId) {
+      versionState.previewLoading = false;
+    }
   }
 }
 
@@ -240,7 +251,7 @@ export async function selectNextVersion(project: string, docId: string) {
     await selectVersion(project, docId, significant[nextIdx]!.id);
   } else {
     // Go back to live
-    exitVersionReview();
+    leaveHistoryReview();
   }
 }
 
@@ -253,7 +264,7 @@ export async function restoreVersion(
   if (!versionState.supported) return;
   try {
     await tauriApi.restoreToVersion(project, docId, versionId);
-    exitVersionReview();
+    leaveHistoryReview();
     await loadVersions(docId);
   } catch (error) {
     if (error instanceof TauriRuntimeUnavailableError) return;
@@ -267,11 +278,21 @@ export async function restoreVersion(
 
 /** Exit version review mode. */
 export function exitVersionReview() {
+  previewRequestToken += 1;
   versionState.selectedVersionId = null;
   versionState.selectedVersionIndex = -1;
   versionState.previewText = null;
+  versionState.previewLoading = false;
   versionState.previewError = null;
   versionState.diffBlocks = [];
+}
+
+export function leaveHistoryReview() {
+  uiState.historyReviewSessionId = null;
+  if (uiState.view === 'history-review') {
+    uiState.view = 'editor';
+  }
+  exitVersionReview();
 }
 
 /** Show the Cmd+S save version prompt. */

@@ -3767,7 +3767,7 @@ dependencies = [
 
 [[package]]
 name = "notes"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "automerge",
@@ -3826,6 +3826,7 @@ dependencies = [
  "iroh",
  "log",
  "security-framework",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "sha2 0.10.9",

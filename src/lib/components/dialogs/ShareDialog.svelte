@@ -102,6 +102,7 @@
         <button class="action-row" onclick={handleGenerate}>try again</button>
       {:else if invite}
         <p class="hint">share this code and your peer ID with the person you want to invite</p>
+        <p class="hint-subtle">this invite is single-use, expires in 10 minutes, and stops working if you close the app</p>
 
         <div class="field-row">
           <span class="field-label">invite code</span>
@@ -234,6 +235,14 @@
     color: var(--text-secondary);
     line-height: 1.5;
     margin-bottom: 16px;
+  }
+
+  .hint-subtle {
+    font-size: 11px;
+    color: var(--text-tertiary);
+    line-height: 1.4;
+    margin-top: -10px;
+    margin-bottom: 14px;
   }
 
   .status-row {

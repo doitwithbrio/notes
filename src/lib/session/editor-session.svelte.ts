@@ -3,7 +3,7 @@ import * as Automerge from '@automerge/automerge';
 import { tauriApi } from '../api/tauri.js';
 import { TauriRuntimeUnavailableError } from '../runtime/tauri.js';
 import { getDocById, markDocUnread, setActiveDoc, setDocWordCount } from '../state/documents.svelte.js';
-import { createVersion, exitVersionReview, loadVersions, versionState } from '../state/versions.svelte.js';
+import { createVersion, leaveHistoryReview, loadVersions, versionState } from '../state/versions.svelte.js';
 import { uiState } from '../state/ui.svelte.js';
 
 type NotesDoc = {
@@ -126,7 +126,7 @@ export async function openEditorSession(projectId: string, docId: string) {
   if (editorSessionState.projectId === projectId && editorSessionState.docId === docId) {
     // Session already loaded — just ensure the UI view is restored
     // (user may have navigated to project-overview or settings and come back)
-    exitVersionReview();
+    leaveHistoryReview();
     setActiveDoc(docId);
     return;
   }
@@ -233,11 +233,7 @@ export async function saveNow() {
 
 export async function closeEditorSession() {
   // Exit any review modes immediately (before async work)
-  exitVersionReview();
-  if (uiState.view === 'history-review') {
-    uiState.view = 'editor';
-    uiState.historyReviewSessionId = null;
-  }
+  leaveHistoryReview();
 
   flushWordCount();
   clearTimers();

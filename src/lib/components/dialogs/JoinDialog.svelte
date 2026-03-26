@@ -67,10 +67,11 @@
             id="passphrase-input"
             class="text-input"
             type="text"
-            placeholder="tiger marble ocean violet canyon frost"
+            placeholder="tiger-marble-ocean-violet-canyon-frost"
             bind:value={passphrase}
             disabled={inviteState.accepting}
           />
+          <span class="field-hint">spaces or hyphens both work</span>
         </div>
 
         <div class="field">
@@ -192,6 +193,13 @@
     border-radius: 10px;
     outline: none;
     transition: border-color var(--transition-fast);
+  }
+
+  .field-hint {
+    display: block;
+    font-size: 11px;
+    color: var(--text-tertiary);
+    margin-top: 4px;
   }
 
   .text-input:focus {

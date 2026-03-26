@@ -8,7 +8,7 @@
     selectVersion,
     selectPrevVersion,
     selectNextVersion,
-    exitVersionReview,
+    leaveHistoryReview,
   } from '../../state/versions.svelte.js';
   import { formatShortTime } from '../../utils/time.js';
 
@@ -19,7 +19,7 @@
 
   // Are we at the oldest/newest version?
   const canGoPrev = $derived(selectedIdx < versions.length - 1);
-  const canGoNext = $derived(selectedIdx > 0 || isReviewing);
+  const canGoNext = $derived(selectedIdx > 0);
 
   function handleTickClick(versionId: string) {
     if (!editorSessionState.projectId || !editorSessionState.docId) return;
@@ -34,26 +34,20 @@
 
   function handlePrev() {
     if (!editorSessionState.projectId || !editorSessionState.docId) return;
-    if (!isReviewing && versions.length > 0) {
-      // Enter review mode at the most recent version
-      uiState.view = 'history-review';
-      handleTickClick(versions[0]!.id);
-      return;
-    }
-    uiState.view = 'history-review';
     selectPrevVersion(editorSessionState.projectId, editorSessionState.docId);
   }
 
   function handleNext() {
     if (!editorSessionState.projectId || !editorSessionState.docId) return;
     if (selectedIdx <= 0) {
-      // Go back to live
-      uiState.view = 'editor';
-      uiState.historyReviewSessionId = null;
-      exitVersionReview();
+      leaveHistoryReview();
       return;
     }
     selectNextVersion(editorSessionState.projectId, editorSessionState.docId);
+  }
+
+  function handleBackToLive() {
+    leaveHistoryReview();
   }
 
   // Get position percentage for a version on the timeline (0 = oldest, 100 = newest)
@@ -95,16 +89,21 @@
       {/each}
 
       <!-- Live indicator at the end -->
-      <div class="live-dot" class:active={!isReviewing}>
+      <button
+        class="live-dot"
+        onclick={handleBackToLive}
+        title="Back to live"
+        type="button"
+      >
         <span class="live-label">live</span>
-      </div>
+      </button>
     </div>
 
     <button
       class="nav-btn"
       onclick={handleNext}
-      disabled={!isReviewing}
-      title={isReviewing && selectedIdx <= 0 ? 'Back to live' : 'Newer version'}
+      disabled={!canGoNext}
+      title={selectedIdx <= 0 ? 'Back to live' : 'Newer version'}
     >
       <ChevronRight size={14} strokeWidth={2} />
     </button>
@@ -116,6 +115,7 @@
           <span class="user-label">"{selectedVersion.label}"</span>
         {/if}
       </span>
+      <button class="done-btn" onclick={handleBackToLive} type="button">done</button>
     {/if}
   </div>
 {/if}
@@ -222,6 +222,13 @@
     display: flex;
     align-items: center;
     gap: 4px;
+    padding: 2px 4px;
+    border-radius: 999px;
+    transition: background var(--transition-fast);
+   }
+
+  .live-dot:hover {
+    background: var(--surface-hover);
   }
 
   .live-dot::before {
@@ -233,20 +240,12 @@
     transition: background var(--transition-fast);
   }
 
-  .live-dot.active::before {
-    background: var(--accent);
-  }
-
   .live-label {
     font-size: 9px;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.05em;
     color: var(--text-tertiary);
-  }
-
-  .live-dot.active .live-label {
-    color: var(--accent);
   }
 
   .version-label {
@@ -262,5 +261,20 @@
     font-weight: 400;
     color: var(--text-secondary);
     font-style: italic;
+  }
+
+  .done-btn {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-primary);
+    background: var(--surface-hover);
+    padding: 4px 8px;
+    border-radius: 999px;
+    flex-shrink: 0;
+    transition: background var(--transition-fast);
+  }
+
+  .done-btn:hover {
+    background: var(--surface-active);
   }
 </style>

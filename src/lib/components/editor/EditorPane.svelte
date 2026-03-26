@@ -7,7 +7,7 @@
   import { syncState } from '../../state/sync.svelte.js';
   import { editorSessionState, updateEditorText, reloadActiveSession } from '../../session/editor-session.svelte.js';
   import { uiState } from '../../state/ui.svelte.js';
-  import { versionState, exitVersionReview, showSavePrompt, createVersion, restoreVersion } from '../../state/versions.svelte.js';
+  import { versionState, leaveHistoryReview, showSavePrompt } from '../../state/versions.svelte.js';
   import { computeBlockDiff } from '../../utils/diff.js';
   import TimelineScrubber from './TimelineScrubber.svelte';
   import SaveVersionBar from './SaveVersionBar.svelte';
@@ -85,6 +85,14 @@
     untrack(() => syncEditorContent(text));
   });
 
+  $effect(() => {
+    const reviewing = isHistoryReview;
+    if (!reviewing) {
+      const text = editorSessionState.text;
+      untrack(() => syncEditorContent(text));
+    }
+  });
+
   // When entering/leaving review mode, toggle editor editability
   $effect(() => {
     const reviewing = isHistoryReview;
@@ -111,9 +119,7 @@
     const docId = editorSessionState.docId;
     if (prevDocId !== null && docId !== prevDocId) {
       if (untrack(() => isHistoryReview)) {
-        uiState.view = 'editor';
-        uiState.historyReviewSessionId = null;
-        exitVersionReview();
+        leaveHistoryReview();
       }
     }
     prevDocId = docId;
@@ -121,6 +127,11 @@
 
   // Cmd+S handler — create a named version
   function handleGlobalKeydown(e: KeyboardEvent) {
+    if (e.key === 'Escape' && isHistoryReview) {
+      e.preventDefault();
+      leaveHistoryReview();
+      return;
+    }
     if ((e.metaKey || e.ctrlKey) && e.key === 's') {
       e.preventDefault();
       if (!isHistoryReview && versionState.supported && editorSessionState.projectId && editorSessionState.docId) {
@@ -153,7 +164,9 @@
     </div>
   </div>
 
-  <TimelineScrubber />
+  {#if isHistoryReview}
+    <TimelineScrubber />
+  {/if}
   <SaveVersionBar />
 
   {#if activeDoc}

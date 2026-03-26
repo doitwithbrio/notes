@@ -1956,17 +1956,20 @@ fn load_or_create_secret_key(
     let keystore = notes_crypto::KeyStore::new(keys_dir);
     const KEY_NAME: &str = "peer-identity";
 
-    // Try loading existing key
-    if keystore.has_key(KEY_NAME) {
-        let bytes = keystore.load_key(KEY_NAME)?;
-        if bytes.len() == 32 {
+    // Try loading existing key, including legacy keychain service migration.
+    match keystore.load_key(KEY_NAME) {
+        Ok(bytes) if bytes.len() == 32 => {
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&bytes);
             let key = iroh::SecretKey::from_bytes(&arr);
             log::info!("Loaded peer identity from keystore");
             return Ok(key);
         }
-        log::warn!("Identity key corrupt, generating new one");
+        Ok(_) => {
+            log::warn!("Identity key corrupt, generating new one");
+        }
+        Err(notes_crypto::CryptoError::KeyNotFound(_)) => {}
+        Err(err) => return Err(Box::new(err)),
     }
 
     // Migrate from old plaintext file if it exists

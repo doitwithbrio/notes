@@ -17,6 +17,29 @@ function extractErrorMessage(error: unknown, fallback: string): string {
   return fallback;
 }
 
+/** Map raw backend error messages to user-friendly descriptions. */
+function friendlyJoinError(raw: string): string {
+  const lower = raw.toLowerCase();
+  if (lower.includes('invalid owner peer id')) return 'the owner peer ID is not valid — check you pasted it correctly';
+  if (lower.includes('connection failed')) return 'could not reach the owner — make sure they have the app open and both peers can connect';
+  if (lower.includes('timed out')) return 'connection timed out — the owner may have closed the app or the invite expired';
+  if (lower.includes('wrong code') || lower.includes('handshake failed')) return 'wrong invite code — check the code and try again';
+  if (lower.includes('connection lost') || lower.includes('stream') || lower.includes('reset')) return 'the owner closed the connection — the invite may have expired, been used already, or the owner restarted';
+  if (lower.includes('decrypt failed')) return 'could not decrypt the invite — the code may be wrong';
+  return raw;
+}
+
+/** Normalize an invite passphrase so both "fund-crow-gale" and
+ *  "fund crow gale" are accepted. Canonical form is hyphen-separated. */
+function normalizePassphrase(input: string): string {
+  return input
+    .trim()
+    .toLowerCase()
+    .split(/[\s\-]+/)
+    .filter(Boolean)
+    .join('-');
+}
+
 export const inviteState = $state({
   // Generate flow (owner side)
   generating: false,
@@ -66,7 +89,7 @@ export async function generateInvite(projectId: string, role: 'editor' | 'viewer
     if (error instanceof TauriRuntimeUnavailableError) {
       // Dev mode — show mock data for testing
       inviteState.activeInvite = {
-        passphrase: 'tiger marble ocean violet canyon frost',
+        passphrase: 'tiger-marble-ocean-violet-canyon-frost',
         peerId: 'mock-peer-id-for-dev',
         expiresAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
       };
@@ -108,7 +131,7 @@ export async function acceptInvite(passphrase: string, ownerPeerId: string) {
   inviteState.acceptResult = null;
 
   try {
-    const result = await tauriApi.acceptInvite(passphrase.trim(), ownerPeerId.trim());
+    const result = await tauriApi.acceptInvite(normalizePassphrase(passphrase), ownerPeerId.trim());
     inviteState.acceptResult = result;
 
     // Reload projects and docs to include the newly joined project.
@@ -125,7 +148,8 @@ export async function acceptInvite(passphrase: string, ownerPeerId: string) {
       };
       return;
     }
-    inviteState.acceptError = extractErrorMessage(error, 'failed to join project');
+    const raw = extractErrorMessage(error, 'failed to join project');
+    inviteState.acceptError = friendlyJoinError(raw);
   } finally {
     inviteState.accepting = false;
   }

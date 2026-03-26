@@ -18,6 +18,7 @@ iroh.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"
+security-framework-sys = "2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # libsecret via keyring — deferred, use file-based storage with restrictive permissions for now

@@ -327,13 +327,23 @@ impl InviteHandler {
         // Step 2: Try each pending invite's passphrase with SPAKE2
         self.cleanup_expired();
 
+        let pending_count = self.pending.len();
+        log::info!(
+            "Invite handler: received SPAKE2 from invitee, checking against {pending_count} pending invite(s)"
+        );
+
         let mut matched: Option<(String, Vec<u8>)> = None; // (passphrase, shared_key)
 
         for entry in self.pending.iter() {
             let passphrase = entry.key();
             let invite = entry.value();
 
-            if invite.is_expired() || invite.is_exhausted() {
+            if invite.is_expired() {
+                log::debug!("Invite handler: skipping expired invite for project '{}'", invite.project_name);
+                continue;
+            }
+            if invite.is_exhausted() {
+                log::debug!("Invite handler: skipping exhausted invite for project '{}'", invite.project_name);
                 continue;
             }
 
@@ -357,11 +367,15 @@ impl InviteHandler {
         }
 
         let (passphrase, mut shared_key) = match matched {
-            Some(m) => m,
+            Some(m) => {
+                log::info!("Invite handler: SPAKE2 passphrase matched");
+                m
+            }
             None => {
-                // No passphrase matched — increment attempt counter only for the specific
-                // connection source (we don't know which invite was targeted)
-                log::warn!("SPAKE2 handshake failed: no matching passphrase");
+                log::error!(
+                    "Invite handler: SPAKE2 handshake failed — no matching passphrase among {pending_count} pending invite(s). \
+                     The invitee sent a code that doesn't match any active invite."
+                );
                 return Err(InviteError::VerificationFailed);
             }
         };
@@ -470,8 +484,10 @@ impl iroh::protocol::ProtocolHandler for InviteHandler {
         };
 
         async move {
+            let remote_id = connection.remote_id();
+            log::info!("Invite handler: incoming connection from peer {remote_id}");
             if let Err(e) = handler.handle_connection(connection).await {
-                log::warn!("Invite handler error: {e}");
+                log::error!("Invite handler: connection from {remote_id} failed: {e}");
             }
             Ok(())
         }
