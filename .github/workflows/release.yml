@@ -9,18 +9,7 @@ jobs:
   build:
     permissions:
       contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            arch: aarch64
-            runner: macos-latest
-          - target: x86_64-apple-darwin
-            arch: x64
-            runner: macos-13
-
-    runs-on: ${{ matrix.runner }}
+    runs-on: macos-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -28,13 +17,12 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: aarch64-apple-darwin
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
           workspaces: '. -> target'
-          shared-key: ${{ matrix.target }}
 
       - name: Install bun
         uses: oven-sh/setup-bun@v2
@@ -59,12 +47,12 @@ jobs:
       - name: Build
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-        run: tauri build --target ${{ matrix.target }}
+        run: tauri build --target aarch64-apple-darwin
 
       - name: Locate bundle
         id: bundle
         run: |
-          BUNDLE_DIR="target/${{ matrix.target }}/release/bundle"
+          BUNDLE_DIR="target/aarch64-apple-darwin/release/bundle"
           APP=$(find "$BUNDLE_DIR/macos" -name "*.app" -maxdepth 1 | head -1)
           if [ -z "$APP" ]; then
             echo "::error::No .app bundle found in $BUNDLE_DIR/macos"
@@ -120,15 +108,15 @@ jobs:
           VER=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
           echo "version=$VER" >> "$GITHUB_OUTPUT"
 
-      - name: Create draft release
+      - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --title "notes v${{ steps.version.outputs.version }}" \
-            --notes $'**macOS:** If you see "unidentified developer", right-click the app and select Open.' \
-            --draft 2>/dev/null || true
+            --notes '**macOS:** If you see "unidentified developer", right-click the app and select Open.' \
+            2>/dev/null || true
 
       - name: Upload assets
         env:
@@ -138,13 +126,6 @@ jobs:
           TAG="$GITHUB_REF_NAME"
           REPO="$GITHUB_REPOSITORY"
 
-          # Wait for release to exist (in case the other matrix job creates it)
-          for i in $(seq 1 30); do
-            gh release view "$TAG" --repo "$REPO" &>/dev/null && break
-            echo "Waiting for release... (attempt $i)"
-            sleep 5
-          done
-
           for f in "$DIR"/dmg/*.dmg "$DIR"/macos/*.app.tar.gz "$DIR"/macos/*.app.tar.gz.sig; do
             if [ -f "$f" ]; then
               echo "Uploading: $(basename "$f")"
@@ -152,64 +133,36 @@ jobs:
             fi
           done
 
-  updater-json:
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Generate latest.json
+      - name: Generate and upload latest.json
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="$GITHUB_REF_NAME"
           REPO="$GITHUB_REPOSITORY"
           VER="${TAG#v}"
+          DIR="${{ steps.bundle.outputs.dir }}/macos"
           BASE="https://github.com/${REPO}/releases/download/${TAG}"
           NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-          mkdir -p /tmp/sigs
-          gh release download "$TAG" --repo "$REPO" --pattern "*.sig" --dir /tmp/sigs
-
-          AARCH64_SIG=""
-          X64_SIG=""
-          for f in /tmp/sigs/*aarch64*.app.tar.gz.sig; do
-            [ -f "$f" ] && AARCH64_SIG=$(cat "$f")
-          done
-          for f in /tmp/sigs/*x64*.app.tar.gz.sig; do
-            [ -f "$f" ] && X64_SIG=$(cat "$f")
-          done
-
-          if [ -z "$AARCH64_SIG" ] || [ -z "$X64_SIG" ]; then
-            echo "::error::Missing updater signatures (aarch64='${AARCH64_SIG:+set}' x64='${X64_SIG:+set}')"
-            ls -la /tmp/sigs/ || true
-            exit 1
-          fi
-
-          AARCH64_TAR=$(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name' | grep 'aarch64.*app\.tar\.gz$' | head -1)
-          X64_TAR=$(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name' | grep 'x64.*app\.tar\.gz$' | head -1)
+          TAR_NAME=$(basename "$(find "$DIR" -name "*.app.tar.gz" -maxdepth 1 | head -1)")
+          SIG_FILE=$(find "$DIR" -name "*.app.tar.gz.sig" -maxdepth 1 | head -1)
+          SIG=$(cat "$SIG_FILE")
 
           python3 -c "
           import json, sys
           data = {
-              'version': '${VER}',
-              'pub_date': '${NOW}',
+              'version': sys.argv[1],
+              'pub_date': sys.argv[2],
               'platforms': {
                   'darwin-aarch64': {
-                      'url': '${BASE}/${AARCH64_TAR}',
-                      'signature': sys.argv[1]
-                  },
-                  'darwin-x86_64': {
-                      'url': '${BASE}/${X64_TAR}',
-                      'signature': sys.argv[2]
+                      'url': sys.argv[3] + '/' + sys.argv[4],
+                      'signature': sys.argv[5]
                   }
               }
           }
           with open('/tmp/latest.json', 'w') as f:
               json.dump(data, f, indent=2)
           print(json.dumps(data, indent=2))
-          " "$AARCH64_SIG" "$X64_SIG"
+          " "$VER" "$NOW" "$BASE" "$TAR_NAME" "$SIG"
 
           gh release upload "$TAG" /tmp/latest.json --repo "$REPO" --clobber
