@@ -54,7 +54,10 @@
   }
 
   const metaLine = $derived(() => {
-    const parts: string[] = [project.role];
+    const accessLabel = project.accessState === 'identity-mismatch'
+      ? 'identity mismatch'
+      : project.accessState;
+    const parts: string[] = [accessLabel];
     if (project.shared && onlinePeerCount > 0) {
       parts.push(`${onlinePeerCount} peer${onlinePeerCount > 1 ? 's' : ''} online`);
     }
@@ -76,7 +79,7 @@
       <div class="project-header">
         <div class="project-title-row">
           <h1 class="project-title">{project.name}</h1>
-          {#if project.role === 'owner'}
+          {#if project.canManagePeers}
             <button class="share-btn" onclick={() => openShareDialog(project.id)}>
               <Share2 size={13} strokeWidth={1.5} />
               share
@@ -84,6 +87,9 @@
           {/if}
         </div>
         <p class="project-meta">{metaLine()}</p>
+        {#if project.accessState === 'identity-mismatch'}
+          <p class="project-warning">this app instance is using a different device identity than the one authorized for this project. open the build that shows you as owner, or rejoin the project with this identity.</p>
+        {/if}
       </div>
 
       <!-- Todos section -->
@@ -286,6 +292,14 @@
     color: var(--text-tertiary);
     font-weight: 400;
     line-height: 1.5;
+  }
+
+  .project-warning {
+    margin-top: 8px;
+    max-width: 680px;
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--warning-fg, #8a5a00);
   }
 
   /* ── Sections ── */

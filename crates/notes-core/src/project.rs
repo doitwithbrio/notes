@@ -38,6 +38,28 @@ pub struct ProjectManager {
 }
 
 impl ProjectManager {
+    fn resolve_access_from_owner_and_peers(
+        owner: &str,
+        peers: &[PeerInfo],
+        local_peer_id: &str,
+    ) -> (Option<PeerRole>, ProjectAccessState) {
+        if owner.is_empty() {
+            return (Some(PeerRole::Owner), ProjectAccessState::LocalOwner);
+        }
+        if owner == local_peer_id {
+            return (Some(PeerRole::Owner), ProjectAccessState::Owner);
+        }
+        if let Some(peer) = peers.iter().find(|peer| peer.peer_id == local_peer_id) {
+            let access = match peer.role {
+                PeerRole::Owner => ProjectAccessState::Owner,
+                PeerRole::Editor => ProjectAccessState::Editor,
+                PeerRole::Viewer => ProjectAccessState::Viewer,
+            };
+            return (Some(peer.role), access);
+        }
+        (None, ProjectAccessState::IdentityMismatch)
+    }
+
     pub fn new(base_dir: PathBuf) -> Self {
         Self {
             persistence: Arc::new(Persistence::new(base_dir)),
@@ -430,6 +452,20 @@ impl ProjectManager {
     }
 
     /// Describe all projects for frontend bootstrapping.
+    pub async fn resolve_local_access(
+        &self,
+        project_name: &str,
+        local_peer_id: &str,
+    ) -> Result<(Option<PeerRole>, ProjectAccessState), CoreError> {
+        let owner = self.get_project_owner(project_name).await?;
+        let peers = self.get_project_peers(project_name).await?;
+        Ok(Self::resolve_access_from_owner_and_peers(
+            &owner,
+            &peers,
+            local_peer_id,
+        ))
+    }
+
     pub async fn list_project_summaries(
         &self,
         local_peer_id: &str,
@@ -442,14 +478,11 @@ impl ProjectManager {
             let peers = manifest.list_peers()?;
             let owner = manifest.get_owner().unwrap_or_default();
             let shared = !owner.is_empty() || !peers.is_empty();
-            let role = if owner.is_empty() || owner == local_peer_id {
-                PeerRole::Owner
-            } else {
-                peers.iter()
-                    .find(|peer| peer.peer_id == local_peer_id)
-                    .map(|peer| peer.role)
-                    .unwrap_or(PeerRole::Viewer)
-            };
+            let (role, access_state) = Self::resolve_access_from_owner_and_peers(
+                &owner,
+                &peers,
+                local_peer_id,
+            );
 
             let file_count = manifest.list_files().map(|f| f.len()).unwrap_or(0);
 
@@ -458,6 +491,9 @@ impl ProjectManager {
                 path: self.persistence.project_dir(&name).display().to_string(),
                 shared,
                 role,
+                access_state,
+                can_edit: matches!(access_state, ProjectAccessState::LocalOwner | ProjectAccessState::Owner | ProjectAccessState::Editor),
+                can_manage_peers: matches!(access_state, ProjectAccessState::LocalOwner | ProjectAccessState::Owner),
                 peer_count: peers.len(),
                 file_count,
             });
@@ -728,18 +764,39 @@ impl ProjectManager {
             return Ok(());
         }
 
-        // Load doc — use encrypted loading if epoch keys exist for this project
-        let data = if let Some(epoch_mgr) = self.epoch_keys.get(project_name) {
+        let note_path = {
+            let manifest_arc = self.get_manifest(project_name)?;
+            let manifest = manifest_arc.read().await;
+            manifest.get_file_path(doc_id).ok()
+        };
+
+        let load_result = if let Some(epoch_mgr) = self.epoch_keys.get(project_name) {
             let mgr = epoch_mgr.read().await;
             if let Ok(key) = mgr.current_key() {
                 self.persistence
                     .load_doc_encrypted(project_name, doc_id, key.as_bytes())
-                    .await?
+                    .await
             } else {
-                self.persistence.load_doc(project_name, doc_id).await?
+                self.persistence.load_doc(project_name, doc_id).await
             }
         } else {
-            self.persistence.load_doc(project_name, doc_id).await?
+            self.persistence.load_doc(project_name, doc_id).await
+        };
+        let data = match load_result {
+            Ok(data) => data,
+            Err(CoreError::InvalidData(message)) if message.contains("Primary and backup both corrupted") => {
+                if let Some(path) = note_path.as_deref() {
+                    if self.persistence.markdown_export_exists(project_name, path).await.unwrap_or(false) {
+                        return Err(CoreError::RecoverableDocCorruption {
+                            doc_id: *doc_id,
+                            note_path: path.to_string(),
+                            suggested_path: path.to_string(),
+                        });
+                    }
+                }
+                return Err(CoreError::InvalidData(message));
+            }
+            Err(error) => return Err(error),
         };
         self.doc_store.load_doc(*doc_id, &data)?;
 
@@ -753,6 +810,38 @@ impl ProjectManager {
 
         log::info!("Loaded document {doc_id} from {project_name}");
         Ok(())
+    }
+
+    pub async fn recover_note_from_markdown(
+        &self,
+        project_name: &str,
+        doc_id: &DocId,
+    ) -> Result<DocInfo, CoreError> {
+        validation::validate_project_name(project_name)?;
+        let note_path = {
+            let manifest_arc = self.get_manifest(project_name)?;
+            let manifest = manifest_arc.read().await;
+            manifest.get_file_path(doc_id)?
+        };
+        let markdown = self.persistence.read_markdown_export(project_name, &note_path).await?;
+        self.persistence
+            .quarantine_broken_doc_artifacts(project_name, doc_id)
+            .await?;
+        self.doc_store.remove_doc(doc_id);
+        self.doc_projects.remove(doc_id);
+        self.doc_store.create_doc_with_id(*doc_id)?;
+        self.doc_store.replace_text(doc_id, &markdown).await?;
+        self.save_doc(project_name, doc_id).await?;
+        self.doc_projects.insert(*doc_id, project_name.to_string());
+        self.start_save_loop(project_name.to_string(), *doc_id, Duration::from_secs(5))
+            .await;
+
+        Ok(DocInfo {
+            id: *doc_id,
+            path: note_path,
+            file_type: FileType::Note,
+            created: chrono::Utc::now(),
+        })
     }
 
     /// Close a document: cancel save loop, save to disk, remove from memory.
@@ -1340,5 +1429,112 @@ mod tests {
             let text = pm.get_doc_text(&id).await.unwrap();
             assert_eq!(text, "");
         }
+    }
+
+    #[tokio::test]
+    async fn test_open_doc_returns_recoverable_corruption_when_markdown_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let pm = ProjectManager::new(dir.path().to_path_buf());
+        pm.create_project("test").await.unwrap();
+        pm.open_project("test").await.unwrap();
+
+        let id = pm.create_note("test", "ideas.md").await.unwrap();
+        pm.doc_store.replace_text(&id, "# Ideas\n\nRecovered").await.unwrap();
+        pm.save_doc("test", &id).await.unwrap();
+        pm.close_doc("test", &id).await.unwrap();
+
+        let primary = dir
+            .path()
+            .join("test")
+            .join(".p2p")
+            .join("automerge")
+            .join(format!("{}.automerge", id));
+        let backup = dir
+            .path()
+            .join("test")
+            .join(".p2p")
+            .join("automerge")
+            .join(format!("{}.automerge.bak", id));
+        tokio::fs::write(&primary, b"broken primary").await.unwrap();
+        tokio::fs::write(&backup, b"broken backup").await.unwrap();
+
+        let error = pm.open_doc("test", &id).await.expect_err("expected recoverable corruption");
+        match error {
+            CoreError::RecoverableDocCorruption { doc_id, note_path, suggested_path } => {
+                assert_eq!(doc_id, id);
+                assert_eq!(note_path, "ideas.md");
+                assert_eq!(suggested_path, "ideas.md");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_recover_note_from_markdown_rebuilds_same_doc_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let pm = ProjectManager::new(dir.path().to_path_buf());
+        pm.create_project("test").await.unwrap();
+        pm.open_project("test").await.unwrap();
+
+        let id = pm.create_note("test", "ideas.md").await.unwrap();
+        pm.doc_store.replace_text(&id, "# Ideas\n\nRecovered").await.unwrap();
+        pm.save_doc("test", &id).await.unwrap();
+        pm.close_doc("test", &id).await.unwrap();
+
+        let primary = dir
+            .path()
+            .join("test")
+            .join(".p2p")
+            .join("automerge")
+            .join(format!("{}.automerge", id));
+        let backup = dir
+            .path()
+            .join("test")
+            .join(".p2p")
+            .join("automerge")
+            .join(format!("{}.automerge.bak", id));
+        tokio::fs::write(&primary, b"broken primary").await.unwrap();
+        tokio::fs::write(&backup, b"broken backup").await.unwrap();
+
+        let recovered = pm.recover_note_from_markdown("test", &id).await.unwrap();
+        assert_eq!(recovered.id, id);
+        assert_eq!(recovered.path, "ideas.md");
+
+        pm.open_doc("test", &recovered.id).await.unwrap();
+        let text = pm.get_doc_text(&recovered.id).await.unwrap();
+        assert_eq!(text, "# Ideas\n\nRecovered");
+
+        let original_md = tokio::fs::read_to_string(dir.path().join("test").join("ideas.md")).await.unwrap();
+        assert_eq!(original_md, "# Ideas\n\nRecovered");
+        let mut entries = tokio::fs::read_dir(dir.path().join("test").join(".p2p").join("automerge")).await.unwrap();
+        let mut quarantined = Vec::new();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            quarantined.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        assert!(quarantined.iter().any(|name| name.starts_with(&format!("{}.automerge.corrupt-", id))));
+        assert!(quarantined.iter().any(|name| name.starts_with(&format!("{}.automerge.bak.corrupt-", id))));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_local_access_distinguishes_identity_mismatch_from_viewer() {
+        let dir = tempfile::tempdir().unwrap();
+        let pm = ProjectManager::new(dir.path().to_path_buf());
+        pm.create_project("test").await.unwrap();
+        pm.open_project("test").await.unwrap();
+
+        {
+            let manifest = pm.get_manifest("test").unwrap();
+            let mut manifest = manifest.write().await;
+            manifest.set_owner("owner-peer").unwrap();
+            manifest.add_peer("viewer-peer", "viewer", "Viewer").unwrap();
+        }
+
+        let (viewer_role, viewer_access) = pm.resolve_local_access("test", "viewer-peer").await.unwrap();
+        assert_eq!(viewer_role, Some(PeerRole::Viewer));
+        assert_eq!(viewer_access, ProjectAccessState::Viewer);
+
+        let (mismatch_role, mismatch_access) = pm.resolve_local_access("test", "someone-else").await.unwrap();
+        assert_eq!(mismatch_role, None);
+        assert_eq!(mismatch_access, ProjectAccessState::IdentityMismatch);
     }
 }

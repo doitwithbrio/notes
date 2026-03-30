@@ -16,13 +16,47 @@ import type {
   BackendSyncStatusEvent,
   BackendUnseenDocInfo,
   BackendVersion,
+  BackendRecoverableDocCorruptionDetails,
   UpdateInfo,
 } from '../types/index.js';
 import { assertTauriRuntime } from '../runtime/tauri.js';
 
+type BackendCommandErrorPayload = {
+  code?: string;
+  message?: string;
+  details?: Record<string, unknown>;
+};
+
+export class TauriCommandError extends Error {
+  code: string;
+  details?: Record<string, unknown>;
+
+  constructor(payload: BackendCommandErrorPayload) {
+    super(payload.message ?? 'Backend command failed');
+    this.name = 'TauriCommandError';
+    this.code = payload.code ?? 'UNKNOWN_ERROR';
+    this.details = payload.details;
+  }
+}
+
+function normalizeInvokeError(error: unknown): Error {
+  if (error instanceof Error) return error;
+  if (error && typeof error === 'object') {
+    const payload = error as BackendCommandErrorPayload;
+    if (typeof payload.message === 'string' || typeof payload.code === 'string') {
+      return new TauriCommandError(payload);
+    }
+  }
+  return new Error(String(error));
+}
+
 async function guardedInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   assertTauriRuntime(`invoke:${command}`);
-  return invoke<T>(command, args);
+  try {
+    return await invoke<T>(command, args);
+  } catch (error) {
+    throw normalizeInvokeError(error);
+  }
 }
 
 async function guardedListen<T>(
@@ -49,6 +83,8 @@ export const tauriApi = {
     guardedInvoke<void>('delete_note', { project, docId }),
   renameNote: (project: string, docId: string, newPath: string) =>
     guardedInvoke<void>('rename_note', { project, docId, newPath }),
+  recoverDocFromMarkdown: (project: string, docId: string) =>
+    guardedInvoke<BackendDocInfo>('recover_doc_from_markdown_cmd', { project, docId }),
   getDocBinary: async (project: string, docId: string) => {
     const raw = await guardedInvoke<ArrayBuffer | number[]>('get_doc_binary', { project, docId });
     if (raw instanceof ArrayBuffer) return new Uint8Array(raw);
@@ -115,3 +151,9 @@ export const tauriApi = {
   /** Ask the Rust backend to fetch latest.json and compare versions. */
   checkForUpdate: () => guardedInvoke<UpdateInfo | null>('check_for_update'),
 };
+
+export function isRecoverableDocCorruption(
+  error: unknown,
+): error is TauriCommandError & { details: BackendRecoverableDocCorruptionDetails } {
+  return error instanceof TauriCommandError && error.code === 'DOC_CORRUPTED_RECOVERABLE';
+}

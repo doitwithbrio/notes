@@ -31,16 +31,38 @@ impl KeyStore {
         Self { keys_dir }
     }
 
-    /// Whether to use the OS keychain (skip in debug builds to avoid
-    /// macOS Keychain password prompts from unsigned binaries).
+    /// Whether to use the OS keychain.
+    ///
+    /// macOS is the canonical backend for both debug and release so the same
+    /// machine keeps a single peer identity across builds. For local testing,
+    /// `NOTES_KEYSTORE_MODE=file-only` can force file-backed storage.
     fn use_keychain() -> bool {
-        #[cfg(debug_assertions)]
+        #[cfg(target_os = "macos")]
+        {
+            #[cfg(test)]
+            {
+                return false;
+            }
+            match std::env::var("NOTES_KEYSTORE_MODE") {
+                Ok(mode)
+                    if mode.eq_ignore_ascii_case("file")
+                        || mode.eq_ignore_ascii_case("file-only") =>
+                {
+                    false
+                }
+                Ok(mode)
+                    if mode.eq_ignore_ascii_case("keychain")
+                        || mode.eq_ignore_ascii_case("keychain-only") =>
+                {
+                    true
+                }
+                _ => true,
+            }
+        }
+
+        #[cfg(not(target_os = "macos"))]
         {
             false
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            true
         }
     }
 

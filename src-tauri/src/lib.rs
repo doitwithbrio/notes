@@ -364,6 +364,36 @@ enum MinRole {
     Owner,
 }
 
+fn is_authorized_for_min_role(
+    role: Option<PeerRole>,
+    access_state: notes_core::ProjectAccessState,
+    min_role: MinRole,
+) -> Result<(), CoreError> {
+    if access_state == notes_core::ProjectAccessState::LocalOwner {
+        return Ok(());
+    }
+
+    match min_role {
+        MinRole::Owner => match access_state {
+            notes_core::ProjectAccessState::Owner => Ok(()),
+            notes_core::ProjectAccessState::IdentityMismatch => Err(CoreError::ProjectIdentityMismatch),
+            _ => match role {
+                Some(PeerRole::Owner) | Some(PeerRole::Editor) | Some(PeerRole::Viewer) => {
+                    Err(CoreError::InvalidInput("only the project owner can perform this action".into()))
+                }
+                None => Err(CoreError::ProjectIdentityMismatch),
+            },
+        },
+        MinRole::Editor => match role {
+            Some(PeerRole::Owner) | Some(PeerRole::Editor) => Ok(()),
+            Some(PeerRole::Viewer) => {
+                Err(CoreError::InvalidInput("viewers cannot modify documents".into()))
+            }
+            None => Err(CoreError::ProjectIdentityMismatch),
+        },
+    }
+}
+
 /// Check the local device's role in a project. Returns Ok(()) if authorized,
 /// Err if the role is insufficient. For local-only projects (no owner set),
 /// all operations are allowed.
@@ -373,46 +403,12 @@ async fn check_role(
     min_role: MinRole,
 ) -> Result<(), CoreError> {
     let my_peer_id = state.local_peer_id.clone();
-    let owner = state
+    let (my_role, access_state) = state
         .project_manager
-        .get_project_owner(project)
-        .await
-        .unwrap_or_default();
+        .resolve_local_access(project, &my_peer_id)
+        .await?;
 
-    // Local-only project (no sharing configured) — all operations allowed
-    if owner.is_empty() {
-        return Ok(());
-    }
-
-    // Owner can do everything
-    if owner == my_peer_id {
-        return Ok(());
-    }
-
-    // Look up our role
-    let peers = state.project_manager.get_project_peers(project).await?;
-    let my_role = peers
-        .iter()
-        .find(|p| p.peer_id == my_peer_id)
-        .map(|p| p.role);
-
-    match min_role {
-        MinRole::Owner => {
-            Err(CoreError::InvalidInput("only the project owner can perform this action".into()))
-        }
-        MinRole::Editor => {
-            match my_role {
-                Some(PeerRole::Owner) | Some(PeerRole::Editor) => Ok(()),
-                Some(PeerRole::Viewer) => {
-                    Err(CoreError::InvalidInput("viewers cannot modify documents".into()))
-                }
-                None => {
-                    // Unknown/removed peer — fail closed (deny access)
-                    Err(CoreError::InvalidInput("peer not authorized for this project".into()))
-                }
-            }
-        }
-    }
+    is_authorized_for_min_role(my_role, access_state, min_role)
 }
 
 // ── Project Commands ─────────────────────────────────────────────────
@@ -870,6 +866,20 @@ async fn rename_note(
         .project_manager
         .rename_note(&project, &doc_id, &new_path)
         .await
+}
+
+#[tauri::command]
+async fn recover_doc_from_markdown_cmd(
+    state: State<'_, AppState>,
+    project: String,
+    doc_id: DocId,
+) -> Result<DocInfo, CoreError> {
+    check_role(&state, &project, MinRole::Editor).await?;
+    let doc = state
+        .project_manager
+        .recover_note_from_markdown(&project, &doc_id)
+        .await?;
+    Ok(doc)
 }
 
 #[tauri::command]
@@ -2636,6 +2646,7 @@ pub fn run() {
             close_doc,
             delete_note,
             rename_note,
+            recover_doc_from_markdown_cmd,
             get_doc_binary,
             get_doc_text,
             apply_changes,
@@ -2910,5 +2921,24 @@ mod tests {
 
         let repaired = tokio::fs::read_to_string(&seen_state_path).await.unwrap();
         assert!(repaired.contains(&doc_id.to_string()));
+    }
+
+    #[test]
+    fn owner_min_role_accepts_shared_owner_and_rejects_mismatch() {
+        assert!(is_authorized_for_min_role(
+            Some(PeerRole::Owner),
+            notes_core::ProjectAccessState::Owner,
+            MinRole::Owner,
+        )
+        .is_ok());
+
+        assert!(matches!(
+            is_authorized_for_min_role(
+                None,
+                notes_core::ProjectAccessState::IdentityMismatch,
+                MinRole::Owner,
+            ),
+            Err(CoreError::ProjectIdentityMismatch)
+        ));
     }
 }

@@ -8,11 +8,13 @@ const mockState = vi.hoisted(() => ({
   editorSessionState: {
     loading: false,
     lastError: null as string | null,
+    lastErrorCode: null as string | null,
+    lastErrorDetails: null as Record<string, unknown> | null,
     projectId: null as string | null,
     docId: null as string | null,
   },
   uiState: { sidebarOpen: true, rightSidebarOpen: false, quickOpenVisible: false },
-  projectState: { projects: [{ id: 'project-1', name: 'Project 1' }] },
+  projectState: { projects: [{ id: 'project-1', name: 'Project 1', path: 'project-1', shared: true, role: 'owner', accessState: 'owner', canEdit: true, canManagePeers: true, peerCount: 1 }] },
   inviteState: {
     shareDialogOpen: false,
     joinDialogOpen: false,
@@ -27,6 +29,7 @@ const mockState = vi.hoisted(() => ({
   reconcileMissingSelectedDoc: vi.fn(),
   navigateToDoc: vi.fn(async () => undefined),
   navigateToProject: vi.fn(async () => undefined),
+  recoverDocFromMarkdown: vi.fn(async () => ({ id: 'doc-a', path: 'ideas.md', fileType: 'note', created: new Date().toISOString() })),
   resumePendingJoins: vi.fn(async () => undefined),
   clearInviteBanner: vi.fn(),
 }));
@@ -56,6 +59,14 @@ vi.mock('../state/projects.svelte.js', () => ({
   projectState: mockState.projectState,
 }));
 
+vi.mock('../api/tauri.js', () => ({
+  tauriApi: {
+    recoverDocFromMarkdown: mockState.recoverDocFromMarkdown,
+    e2eIsEnabled: vi.fn(async () => false),
+    e2eSetNetworkBlocked: vi.fn(async () => undefined),
+  },
+}));
+
 vi.mock('../state/invite.svelte.js', () => ({
   inviteState: mockState.inviteState,
   resumePendingJoins: mockState.resumePendingJoins,
@@ -69,6 +80,7 @@ vi.mock('../utils/platform.js', () => ({
 vi.mock('../navigation/workspace-router.svelte.js', () => ({
   getWorkspaceRoute: () => mockState.route,
   getSelectedDoc: () => mockState.selectedDoc,
+  getSelectedProjectId: () => (mockState.route && mockState.route.kind === 'doc' ? mockState.route.projectId : mockState.route?.kind === 'project' ? mockState.route.projectId : null),
   isProjectRoute: (route: unknown) => !!route && (route as { kind?: string }).kind === 'project',
   navigateToDoc: mockState.navigateToDoc,
   navigateToProject: mockState.navigateToProject,
@@ -82,10 +94,13 @@ vi.mock('./editor/ProjectOverview.svelte', () => import('./__test_mocks__/StubPr
 
 describe('App fallback behavior', () => {
   beforeEach(() => {
+    mockState.projectState.projects = [{ id: 'project-1', name: 'Project 1', path: 'project-1', shared: true, role: 'owner', accessState: 'owner', canEdit: true, canManagePeers: true, peerCount: 1 }];
     mockState.route = null;
     mockState.selectedDoc = null;
     mockState.editorSessionState.loading = false;
     mockState.editorSessionState.lastError = null;
+    mockState.editorSessionState.lastErrorCode = null;
+    mockState.editorSessionState.lastErrorDetails = null;
     mockState.editorSessionState.projectId = null;
     mockState.editorSessionState.docId = null;
     mockState.inviteState.pendingJoinResumes = [];
@@ -93,6 +108,7 @@ describe('App fallback behavior', () => {
     mockState.reconcileMissingSelectedDoc.mockReset();
     mockState.navigateToDoc.mockReset();
     mockState.navigateToProject.mockReset();
+    mockState.recoverDocFromMarkdown.mockReset();
     mockState.resumePendingJoins.mockReset();
     mockState.clearInviteBanner.mockReset();
   });
@@ -153,6 +169,63 @@ describe('App fallback behavior', () => {
 
     expect(mockState.navigateToDoc).toHaveBeenCalledWith('project-1', 'doc-a');
     expect(mockState.navigateToProject).not.toHaveBeenCalled();
+  });
+
+  it('shows markdown recovery action for recoverable corruption and opens the recovered copy', async () => {
+    mockState.route = { kind: 'doc', projectId: 'project-1', docId: 'doc-a', mode: 'live' };
+    mockState.selectedDoc = { id: 'doc-a', projectId: 'project-1', title: 'ideas' };
+    mockState.editorSessionState.lastError = 'Document data is unreadable, but a markdown export is available for recovery';
+    mockState.editorSessionState.lastErrorCode = 'DOC_CORRUPTED_RECOVERABLE';
+    mockState.editorSessionState.lastErrorDetails = {
+      docId: 'doc-a',
+      notePath: 'ideas.md',
+      suggestedPath: 'ideas (recovered).md',
+    };
+
+    render(App);
+
+    expect(screen.getByTestId('editor-open-recover').textContent).toContain('recover note from markdown');
+    await fireEvent.click(screen.getByTestId('editor-open-recover'));
+
+    await waitFor(() => {
+      expect(mockState.recoverDocFromMarkdown).toHaveBeenCalledWith('project-1', 'doc-a');
+      expect(mockState.navigateToDoc).toHaveBeenCalledWith('project-1', 'doc-a');
+    });
+  });
+
+  it('keeps recovery available for editors with write access', async () => {
+    mockState.route = { kind: 'doc', projectId: 'project-1', docId: 'doc-a', mode: 'live' };
+    mockState.selectedDoc = { id: 'doc-a', projectId: 'project-1', title: 'ideas' };
+    mockState.projectState.projects = [{ id: 'project-1', name: 'Project 1', path: 'project-1', shared: true, role: 'editor', accessState: 'editor', canEdit: true, canManagePeers: false, peerCount: 1 }];
+    mockState.editorSessionState.lastError = 'Document data is unreadable, but a markdown export is available for recovery';
+    mockState.editorSessionState.lastErrorCode = 'DOC_CORRUPTED_RECOVERABLE';
+    mockState.editorSessionState.lastErrorDetails = {
+      docId: 'doc-a',
+      notePath: 'ideas.md',
+      suggestedPath: 'ideas.md',
+    };
+
+    render(App);
+
+    expect(screen.getByTestId('editor-open-recover').textContent).toContain('recover note from markdown');
+  });
+
+  it('explains identity mismatch and hides recovery action when write access is unavailable', async () => {
+    mockState.route = { kind: 'doc', projectId: 'project-1', docId: 'doc-a', mode: 'live' };
+    mockState.selectedDoc = { id: 'doc-a', projectId: 'project-1', title: 'ideas' };
+    mockState.projectState.projects = [{ id: 'project-1', name: 'Project 1', path: 'project-1', shared: true, role: null as any, accessState: 'identity-mismatch', canEdit: false, canManagePeers: false, peerCount: 1 }];
+    mockState.editorSessionState.lastError = 'Document data is unreadable, but a markdown export is available for recovery';
+    mockState.editorSessionState.lastErrorCode = 'DOC_CORRUPTED_RECOVERABLE';
+    mockState.editorSessionState.lastErrorDetails = {
+      docId: 'doc-a',
+      notePath: 'ideas.md',
+      suggestedPath: 'ideas.md',
+    };
+
+    render(App);
+
+    expect(screen.queryByTestId('editor-open-recover')).toBeNull();
+    expect(screen.getByTestId('editor-open-failed').textContent).toContain('different device identity');
   });
 
   it('opens the invite banner project using the local project name key', async () => {

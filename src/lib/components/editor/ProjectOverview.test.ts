@@ -102,6 +102,9 @@ describe('ProjectOverview', () => {
         shared: false,
         peerCount: 0,
         role: 'owner',
+        accessState: 'local-owner',
+        canEdit: true,
+        canManagePeers: true,
       },
     });
 
@@ -119,6 +122,9 @@ describe('ProjectOverview', () => {
         shared: true,
         peerCount: 1,
         role: 'owner',
+        accessState: 'owner',
+        canEdit: true,
+        canManagePeers: true,
       },
     });
 
@@ -143,11 +149,34 @@ describe('ProjectOverview', () => {
         shared: false,
         peerCount: 0,
         role: 'owner',
+        accessState: 'local-owner',
+        canEdit: true,
+        canManagePeers: true,
       },
     });
 
     await fireEvent.click(screen.getByRole('button', { name: /alpha/i }));
 
     expect(mockState.consoleError).toHaveBeenCalled();
+  });
+
+  it('shows identity mismatch instead of viewer-like owner actions', async () => {
+    render(ProjectOverview, {
+      project: {
+        id: 'project-1',
+        name: 'alpha',
+        path: 'alpha',
+        shared: true,
+        peerCount: 1,
+        role: null,
+        accessState: 'identity-mismatch',
+        canEdit: false,
+        canManagePeers: false,
+      },
+    });
+
+    expect(screen.getByText(/identity mismatch/i)).toBeTruthy();
+    expect(screen.getByText(/different device identity/i)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /share/i })).toBeNull();
   });
 });

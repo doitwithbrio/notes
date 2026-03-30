@@ -16,6 +16,17 @@ pub enum PeerRole {
     Viewer,
 }
 
+/// How the current local device is related to a project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProjectAccessState {
+    LocalOwner,
+    Owner,
+    Editor,
+    Viewer,
+    IdentityMismatch,
+}
+
 /// Type of file in the project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -62,7 +73,10 @@ pub struct ProjectSummary {
     pub name: String,
     pub path: String,
     pub shared: bool,
-    pub role: PeerRole,
+    pub role: Option<PeerRole>,
+    pub access_state: ProjectAccessState,
+    pub can_edit: bool,
+    pub can_manage_peers: bool,
     pub peer_count: usize,
     pub file_count: usize,
 }

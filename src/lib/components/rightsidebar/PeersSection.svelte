@@ -9,7 +9,7 @@
   const offlinePeers = $derived(presenceState.peers.filter((p) => !p.online));
 
   const activeProject = $derived(getProject(getWorkspaceProjectId()));
-  const isOwner = $derived(activeProject?.role === 'owner');
+  const isOwner = $derived(activeProject?.canManagePeers ?? false);
 
   function handleInvite() {
     if (activeProject) {

@@ -4,10 +4,11 @@
   import { initializeApp, appSessionState, teardownAppSession } from '../state/app-session.svelte.js';
   import { closeEditorSession, editorSessionState } from '../session/editor-session.svelte.js';
   import { teardownAppearance } from '../state/appearance.svelte.js';
+  import { tauriApi } from '../api/tauri.js';
   import { closeQuickOpen, toggleQuickOpen, uiState } from '../state/ui.svelte.js';
   import { projectState } from '../state/projects.svelte.js';
   import { isMac } from '../utils/platform.js';
-  import { getSelectedDoc, getWorkspaceRoute, isProjectRoute, navigateToDoc, navigateToProject, reconcileMissingSelectedDoc } from '../navigation/workspace-router.svelte.js';
+  import { getSelectedDoc, getSelectedProjectId, getWorkspaceRoute, isProjectRoute, navigateToDoc, navigateToProject, reconcileMissingSelectedDoc } from '../navigation/workspace-router.svelte.js';
   import Sidebar from './sidebar/Sidebar.svelte';
   import ProjectOverview from './editor/ProjectOverview.svelte';
   import RightSidebar from './rightsidebar/RightSidebar.svelte';
@@ -22,12 +23,25 @@
       ? (projectState.projects.find((project) => project.id === route.projectId) ?? null)
       : null,
   );
+  const selectedProject = $derived(
+    projectState.projects.find((project) => project.id === getSelectedProjectId()) ?? null,
+  );
   const selectedDocOpenFailed = $derived.by(() => {
     if (!route || route.kind !== 'doc') return false;
     if (!activeDoc) return false;
     if (editorSessionState.loading || !editorSessionState.lastError) return false;
     return editorSessionState.projectId !== activeDoc.projectId || editorSessionState.docId !== activeDoc.id;
   });
+  const selectedDocRecoverable = $derived(
+    selectedDocOpenFailed && editorSessionState.lastErrorCode === 'DOC_CORRUPTED_RECOVERABLE',
+  );
+  const selectedDocRecoveryDetails = $derived(
+    selectedDocRecoverable
+      ? (editorSessionState.lastErrorDetails as { notePath?: string; suggestedPath?: string } | null)
+      : null,
+  );
+  const selectedDocCanRecover = $derived(selectedProject?.canEdit ?? true);
+  const selectedDocIdentityMismatch = $derived(selectedProject?.accessState === 'identity-mismatch');
 
   let editorPanePromise = $state<Promise<typeof import('./editor/EditorPane.svelte')> | null>(null);
   let settingsPanePromise = $state<Promise<typeof import('./settings/SettingsPane.svelte')> | null>(null);
@@ -154,6 +168,17 @@
       console.error('Failed to retry opening note:', error);
     });
   }
+
+  function handleRecoverSelectedDoc() {
+    if (!route || route.kind !== 'doc') return;
+    void tauriApi.recoverDocFromMarkdown(route.projectId, route.docId)
+      .then(async () => {
+        await navigateToDoc(route.projectId, route.docId);
+      })
+      .catch((error) => {
+        console.error('Failed to recover note from markdown:', error);
+      });
+  }
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
@@ -209,7 +234,23 @@
             <div class="app-message inline-message" data-testid="editor-open-failed">
               <p class="title">could not open {activeDoc.title}</p>
               <p class="body">{editorSessionState.lastError}</p>
+              {#if selectedDocRecoverable && selectedDocRecoveryDetails}
+                {#if selectedDocCanRecover}
+                  <p class="body">a markdown export was found at <code>{selectedDocRecoveryDetails.notePath}</code>. recovering will rebuild this note from markdown and keep the broken automerge files quarantined.</p>
+                  <div class="invite-actions">
+                    <button class="invite-action secondary" data-testid="editor-open-retry" onclick={handleRetrySelectedDoc}>retry</button>
+                    <button class="invite-action" data-testid="editor-open-recover" onclick={handleRecoverSelectedDoc}>recover note from markdown</button>
+                  </div>
+                {:else if selectedDocIdentityMismatch}
+                  <p class="body">a markdown export exists at <code>{selectedDocRecoveryDetails.notePath}</code>, but this app instance is using a different device identity than the owner/editor for this project. Open the build that shows you as owner, or switch this build to the same identity, then retry recovery.</p>
+                  <button class="invite-action secondary" data-testid="editor-open-retry" onclick={handleRetrySelectedDoc}>retry</button>
+                {:else}
+                  <p class="body">a markdown export exists at <code>{selectedDocRecoveryDetails.notePath}</code>, but only owners and editors can rebuild notes in this project.</p>
+                  <button class="invite-action secondary" data-testid="editor-open-retry" onclick={handleRetrySelectedDoc}>retry</button>
+                {/if}
+              {:else}
               <button class="invite-action" data-testid="editor-open-retry" onclick={handleRetrySelectedDoc}>retry</button>
+              {/if}
             </div>
           {:else if activeDoc}
             {#if editorPanePromise}

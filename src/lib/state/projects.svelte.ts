@@ -14,6 +14,9 @@ export function mapProject(summary: BackendProjectSummary): Project {
     path: summary.path,
     shared: summary.shared,
     role: summary.role,
+    accessState: summary.accessState,
+    canEdit: summary.canEdit,
+    canManagePeers: summary.canManagePeers,
     peerCount: summary.peerCount,
   };
 }

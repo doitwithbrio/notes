@@ -152,7 +152,7 @@ impl Persistence {
             }
             Err(e) => {
                 log::warn!("Decryption failed for {doc_id}: {e}, trying backup");
-                self.try_recover_from_backup(project_name, doc_id, &path)
+                self.try_recover_encrypted_from_backup(project_name, doc_id, &path, epoch_key)
                     .await
             }
         }
@@ -218,6 +218,43 @@ impl Persistence {
         Ok(data)
     }
 
+    async fn try_recover_encrypted_from_backup(
+        &self,
+        project_name: &str,
+        doc_id: &DocId,
+        primary_path: &Path,
+        epoch_key: &[u8; 32],
+    ) -> Result<Vec<u8>, CoreError> {
+        let backup = self.backup_path(project_name, doc_id);
+        let raw = fs::read(&backup).await.map_err(|_| {
+            CoreError::InvalidData(format!(
+                "Primary and backup both unreadable for {doc_id}"
+            ))
+        })?;
+
+        if automerge::AutoCommit::load(&raw).is_ok() {
+            log::info!("Recovered plaintext doc {doc_id} from backup");
+            if let Err(e) = fs::copy(&backup, primary_path).await {
+                log::warn!("Failed to restore backup to primary: {e}");
+            }
+            return Ok(raw);
+        }
+
+        let doc_id_bytes = doc_id_to_bytes(doc_id);
+        match notes_crypto::decrypt_document(epoch_key, &doc_id_bytes, &raw) {
+            Ok((_epoch, plaintext)) if automerge::AutoCommit::load(&plaintext).is_ok() => {
+                log::info!("Recovered encrypted doc {doc_id} from backup");
+                if let Err(e) = fs::copy(&backup, primary_path).await {
+                    log::warn!("Failed to restore backup to primary: {e}");
+                }
+                Ok(plaintext)
+            }
+            _ => Err(CoreError::InvalidData(format!(
+                "Primary and backup both corrupted for {doc_id}"
+            ))),
+        }
+    }
+
     /// Delete a document file and its backup from disk.
     pub async fn delete_doc(
         &self,
@@ -233,6 +270,36 @@ impl Persistence {
         }
         match fs::remove_file(&backup).await {
             Ok(()) | Err(_) => {} // best-effort
+        }
+
+        Ok(())
+    }
+
+    pub async fn quarantine_broken_doc_artifacts(
+        &self,
+        project_name: &str,
+        doc_id: &DocId,
+    ) -> Result<(), CoreError> {
+        let ts = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
+        let path = self.doc_path(project_name, doc_id);
+        let backup = self.backup_path(project_name, doc_id);
+        let broken_path = self
+            .automerge_dir(project_name)
+            .join(format!("{}.automerge.corrupt-{}", doc_id, ts));
+        let broken_backup = self
+            .automerge_dir(project_name)
+            .join(format!("{}.automerge.bak.corrupt-{}", doc_id, ts));
+
+        match fs::rename(&path, &broken_path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(CoreError::Io(e)),
+        }
+
+        match fs::rename(&backup, &broken_backup).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(CoreError::Io(e)),
         }
 
         Ok(())
@@ -283,6 +350,28 @@ impl Persistence {
 
         log::debug!("Exported markdown: {relative_path}");
         Ok(())
+    }
+
+    pub async fn read_markdown_export(
+        &self,
+        project_name: &str,
+        relative_path: &str,
+    ) -> Result<String, CoreError> {
+        validation::validate_relative_path(relative_path)?;
+        let path = self.base_dir.join(project_name).join(relative_path);
+        let resolved = validation::ensure_within(&self.base_dir.join(project_name), &path)?;
+        Ok(fs::read_to_string(resolved).await?)
+    }
+
+    pub async fn markdown_export_exists(
+        &self,
+        project_name: &str,
+        relative_path: &str,
+    ) -> Result<bool, CoreError> {
+        validation::validate_relative_path(relative_path)?;
+        let path = self.base_dir.join(project_name).join(relative_path);
+        let resolved = validation::ensure_within(&self.base_dir.join(project_name), &path)?;
+        Ok(fs::try_exists(resolved).await.unwrap_or(false))
     }
 
     /// List all automerge document files in a project.

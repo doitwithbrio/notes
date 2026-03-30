@@ -145,12 +145,16 @@ export const CURSOR_COLORS = [
 export type ConnectionStatus = 'connected' | 'slow' | 'offline' | 'local';
 export type SyncStatus = 'synced' | 'syncing' | 'local-only';
 export type PeerRole = 'owner' | 'editor' | 'viewer';
+export type ProjectAccessState = 'local-owner' | 'owner' | 'editor' | 'viewer' | 'identity-mismatch';
 
 export interface BackendProjectSummary {
   name: string;
   path: string;
   shared: boolean;
-  role: PeerRole;
+  role: PeerRole | null;
+  accessState: ProjectAccessState;
+  canEdit: boolean;
+  canManagePeers: boolean;
   peerCount: number;
 }
 
@@ -159,6 +163,12 @@ export interface BackendDocInfo {
   path: string;
   fileType: 'note' | 'asset';
   created: string;
+}
+
+export interface BackendRecoverableDocCorruptionDetails {
+  docId: string;
+  notePath: string;
+  suggestedPath: string;
 }
 
 export interface BackendUnseenDocInfo {
@@ -309,7 +319,10 @@ export interface Project {
   name: string;
   path: string;
   shared: boolean;
-  role: PeerRole;
+  role: PeerRole | null;
+  accessState: ProjectAccessState;
+  canEdit: boolean;
+  canManagePeers: boolean;
   peerCount: number;
 }
 

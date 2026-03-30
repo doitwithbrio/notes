@@ -30,8 +30,18 @@ pub enum CoreError {
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 
+    #[error("This app instance is using a different device identity than the one authorized for this project")]
+    ProjectIdentityMismatch,
+
     #[error("Invalid document data: {0}")]
     InvalidData(String),
+
+    #[error("Document data is unreadable, but a markdown export is available for recovery")]
+    RecoverableDocCorruption {
+        doc_id: Uuid,
+        note_path: String,
+        suggested_path: String,
+    },
 
     #[error("Resource exhausted: {0}")]
     ResourceExhausted(String),
@@ -46,7 +56,7 @@ impl serde::Serialize for CoreError {
         S: serde::Serializer,
     {
         use serde::ser::SerializeMap;
-        let mut map = serializer.serialize_map(Some(2))?;
+        let mut map = serializer.serialize_map(Some(3))?;
 
         let code = match self {
             CoreError::DocNotFound(_) => "DOC_NOT_FOUND",
@@ -58,7 +68,9 @@ impl serde::Serialize for CoreError {
             CoreError::Io(_) => "IO_ERROR",
             CoreError::Serde(_) => "SERDE_ERROR",
             CoreError::InvalidInput(_) => "INVALID_INPUT",
+            CoreError::ProjectIdentityMismatch => "PROJECT_IDENTITY_MISMATCH",
             CoreError::InvalidData(_) => "INVALID_DATA",
+            CoreError::RecoverableDocCorruption { .. } => "DOC_CORRUPTED_RECOVERABLE",
             CoreError::ResourceExhausted(_) => "RESOURCE_EXHAUSTED",
         };
 
@@ -83,6 +95,30 @@ impl serde::Serialize for CoreError {
             other => other.to_string(),
         };
         map.serialize_entry("message", &message)?;
+
+        if let CoreError::RecoverableDocCorruption {
+            doc_id,
+            note_path,
+            suggested_path,
+        } = self
+        {
+            #[derive(serde::Serialize)]
+            #[serde(rename_all = "camelCase")]
+            struct RecoverableDocCorruptionDetails<'a> {
+                doc_id: String,
+                note_path: &'a str,
+                suggested_path: &'a str,
+            }
+
+            map.serialize_entry(
+                "details",
+                &RecoverableDocCorruptionDetails {
+                    doc_id: doc_id.to_string(),
+                    note_path,
+                    suggested_path,
+                },
+            )?;
+        }
         map.end()
     }
 }

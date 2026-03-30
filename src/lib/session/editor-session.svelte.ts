@@ -1,6 +1,6 @@
 import * as Automerge from '@automerge/automerge';
 
-import { tauriApi } from '../api/tauri.js';
+import { TauriCommandError, tauriApi } from '../api/tauri.js';
 import { TauriRuntimeUnavailableError } from '../runtime/tauri.js';
 import { getDocById, markDocUnread, setDocWordCount } from '../state/documents.svelte.js';
 import { createVersion, loadVersions, versionState } from '../state/versions.svelte.js';
@@ -43,6 +43,8 @@ export const editorSessionState = $state({
   loading: false,
   flushing: false,
   lastError: null as string | null,
+  lastErrorCode: null as string | null,
+  lastErrorDetails: null as Record<string, unknown> | null,
   revision: 0,
 });
 
@@ -210,6 +212,8 @@ export async function openEditorSession(projectId: string, docId: string) {
   const intentId = bumpSessionIntent();
   editorSessionState.loading = true;
   editorSessionState.lastError = null;
+  editorSessionState.lastErrorCode = null;
+  editorSessionState.lastErrorDetails = null;
   clearVersionPreview();
 
   return queueSessionTransition(async () => {
@@ -276,9 +280,19 @@ export async function openEditorSession(projectId: string, docId: string) {
       }
       if (error instanceof TauriRuntimeUnavailableError) {
         editorSessionState.lastError = null;
+        editorSessionState.lastErrorCode = null;
+        editorSessionState.lastErrorDetails = null;
         return;
       }
-      editorSessionState.lastError = error instanceof Error ? error.message : 'Failed to open note';
+      if (error instanceof TauriCommandError) {
+        editorSessionState.lastError = error.message;
+        editorSessionState.lastErrorCode = error.code;
+        editorSessionState.lastErrorDetails = error.details ?? null;
+      } else {
+        editorSessionState.lastError = error instanceof Error ? error.message : 'Failed to open note';
+        editorSessionState.lastErrorCode = null;
+        editorSessionState.lastErrorDetails = null;
+      }
       throw error;
     } finally {
       if (intentId === sessionIntentId) {
