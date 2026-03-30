@@ -23,6 +23,7 @@ const mockState = vi.hoisted(() => ({
     peers: [] as Array<{ id: string; online: boolean; cursorColor: string }>,
   },
   navigateToDoc: vi.fn(),
+  consoleError: vi.fn(),
   openShareDialog: vi.fn(),
   addTodo: vi.fn(),
   toggleTodo: vi.fn(),
@@ -84,6 +85,12 @@ describe('ProjectOverview', () => {
     mockState.presenceState.peers = [];
     mockState.navigateToDoc.mockReset();
     mockState.openShareDialog.mockReset();
+    mockState.consoleError.mockReset();
+    vi.spyOn(console, 'error').mockImplementation(mockState.consoleError);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   it('opens a note via the workspace router', async () => {
@@ -121,5 +128,26 @@ describe('ProjectOverview', () => {
     await fireEvent.click(screen.getByRole('button', { name: /share/i }));
 
     expect(mockState.openShareDialog).toHaveBeenCalledWith('project-1');
+  });
+
+  it('handles note open failures without leaking the rejection', async () => {
+    mockState.navigateToDoc.mockImplementation(async () => {
+      throw new Error('open failed');
+    });
+
+    render(ProjectOverview, {
+      project: {
+        id: 'project-1',
+        name: 'alpha',
+        path: 'alpha',
+        shared: false,
+        peerCount: 0,
+        role: 'owner',
+      },
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /alpha/i }));
+
+    expect(mockState.consoleError).toHaveBeenCalled();
   });
 });

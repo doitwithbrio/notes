@@ -99,23 +99,28 @@ describe('QuickOpen', () => {
     });
   });
 
-  it('moves selection one item per arrow key and opens only once on Enter', async () => {
+  it('moves selection one item per arrow key and ignores repeated Enter while opening', async () => {
     mockState.documentState.docs = [
       { id: 'doc-a', projectId: 'project-1', path: 'alpha.md', title: 'Alpha' },
       { id: 'doc-b', projectId: 'project-1', path: 'beta.md', title: 'Beta' },
       { id: 'doc-c', projectId: 'project-1', path: 'charlie.md', title: 'Charlie' },
     ];
+    const gate = deferred<void>();
+    mockState.navigateToDoc.mockImplementation(() => gate.promise);
 
     render(QuickOpen);
 
     const input = screen.getByPlaceholderText('search notes...');
     await fireEvent.keyDown(input, { key: 'ArrowDown' });
     await fireEvent.keyDown(input, { key: 'Enter' });
+    await fireEvent.keyDown(input, { key: 'Enter' });
 
     await waitFor(() => {
       expect(mockState.navigateToDoc).toHaveBeenCalledTimes(1);
       expect(mockState.navigateToDoc).toHaveBeenCalledWith('project-1', 'doc-b');
     });
+
+    gate.resolve();
   });
 
   it('closes when the backdrop is clicked', async () => {

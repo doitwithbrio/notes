@@ -6,11 +6,54 @@ on:
       - 'v*'
 
 jobs:
-  build:
+  verify-version:
+    runs-on: ubuntu-latest
     permissions:
       contents: write
-    runs-on: macos-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
 
+      - name: Verify version
+        id: version
+        run: |
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          CARGO_VER=$(python3 -c "import tomllib; print(tomllib.load(open('src-tauri/Cargo.toml', 'rb'))['package']['version'])")
+          CONF_VER=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+          if [ "$TAG_VER" != "$CARGO_VER" ] || [ "$TAG_VER" != "$CONF_VER" ]; then
+            echo "::error::Version mismatch: tag=$TAG_VER cargo=$CARGO_VER conf=$CONF_VER"
+            exit 1
+          fi
+          echo "version=$TAG_VER" >> "$GITHUB_OUTPUT"
+          echo "Version OK: $TAG_VER"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists"
+          else
+            NOTES=$(printf '%s\n' \
+              "- macOS: if you see 'unidentified developer', right-click the app and select Open." \
+              "- Linux (AppImage): download the .AppImage asset, run chmod +x on it, then launch it." \
+              "- Arch/Omarchy: if AppImage mounting fails, install fuse2 or run with --appimage-extract-and-run.")
+            gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "notes v${{ steps.version.outputs.version }}" \
+              --draft \
+              --notes "$NOTES"
+          fi
+
+  build-macos:
+    needs: verify-version
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    outputs:
+      updater_bundle: ${{ steps.bundle_meta.outputs.updater_bundle }}
+      updater_signature: ${{ steps.bundle_meta.outputs.updater_signature }}
     steps:
       - uses: actions/checkout@v4
 
@@ -31,29 +74,19 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Install Tauri CLI
-        run: bun add -g @tauri-apps/cli@latest
-
-      - name: Verify version
-        run: |
-          TAG_VER="${GITHUB_REF_NAME#v}"
-          CARGO_VER=$(grep '^version' src-tauri/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          CONF_VER=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
-          if [ "$TAG_VER" != "$CARGO_VER" ] || [ "$TAG_VER" != "$CONF_VER" ]; then
-            echo "::error::Version mismatch: tag=$TAG_VER cargo=$CARGO_VER conf=$CONF_VER"
-            exit 1
-          fi
-          echo "Version OK: $TAG_VER"
+        run: bun add -g @tauri-apps/cli@2
 
       - name: Build
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: tauri build --target aarch64-apple-darwin
 
       - name: Locate bundle
         id: bundle
         run: |
           BUNDLE_DIR="target/aarch64-apple-darwin/release/bundle"
-          APP=$(find "$BUNDLE_DIR/macos" -name "*.app" -maxdepth 1 | head -1)
+          APP=$(find "$BUNDLE_DIR/macos" -maxdepth 1 -name "*.app" | head -1)
           if [ -z "$APP" ]; then
             echo "::error::No .app bundle found in $BUNDLE_DIR/macos"
             ls -laR "$BUNDLE_DIR" || true
@@ -73,7 +106,7 @@ jobs:
         run: |
           DIR="${{ steps.bundle.outputs.dir }}/macos"
           APP_NAME=$(basename "${{ steps.bundle.outputs.app }}")
-          TAR=$(find "$DIR" -name "*.app.tar.gz" -maxdepth 1 | head -1)
+          TAR=$(find "$DIR" -maxdepth 1 -name "*.app.tar.gz" | head -1)
           TAR_BASE=$(basename "$TAR")
           (cd "$DIR" && rm -f "$TAR_BASE" && tar czf "$TAR_BASE" "$APP_NAME")
           echo "Repackaged: $TAR_BASE"
@@ -81,18 +114,19 @@ jobs:
       - name: Re-sign updater tarball
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           DIR="${{ steps.bundle.outputs.dir }}/macos"
-          TAR=$(find "$DIR" -name "*.app.tar.gz" -maxdepth 1 | head -1)
+          TAR=$(find "$DIR" -maxdepth 1 -name "*.app.tar.gz" | head -1)
           rm -f "${TAR}.sig"
-          tauri signer sign --private-key "$TAURI_SIGNING_PRIVATE_KEY" --password "" "$TAR"
+          tauri signer sign --private-key "$TAURI_SIGNING_PRIVATE_KEY" --password "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" "$TAR"
           echo "Signed: ${TAR}.sig"
 
       - name: Rebuild DMG with signed app
         run: |
           DIR="${{ steps.bundle.outputs.dir }}"
           APP="${{ steps.bundle.outputs.app }}"
-          DMG=$(find "$DIR/dmg" -name "*.dmg" -maxdepth 1 | head -1)
+          DMG=$(find "$DIR/dmg" -maxdepth 1 -name "*.dmg" | head -1)
           if [ -n "$DMG" ]; then
             DMG_NAME=$(basename "$DMG")
             APP_NAME=$(basename "$APP")
@@ -102,21 +136,19 @@ jobs:
             echo "Rebuilt DMG: $DMG_NAME"
           fi
 
-      - name: Get app version
-        id: version
+      - name: Capture updater metadata
+        id: bundle_meta
         run: |
-          VER=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
-          echo "version=$VER" >> "$GITHUB_OUTPUT"
-
-      - name: Create release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "notes v${{ steps.version.outputs.version }}" \
-            --notes '**macOS:** If you see "unidentified developer", right-click the app and select Open.' \
-            2>/dev/null || true
+          DIR="${{ steps.bundle.outputs.dir }}/macos"
+          TAR=$(find "$DIR" -maxdepth 1 -name "*.app.tar.gz" | head -1)
+          SIG_FILE="${TAR}.sig"
+          {
+            echo "updater_bundle=$(basename "$TAR")"
+            echo "updater_signature<<EOF"
+            cat "$SIG_FILE"
+            echo
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Upload assets
         env:
@@ -133,36 +165,144 @@ jobs:
             fi
           done
 
-      - name: Generate and upload latest.json
+  build-linux:
+    needs: verify-version
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    outputs:
+      updater_bundle: ${{ steps.bundle_meta.outputs.updater_bundle }}
+      updater_signature: ${{ steps.bundle_meta.outputs.updater_signature }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            file \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev \
+            libxdo-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Install Tauri CLI
+        run: bun add -g @tauri-apps/cli@2
+
+      - name: Build AppImage
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: tauri build --bundles appimage
+
+      - name: Capture updater metadata
+        id: bundle_meta
+        run: |
+          DIR="target/release/bundle/appimage"
+          shopt -s nullglob
+          APPS=("$DIR"/*.AppImage)
+          SIGS=("$DIR"/*.AppImage.sig)
+          if [ "${#APPS[@]}" -ne 1 ] || [ "${#SIGS[@]}" -ne 1 ]; then
+            echo "::error::Missing AppImage or signature in $DIR"
+            ls -laR "$DIR" || true
+            exit 1
+          fi
+          APP="${APPS[0]}"
+          SIG_FILE="${SIGS[0]}"
+          {
+            echo "updater_bundle=$(basename "$APP")"
+            echo "updater_signature<<EOF"
+            cat "$SIG_FILE"
+            echo
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          DIR="target/release/bundle/appimage"
           TAG="$GITHUB_REF_NAME"
           REPO="$GITHUB_REPOSITORY"
-          VER="${TAG#v}"
-          DIR="${{ steps.bundle.outputs.dir }}/macos"
-          BASE="https://github.com/${REPO}/releases/download/${TAG}"
+
+          for f in "$DIR"/*.AppImage "$DIR"/*.AppImage.sig; do
+            if [ -f "$f" ]; then
+              echo "Uploading: $(basename "$f")"
+              gh release upload "$TAG" "$f" --repo "$REPO" --clobber
+            fi
+          done
+
+  upload-latest-json:
+    needs:
+      - verify-version
+      - build-macos
+      - build-linux
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Generate latest.json
+        run: |
+          export NOW
           NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-          TAR_NAME=$(basename "$(find "$DIR" -name "*.app.tar.gz" -maxdepth 1 | head -1)")
-          SIG_FILE=$(find "$DIR" -name "*.app.tar.gz.sig" -maxdepth 1 | head -1)
-          SIG=$(cat "$SIG_FILE")
+          python3 - <<'PY'
+          import json
+          import os
 
-          python3 -c "
-          import json, sys
           data = {
-              'version': sys.argv[1],
-              'pub_date': sys.argv[2],
-              'platforms': {
-                  'darwin-aarch64': {
-                      'url': sys.argv[3] + '/' + sys.argv[4],
-                      'signature': sys.argv[5]
-                  }
-              }
+              "version": os.environ["VER"],
+              "pub_date": os.environ["NOW"],
+              "platforms": {
+                  "darwin-aarch64": {
+                      "url": f"{os.environ['BASE']}/{os.environ['MAC_BUNDLE']}",
+                      "signature": os.environ["MAC_SIG"],
+                  },
+                  "linux-x86_64": {
+                      "url": f"{os.environ['BASE']}/{os.environ['LINUX_BUNDLE']}",
+                      "signature": os.environ["LINUX_SIG"],
+                  },
+              },
           }
-          with open('/tmp/latest.json', 'w') as f:
+
+          with open("/tmp/latest.json", "w", encoding="utf-8") as f:
               json.dump(data, f, indent=2)
           print(json.dumps(data, indent=2))
-          " "$VER" "$NOW" "$BASE" "$TAR_NAME" "$SIG"
+          PY
+        env:
+          VER: ${{ needs.verify-version.outputs.version }}
+          BASE: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}
+          MAC_BUNDLE: ${{ needs.build-macos.outputs.updater_bundle }}
+          MAC_SIG: ${{ needs.build-macos.outputs.updater_signature }}
+          LINUX_BUNDLE: ${{ needs.build-linux.outputs.updater_bundle }}
+          LINUX_SIG: ${{ needs.build-linux.outputs.updater_signature }}
 
-          gh release upload "$TAG" /tmp/latest.json --repo "$REPO" --clobber
+      - name: Upload latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" /tmp/latest.json --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false

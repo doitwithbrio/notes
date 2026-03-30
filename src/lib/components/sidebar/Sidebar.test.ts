@@ -28,6 +28,7 @@ const mockState = vi.hoisted(() => ({
     applyChanges: vi.fn(async () => undefined),
     saveDoc: vi.fn(async () => undefined),
     closeDoc: vi.fn(async () => undefined),
+    deleteNote: vi.fn(async () => undefined),
     renameNote: vi.fn(async () => undefined),
   },
   loadProjectDocs: vi.fn(async () => undefined),
@@ -52,6 +53,7 @@ const mockState = vi.hoisted(() => ({
   handleMovedDoc: vi.fn(),
   navigateToDoc: vi.fn(async () => undefined),
   navigateToProject: vi.fn(async () => undefined),
+  consoleError: vi.fn(),
 }));
 
 vi.mock('../../actions/sortable.js', () => ({ sortable: () => ({ destroy() {} }) }));
@@ -115,21 +117,26 @@ describe('Sidebar doc reconciliation', () => {
     mockState.handleMovedDoc.mockReset();
     mockState.navigateToDoc.mockReset();
     mockState.loadProjectDocs.mockReset();
+    mockState.consoleError.mockReset();
     mockState.tauriApi.createNote.mockReset();
     mockState.tauriApi.getDocBinary.mockReset();
     mockState.tauriApi.openDoc.mockReset();
     mockState.tauriApi.applyChanges.mockReset();
     mockState.tauriApi.saveDoc.mockReset();
     mockState.tauriApi.closeDoc.mockReset();
+    mockState.tauriApi.deleteNote.mockReset();
     mockState.tauriApi.createNote.mockImplementation(async () => 'doc-new');
     mockState.tauriApi.getDocBinary.mockImplementation(async () => new Uint8Array([1]));
     mockState.tauriApi.openDoc.mockImplementation(async () => undefined);
     mockState.tauriApi.applyChanges.mockImplementation(async () => undefined);
     mockState.tauriApi.saveDoc.mockImplementation(async () => undefined);
     mockState.tauriApi.closeDoc.mockImplementation(async () => undefined);
+    mockState.tauriApi.deleteNote.mockImplementation(async () => undefined);
+    vi.spyOn(console, 'error').mockImplementation(mockState.consoleError);
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     cleanup();
   });
 
@@ -219,5 +226,57 @@ describe('Sidebar doc reconciliation', () => {
     });
 
     expect(mockState.navigateToDoc).not.toHaveBeenCalled();
+  });
+
+  it('handles direct doc-open failures without unhandled rejections', async () => {
+    mockState.navigateToDoc.mockImplementation(async () => {
+      throw new Error('open failed');
+    });
+    render(Sidebar);
+
+    await fireEvent.click(screen.getByTestId('doc-open-doc-a'));
+
+    expect(mockState.consoleError).toHaveBeenCalled();
+  });
+
+  it('does not delete the source doc when copying content during move fails', async () => {
+    mockState.tauriApi.applyChanges.mockImplementationOnce(async () => {
+      throw new Error('copy failed');
+    });
+    render(Sidebar);
+
+    await fireEvent.click(screen.getByTestId('doc-menu-doc-a'));
+    await fireEvent.click(screen.getByTestId('menu-item-move to... > Project 2'));
+
+    await waitFor(() => {
+      expect(mockState.tauriApi.deleteNote).toHaveBeenCalledWith('project-2', 'doc-new');
+      expect(mockState.deleteDoc).not.toHaveBeenCalled();
+      expect(mockState.clearMovedDoc).toHaveBeenCalledWith({ fromProjectId: 'project-1', fromDocId: 'doc-a' });
+      expect(mockState.handleMovedDoc).not.toHaveBeenCalled();
+      expect(mockState.navigateToDoc).toHaveBeenCalledWith('project-1', 'doc-a');
+    });
+  });
+
+  it('keeps the destination route when a post-delete reload step fails', async () => {
+    mockState.loadProjectDocs
+      .mockImplementationOnce(async () => undefined)
+      .mockImplementationOnce(async () => {
+        throw new Error('reload failed');
+      });
+    render(Sidebar);
+
+    await fireEvent.click(screen.getByTestId('doc-menu-doc-a'));
+    await fireEvent.click(screen.getByTestId('menu-item-move to... > Project 2'));
+
+    await waitFor(() => {
+      expect(mockState.deleteDoc).toHaveBeenCalledWith('project-1', 'doc-a');
+      expect(mockState.handleMovedDoc).toHaveBeenCalledWith({
+        fromProjectId: 'project-1',
+        fromDocId: 'doc-a',
+        toProjectId: 'project-2',
+        toDocId: 'doc-new',
+      });
+      expect(mockState.navigateToDoc).toHaveBeenCalledWith('project-2', 'doc-new');
+    });
   });
 });

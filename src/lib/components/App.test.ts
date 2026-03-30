@@ -1,20 +1,34 @@
-import { cleanup, render, screen, waitFor } from '@testing-library/svelte';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import App from './App.svelte';
 
 const mockState = vi.hoisted(() => ({
   appSessionState: { ready: true, error: null as string | null },
-  editorSessionState: { loading: false },
+  editorSessionState: {
+    loading: false,
+    lastError: null as string | null,
+    projectId: null as string | null,
+    docId: null as string | null,
+  },
   uiState: { sidebarOpen: true, rightSidebarOpen: false, quickOpenVisible: false },
   projectState: { projects: [{ id: 'project-1', name: 'Project 1' }] },
-  inviteState: { shareDialogOpen: false, joinDialogOpen: false },
+  inviteState: {
+    shareDialogOpen: false,
+    joinDialogOpen: false,
+    pendingJoinResumes: [] as unknown[],
+    latestInviteEvent: null as null | Record<string, unknown>,
+  },
   route: null as
     | null
     | { kind: 'project'; projectId: string }
     | { kind: 'doc'; projectId: string; docId: string; mode: 'live' },
   selectedDoc: null as null | { id: string; projectId: string; title: string },
   reconcileMissingSelectedDoc: vi.fn(),
+  navigateToDoc: vi.fn(async () => undefined),
+  navigateToProject: vi.fn(async () => undefined),
+  resumePendingJoins: vi.fn(async () => undefined),
+  clearInviteBanner: vi.fn(),
 }));
 
 vi.mock('../state/app-session.svelte.js', () => ({
@@ -44,6 +58,8 @@ vi.mock('../state/projects.svelte.js', () => ({
 
 vi.mock('../state/invite.svelte.js', () => ({
   inviteState: mockState.inviteState,
+  resumePendingJoins: mockState.resumePendingJoins,
+  clearInviteBanner: mockState.clearInviteBanner,
 }));
 
 vi.mock('../utils/platform.js', () => ({
@@ -54,6 +70,8 @@ vi.mock('../navigation/workspace-router.svelte.js', () => ({
   getWorkspaceRoute: () => mockState.route,
   getSelectedDoc: () => mockState.selectedDoc,
   isProjectRoute: (route: unknown) => !!route && (route as { kind?: string }).kind === 'project',
+  navigateToDoc: mockState.navigateToDoc,
+  navigateToProject: mockState.navigateToProject,
   reconcileMissingSelectedDoc: mockState.reconcileMissingSelectedDoc,
 }));
 
@@ -67,7 +85,16 @@ describe('App fallback behavior', () => {
     mockState.route = null;
     mockState.selectedDoc = null;
     mockState.editorSessionState.loading = false;
+    mockState.editorSessionState.lastError = null;
+    mockState.editorSessionState.projectId = null;
+    mockState.editorSessionState.docId = null;
+    mockState.inviteState.pendingJoinResumes = [];
+    mockState.inviteState.latestInviteEvent = null;
     mockState.reconcileMissingSelectedDoc.mockReset();
+    mockState.navigateToDoc.mockReset();
+    mockState.navigateToProject.mockReset();
+    mockState.resumePendingJoins.mockReset();
+    mockState.clearInviteBanner.mockReset();
   });
 
   afterEach(() => {
@@ -103,5 +130,77 @@ describe('App fallback behavior', () => {
       expect(screen.getByTestId('editor-loading')).toBeTruthy();
     });
     expect(mockState.reconcileMissingSelectedDoc).not.toHaveBeenCalled();
+  });
+
+  it('shows a dedicated failed-open state for a selected doc without a loaded session', async () => {
+    mockState.route = { kind: 'doc', projectId: 'project-1', docId: 'doc-a', mode: 'live' };
+    mockState.selectedDoc = { id: 'doc-a', projectId: 'project-1', title: 'ideas' };
+    mockState.editorSessionState.lastError = 'Failed to open note';
+
+    render(App);
+
+    expect(screen.getByTestId('editor-open-failed').textContent).toContain('could not open ideas');
+    expect(screen.queryByTestId('editor-loading')).toBeNull();
+  });
+
+  it('retries opening a selected doc from the failed-open state', async () => {
+    mockState.route = { kind: 'doc', projectId: 'project-1', docId: 'doc-a', mode: 'live' };
+    mockState.selectedDoc = { id: 'doc-a', projectId: 'project-1', title: 'ideas' };
+    mockState.editorSessionState.lastError = 'Failed to open note';
+
+    render(App);
+    await fireEvent.click(screen.getByTestId('editor-open-retry'));
+
+    expect(mockState.navigateToDoc).toHaveBeenCalledWith('project-1', 'doc-a');
+    expect(mockState.navigateToProject).not.toHaveBeenCalled();
+  });
+
+  it('opens the invite banner project using the local project name key', async () => {
+    mockState.inviteState.latestInviteEvent = {
+      stage: 'completed',
+      localProjectName: 'Project 1',
+      projectName: 'Remote Project',
+      role: 'editor',
+    };
+
+    render(App);
+    await fireEvent.click(screen.getByText('open project'));
+
+    expect(mockState.navigateToProject).toHaveBeenCalledWith('Project 1');
+    expect(mockState.clearInviteBanner).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries pending joins for failed invite events even without pending resume entries', async () => {
+    mockState.inviteState.latestInviteEvent = {
+      stage: 'failed',
+      projectName: 'Remote Project',
+      error: 'timed out',
+    };
+
+    render(App);
+    await fireEvent.click(screen.getByText('retry'));
+
+    expect(mockState.resumePendingJoins).toHaveBeenCalledTimes(1);
+    expect(mockState.clearInviteBanner).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows the resume banner when a pending join session exists', () => {
+    mockState.inviteState.pendingJoinResumes = [
+      {
+        sessionId: 'session-1',
+        ownerPeerId: 'owner-peer',
+        projectId: 'project-1',
+        projectName: 'Remote Project',
+        localProjectName: 'Project 1',
+        role: 'editor',
+        stage: 'payload-staged',
+        updatedAt: new Date().toISOString(),
+      },
+    ];
+
+    render(App);
+
+    expect(screen.getByTestId('invite-banner').textContent).toContain('finishing join for Project 1');
+    expect(screen.getByText('retry')).toBeTruthy();
   });
 });

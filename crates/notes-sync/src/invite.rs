@@ -357,7 +357,6 @@ pub struct InviteHandler {
     accepted_tx: tokio::sync::broadcast::Sender<InviteAccepted>,
     lifecycle: Option<Arc<dyn InviteLifecycleHandler>>,
     persistence: Option<Arc<dyn InvitePersistenceHandler>>,
-    wrong_attempts: Arc<DashMap<String, u32>>,
     #[cfg(test)]
     completed_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -380,7 +379,6 @@ impl InviteHandler {
             accepted_tx,
             lifecycle: None,
             persistence: None,
-            wrong_attempts: Arc::new(DashMap::new()),
             #[cfg(test)]
             completed_tx,
         }
@@ -430,33 +428,6 @@ impl InviteHandler {
         }
         self.pending.insert(passphrase, invite);
         Ok(())
-    }
-
-    fn wrong_attempts_for(&self, invitee_peer_id: &str) -> u32 {
-        self.wrong_attempts
-            .get(invitee_peer_id)
-            .map(|entry| *entry.value())
-            .unwrap_or(0)
-    }
-
-    fn register_wrong_attempt(&self, invitee_peer_id: &str) -> InviteError {
-        let attempts = if let Some(mut entry) = self.wrong_attempts.get_mut(invitee_peer_id) {
-            *entry += 1;
-            *entry
-        } else {
-            self.wrong_attempts.insert(invitee_peer_id.to_string(), 1);
-            1
-        };
-
-        if attempts >= MAX_HANDSHAKE_ATTEMPTS {
-            InviteError::Exhausted
-        } else {
-            InviteError::VerificationFailed
-        }
-    }
-
-    fn clear_wrong_attempts(&self, invitee_peer_id: &str) {
-        self.wrong_attempts.remove(invitee_peer_id);
     }
 
     /// Remove expired/exhausted invites.
@@ -684,11 +655,6 @@ impl InviteHandler {
         connection: Connection,
         deadline: Instant,
     ) -> Result<(), InviteError> {
-        let remote_peer_id = connection.remote_id().to_string();
-        if self.wrong_attempts_for(&remote_peer_id) >= MAX_HANDSHAKE_ATTEMPTS {
-            return Err(InviteError::Exhausted);
-        }
-
         let deadline_tokio = tokio::time::Instant::from_std(deadline);
         let (mut send, mut recv) = tokio::time::timeout_at(deadline_tokio, connection.accept_bi())
             .await
@@ -807,11 +773,9 @@ impl InviteHandler {
                     "Invite handler: SPAKE2 handshake failed — no matching passphrase among {pending_count} pending invite(s). \
                      The invitee sent a code that doesn't match any active invite."
                 );
-                return Err(self.register_wrong_attempt(&remote_peer_id));
+                return Err(InviteError::VerificationFailed);
             }
         };
-
-        self.clear_wrong_attempts(&remote_peer_id);
 
         if let Some(invite) = self.pending.get(&passphrase) {
             if let InviteState::CommittedPendingAck(committed) = &invite.state {
@@ -1035,7 +999,6 @@ impl iroh::protocol::ProtocolHandler for InviteHandler {
             accepted_tx: self.accepted_tx.clone(),
             lifecycle: self.lifecycle.clone(),
             persistence: self.persistence.clone(),
-            wrong_attempts: Arc::clone(&self.wrong_attempts),
             #[cfg(test)]
             completed_tx: self.completed_tx.clone(),
         };
@@ -1450,36 +1413,6 @@ mod tests {
 
         let retry = harness.run_invitee(passphrase, Some(1)).await;
         assert!(retry.is_ok(), "invite should still be usable after wrong passphrase");
-
-        harness.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn test_wrong_passphrase_attempts_exhaust_invitee() {
-        let passphrase = "attempt-limit-correct-ocean-frost-canyon";
-        let wrong_passphrase = "attempt-limit-wrong-ocean-frost-canyon";
-        let harness = InviteTestHarness::new(vec![
-            (
-                passphrase.to_string(),
-                make_pending_invite(
-                    "owner-peer".to_string(),
-                    passphrase,
-                    "attempt-limit-project",
-                    "proj-attempt-limit",
-                    vec![9; 128],
-                ),
-            ),
-        ], None)
-        .await;
-
-        for _ in 0..MAX_HANDSHAKE_ATTEMPTS {
-            let result = harness.run_invitee(wrong_passphrase, None).await;
-            assert!(result.is_err(), "wrong passphrase should fail");
-            harness.wait_for_connection_completion().await;
-        }
-
-        let retry = harness.run_invitee(passphrase, Some(1)).await;
-        assert!(retry.is_err(), "invitee should be rate-limited after repeated wrong attempts");
 
         harness.shutdown().await;
     }

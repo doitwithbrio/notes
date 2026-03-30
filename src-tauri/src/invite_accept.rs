@@ -15,6 +15,7 @@ use notes_sync::invite::{
 use notes_sync::peer_manager::PeerManager;
 use notes_sync::sync_engine::SyncEngine;
 use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -22,6 +23,98 @@ pub struct AcceptInviteResult {
     pub project_id: String,
     pub project_name: String,
     pub role: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingJoinResumeStatus {
+    pub session_id: String,
+    pub owner_peer_id: String,
+    pub project_id: String,
+    pub project_name: String,
+    pub local_project_name: String,
+    pub role: String,
+    pub stage: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnerInviteStatus {
+    pub invite_id: String,
+    pub project_id: String,
+    pub project_name: String,
+    pub role: String,
+    pub expires_at: String,
+    pub phase: String,
+    pub invitee_peer_id: Option<String>,
+    pub session_id: Option<String>,
+}
+
+pub fn list_pending_join_resumes(
+    join_session_store: &JoinSessionStore,
+) -> Result<Vec<PendingJoinResumeStatus>, CoreError> {
+    Ok(join_session_store
+        .load_all()?
+        .into_iter()
+        .map(|session| PendingJoinResumeStatus {
+            session_id: session.session_id,
+            owner_peer_id: session.owner_peer_id,
+            project_id: session.project_id,
+            project_name: session.project_name,
+            local_project_name: session.local_project_name,
+            role: session.role,
+            stage: join_stage_label(&session.stage).to_string(),
+            updated_at: session.updated_at.to_rfc3339(),
+        })
+        .collect())
+}
+
+pub fn list_owner_invites_from_store(
+    owner_invite_store: &OwnerInviteStateStore,
+    project_name: Option<&str>,
+) -> Result<Vec<OwnerInviteStatus>, CoreError> {
+    Ok(owner_invite_store
+        .load_all()?
+        .into_iter()
+        .filter(|record| project_name.is_none_or(|name| name == record.project_name))
+        .map(|record| {
+            let (invitee_peer_id, session_id) = match &record.phase {
+                PersistedOwnerInvitePhase::Reserved {
+                    invitee_peer_id,
+                    session_id,
+                    ..
+                }
+                | PersistedOwnerInvitePhase::PreparedAckReceived {
+                    invitee_peer_id,
+                    session_id,
+                    ..
+                }
+                | PersistedOwnerInvitePhase::CommittedPendingAck {
+                    invitee_peer_id,
+                    session_id,
+                    ..
+                }
+                | PersistedOwnerInvitePhase::Consumed {
+                    invitee_peer_id,
+                    session_id,
+                    ..
+                } => (Some(invitee_peer_id.clone()), Some(session_id.clone())),
+                PersistedOwnerInvitePhase::Open => (None, None),
+            };
+
+            OwnerInviteStatus {
+                invite_id: record.invite_id,
+                project_id: record.project_id,
+                project_name: record.project_name,
+                role: record.role,
+                expires_at: record.expires_at.to_rfc3339(),
+                phase: owner_phase_label(&record.phase).to_string(),
+                invitee_peer_id,
+                session_id,
+            }
+        })
+        .collect())
 }
 
 pub struct InviteAcceptanceSession {
@@ -268,6 +361,49 @@ impl OwnerInvitePersistence {
             .into_iter()
             .any(|peer| peer.peer_id == invitee_peer_id && peer.role == expected_role))
     }
+
+    pub fn list_owner_invites(&self, project_name: Option<&str>) -> Result<Vec<OwnerInviteStatus>, CoreError> {
+        let mut out = Vec::new();
+        for record in self.store.load_all()? {
+            if project_name.is_some_and(|name| name != record.project_name) {
+                continue;
+            }
+            let (invitee_peer_id, session_id) = match &record.phase {
+                PersistedOwnerInvitePhase::Reserved {
+                    invitee_peer_id,
+                    session_id,
+                    ..
+                }
+                | PersistedOwnerInvitePhase::PreparedAckReceived {
+                    invitee_peer_id,
+                    session_id,
+                    ..
+                }
+                | PersistedOwnerInvitePhase::CommittedPendingAck {
+                    invitee_peer_id,
+                    session_id,
+                    ..
+                }
+                | PersistedOwnerInvitePhase::Consumed {
+                    invitee_peer_id,
+                    session_id,
+                    ..
+                } => (Some(invitee_peer_id.clone()), Some(session_id.clone())),
+                PersistedOwnerInvitePhase::Open => (None, None),
+            };
+            out.push(OwnerInviteStatus {
+                invite_id: record.invite_id,
+                project_id: record.project_id,
+                project_name: record.project_name,
+                role: record.role,
+                expires_at: record.expires_at.to_rfc3339(),
+                phase: owner_phase_label(&record.phase).to_string(),
+                invitee_peer_id,
+                session_id,
+            });
+        }
+        Ok(out)
+    }
 }
 
 fn restore_instant(timestamp: chrono::DateTime<Utc>) -> std::time::Instant {
@@ -275,6 +411,33 @@ fn restore_instant(timestamp: chrono::DateTime<Utc>) -> std::time::Instant {
     std::time::Instant::now()
         .checked_sub(elapsed)
         .unwrap_or_else(std::time::Instant::now)
+}
+
+fn emit_invite_accept_event(
+    app_handle: Option<&AppHandle>,
+    event: notes_sync::events::InviteAcceptEvent,
+) {
+    if let Some(handle) = app_handle {
+        let _ = handle.emit(notes_sync::events::event_names::INVITE_ACCEPT_STATUS, event);
+    }
+}
+
+fn join_stage_label(stage: &PersistedJoinStage) -> &'static str {
+    match stage {
+        PersistedJoinStage::PayloadStaged { .. } => "payload-staged",
+        PersistedJoinStage::CommitConfirmed { .. } => "commit-confirmed",
+        PersistedJoinStage::Finalized { .. } => "finalized",
+    }
+}
+
+fn owner_phase_label(phase: &PersistedOwnerInvitePhase) -> &'static str {
+    match phase {
+        PersistedOwnerInvitePhase::Open => "open",
+        PersistedOwnerInvitePhase::Reserved { .. } => "reserved",
+        PersistedOwnerInvitePhase::PreparedAckReceived { .. } => "prepared-ack-received",
+        PersistedOwnerInvitePhase::CommittedPendingAck { .. } => "committed-pending-ack",
+        PersistedOwnerInvitePhase::Consumed { .. } => "consumed",
+    }
 }
 
 impl InvitePersistenceHandler for OwnerInvitePersistence {
@@ -733,6 +896,7 @@ pub async fn resume_join_sessions(
     sync_engine: Arc<SyncEngine>,
     peer_manager: Arc<PeerManager>,
     endpoint: Endpoint,
+    app_handle: Option<AppHandle>,
 ) {
     let sessions = match join_session_store.load_all() {
         Ok(sessions) => sessions,
@@ -745,6 +909,20 @@ pub async fn resume_join_sessions(
     for session in sessions {
         match session.stage {
             PersistedJoinStage::PayloadStaged { .. } => {
+                emit_invite_accept_event(
+                    app_handle.as_ref(),
+                    notes_sync::events::InviteAcceptEvent {
+                        stage: notes_sync::events::InviteAcceptStage::Resuming,
+                        source: notes_sync::events::InviteAcceptSource::Resume,
+                        session_id: session.session_id.clone(),
+                        owner_peer_id: session.owner_peer_id.clone(),
+                        project_id: session.project_id.clone(),
+                        project_name: session.project_name.clone(),
+                        local_project_name: Some(session.local_project_name.clone()),
+                        role: session.role.clone(),
+                        error: None,
+                    },
+                );
                 let Some(passphrase) = join_session_store.load_secret(&session.session_id).ok().flatten() else {
                     log::warn!("Missing secret for staged join session {}; dropping", session.session_id);
                     delete_join_session(&join_session_store, &session.session_id);
@@ -768,6 +946,20 @@ pub async fn resume_join_sessions(
                     Ok(resume_session) => resume_session,
                     Err(err) => {
                         log::warn!("Failed to resume staged join session: {err}");
+                        emit_invite_accept_event(
+                            app_handle.as_ref(),
+                            notes_sync::events::InviteAcceptEvent {
+                                stage: notes_sync::events::InviteAcceptStage::Failed,
+                                source: notes_sync::events::InviteAcceptSource::Resume,
+                                session_id: session.session_id.clone(),
+                                owner_peer_id: session.owner_peer_id.clone(),
+                                project_id: session.project_id.clone(),
+                                project_name: session.project_name.clone(),
+                                local_project_name: Some(session.local_project_name.clone()),
+                                role: session.role.clone(),
+                                error: Some(err.to_string()),
+                            },
+                        );
                         continue;
                     }
                 };
@@ -815,6 +1007,20 @@ pub async fn resume_join_sessions(
                 )
                 .await
                 {
+                    emit_invite_accept_event(
+                        app_handle.as_ref(),
+                        notes_sync::events::InviteAcceptEvent {
+                            stage: notes_sync::events::InviteAcceptStage::Finalized,
+                            source: notes_sync::events::InviteAcceptSource::Resume,
+                            session_id: session.session_id.clone(),
+                            owner_peer_id: session.owner_peer_id.clone(),
+                            project_id: session.project_id.clone(),
+                            project_name: session.project_name.clone(),
+                            local_project_name: Some(session.local_project_name.clone()),
+                            role: session.role.clone(),
+                            error: None,
+                        },
+                    );
                     let _ = persist_finalized_session(
                         &join_session_store,
                         &payload.session_id,
@@ -824,6 +1030,20 @@ pub async fn resume_join_sessions(
                     );
                     if send_applied_ack(resume_session).await.is_ok() {
                         delete_join_session(&join_session_store, &session.session_id);
+                        emit_invite_accept_event(
+                            app_handle.as_ref(),
+                            notes_sync::events::InviteAcceptEvent {
+                                stage: notes_sync::events::InviteAcceptStage::Completed,
+                                source: notes_sync::events::InviteAcceptSource::Resume,
+                                session_id: session.session_id.clone(),
+                                owner_peer_id: session.owner_peer_id.clone(),
+                                project_id: session.project_id.clone(),
+                                project_name: session.project_name.clone(),
+                                local_project_name: Some(session.local_project_name.clone()),
+                                role: session.role.clone(),
+                                error: None,
+                            },
+                        );
                     }
                     spawn_initial_invite_sync(
                         Arc::clone(&project_manager),
@@ -834,6 +1054,20 @@ pub async fn resume_join_sessions(
                 }
             }
             PersistedJoinStage::CommitConfirmed { .. } => {
+                emit_invite_accept_event(
+                    app_handle.as_ref(),
+                    notes_sync::events::InviteAcceptEvent {
+                        stage: notes_sync::events::InviteAcceptStage::Resuming,
+                        source: notes_sync::events::InviteAcceptSource::Resume,
+                        session_id: session.session_id.clone(),
+                        owner_peer_id: session.owner_peer_id.clone(),
+                        project_id: session.project_id.clone(),
+                        project_name: session.project_name.clone(),
+                        local_project_name: Some(session.local_project_name.clone()),
+                        role: session.role.clone(),
+                        error: None,
+                    },
+                );
                 let payload: InvitePayload = match serde_json::from_str(&session.payload) {
                     Ok(payload) => payload,
                     Err(err) => {
@@ -888,9 +1122,37 @@ pub async fn resume_join_sessions(
                 .is_ok()
                 {
                     delete_join_session(&join_session_store, &session.session_id);
+                    emit_invite_accept_event(
+                        app_handle.as_ref(),
+                        notes_sync::events::InviteAcceptEvent {
+                            stage: notes_sync::events::InviteAcceptStage::Completed,
+                            source: notes_sync::events::InviteAcceptSource::Resume,
+                            session_id: session.session_id.clone(),
+                            owner_peer_id: session.owner_peer_id.clone(),
+                            project_id: session.project_id.clone(),
+                            project_name: session.project_name.clone(),
+                            local_project_name: Some(session.local_project_name.clone()),
+                            role: session.role.clone(),
+                            error: None,
+                        },
+                    );
                 }
             }
             PersistedJoinStage::Finalized { .. } => {
+                emit_invite_accept_event(
+                    app_handle.as_ref(),
+                    notes_sync::events::InviteAcceptEvent {
+                        stage: notes_sync::events::InviteAcceptStage::Resuming,
+                        source: notes_sync::events::InviteAcceptSource::Resume,
+                        session_id: session.session_id.clone(),
+                        owner_peer_id: session.owner_peer_id.clone(),
+                        project_id: session.project_id.clone(),
+                        project_name: session.project_name.clone(),
+                        local_project_name: Some(session.local_project_name.clone()),
+                        role: session.role.clone(),
+                        error: None,
+                    },
+                );
                 if let Ok(Some(passphrase)) = join_session_store.load_secret(&session.session_id) {
                     if let Ok(resume_session) = resume_owner_commit_status(
                         endpoint.clone(),
@@ -901,6 +1163,20 @@ pub async fn resume_join_sessions(
                     {
                         if send_applied_ack(resume_session).await.is_ok() {
                             delete_join_session(&join_session_store, &session.session_id);
+                            emit_invite_accept_event(
+                                app_handle.as_ref(),
+                                notes_sync::events::InviteAcceptEvent {
+                                    stage: notes_sync::events::InviteAcceptStage::Completed,
+                                    source: notes_sync::events::InviteAcceptSource::Resume,
+                                    session_id: session.session_id.clone(),
+                                    owner_peer_id: session.owner_peer_id.clone(),
+                                    project_id: session.project_id.clone(),
+                                    project_name: session.project_name.clone(),
+                                    local_project_name: Some(session.local_project_name.clone()),
+                                    role: session.role.clone(),
+                                    error: None,
+                                },
+                            );
                         }
                     }
                 }
@@ -1164,7 +1440,7 @@ pub async fn finalize_accepted_invite(
         }
         if let Ok(doc_arc) = pm.doc_store().get_doc(&doc_id) {
             sync_engine.register_doc(doc_id, doc_arc);
-            populate_doc_acl_from_parts(&project_manager, &sync_engine, &endpoint, &local_project_name, doc_id).await;
+            populate_doc_acl_from_parts(&project_manager, &sync_engine, &endpoint.id(), &local_project_name, doc_id).await;
         }
     }
 
@@ -1229,6 +1505,7 @@ pub async fn accept_invite_impl(
     peer_manager: Arc<PeerManager>,
     join_session_store: Arc<JoinSessionStore>,
     endpoint: Endpoint,
+    app_handle: Option<AppHandle>,
     passphrase: String,
     owner_peer_id: String,
 ) -> Result<AcceptInviteResult, CoreError> {
@@ -1243,6 +1520,20 @@ pub async fn accept_invite_impl(
         &local_project_name,
         &passphrase,
     )?;
+    emit_invite_accept_event(
+        app_handle.as_ref(),
+        notes_sync::events::InviteAcceptEvent {
+            stage: notes_sync::events::InviteAcceptStage::PayloadStaged,
+            source: notes_sync::events::InviteAcceptSource::Interactive,
+            session_id: session.payload.session_id.clone(),
+            owner_peer_id: session.peer_id.to_string(),
+            project_id: session.payload.project_id.clone(),
+            project_name: session.payload.project_name.clone(),
+            local_project_name: Some(local_project_name.clone()),
+            role: session.payload.role.clone(),
+            error: None,
+        },
+    );
     let session = await_owner_commit_result(session, &join_session_store, &local_project_name).await?;
     let (result, doc_ids) = finalize_accepted_invite(
         Arc::clone(&project_manager),
@@ -1252,6 +1543,20 @@ pub async fn accept_invite_impl(
         staged,
     )
     .await?;
+    emit_invite_accept_event(
+        app_handle.as_ref(),
+        notes_sync::events::InviteAcceptEvent {
+            stage: notes_sync::events::InviteAcceptStage::Finalized,
+            source: notes_sync::events::InviteAcceptSource::Interactive,
+            session_id: session.payload.session_id.clone(),
+            owner_peer_id: session.peer_id.to_string(),
+            project_id: session.payload.project_id.clone(),
+            project_name: session.payload.project_name.clone(),
+            local_project_name: Some(result.project_name.clone()),
+            role: result.role.clone(),
+            error: None,
+        },
+    );
     persist_finalized_session(
         &join_session_store,
         &session.payload.session_id,
@@ -1259,13 +1564,42 @@ pub async fn accept_invite_impl(
         &session.peer_id.to_string(),
         &local_project_name,
     )?;
+    let owner_peer_id_str = session.peer_id.to_string();
     if let Err(err) = send_applied_ack(session).await {
         log::warn!(
             "Invite finalize succeeded for project {} but applied ack failed: {err}",
             result.project_name
         );
+        emit_invite_accept_event(
+            app_handle.as_ref(),
+            notes_sync::events::InviteAcceptEvent {
+                stage: notes_sync::events::InviteAcceptStage::Failed,
+                source: notes_sync::events::InviteAcceptSource::Interactive,
+                session_id,
+                owner_peer_id: owner_peer_id_str.clone(),
+                project_id: result.project_id.clone(),
+                project_name: result.project_name.clone(),
+                local_project_name: Some(result.project_name.clone()),
+                role: result.role.clone(),
+                error: Some(err.to_string()),
+            },
+        );
     } else {
         delete_join_session(&join_session_store, &session_id);
+        emit_invite_accept_event(
+            app_handle.as_ref(),
+            notes_sync::events::InviteAcceptEvent {
+                stage: notes_sync::events::InviteAcceptStage::Completed,
+                source: notes_sync::events::InviteAcceptSource::Interactive,
+                session_id,
+                owner_peer_id: owner_peer_id_str,
+                project_id: result.project_id.clone(),
+                project_name: result.project_name.clone(),
+                local_project_name: Some(result.project_name.clone()),
+                role: result.role.clone(),
+                error: None,
+            },
+        );
     }
     spawn_initial_invite_sync(project_manager, peer_manager, result.project_name.clone(), doc_ids);
     Ok(result)
@@ -1293,13 +1627,13 @@ pub fn hex_decode_32(hex: &str) -> Result<[u8; 32], CoreError> {
 pub async fn populate_doc_acl_from_parts(
     project_manager: &Arc<ProjectManager>,
     sync_engine: &Arc<SyncEngine>,
-    endpoint: &Endpoint,
+    local_peer_id: &iroh::EndpointId,
     project: &str,
     doc_id: DocId,
 ) {
     use notes_sync::sync_engine::PeerRole as SyncPeerRole;
 
-    sync_engine.set_peer_role(doc_id, endpoint.id(), SyncPeerRole::Owner);
+    sync_engine.set_peer_role(doc_id, *local_peer_id, SyncPeerRole::Owner);
 
     if let Ok(peers) = project_manager.get_project_peers(project).await {
         for peer in peers {

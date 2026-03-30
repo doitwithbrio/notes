@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 pub mod invite_accept;
@@ -23,8 +23,9 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 use tauri_plugin_updater::UpdaterExt;
 
 use crate::invite_accept::{
-    accept_invite_impl, populate_doc_acl_from_parts, resume_join_sessions, AcceptInviteResult,
-    OwnerInviteCoordinator, OwnerInvitePersistence,
+    accept_invite_impl, list_owner_invites_from_store, list_pending_join_resumes,
+    populate_doc_acl_from_parts, resume_join_sessions, AcceptInviteResult, OwnerInviteCoordinator,
+    OwnerInvitePersistence, OwnerInviteStatus, PendingJoinResumeStatus,
 };
 
 /// Shared app state accessible from all Tauri commands.
@@ -43,13 +44,34 @@ struct AppState {
     blob_store: Arc<notes_sync::blobs::BlobStore>,
     /// Stable device actor ID (hex string) for the frontend to use.
     device_actor_hex: String,
+    /// Stable local peer ID available before router startup completes.
+    local_peer_id: String,
+    /// Persistent local secret key used for signing and endpoint binding.
+    secret_key: iroh::SecretKey,
     /// Channel to trigger auto-sync when documents change.
     sync_trigger: tokio::sync::mpsc::Sender<(String, DocId)>,
-    /// Count of local changes not yet confirmed synced to at least one peer.
-    unsent_changes: Arc<Mutex<HashMap<DocId, u32>>>,
+    /// Receiver consumed once during deferred networking startup.
+    sync_receiver: Mutex<Option<tokio::sync::mpsc::Receiver<(String, DocId)>>>,
+    /// Local-vs-synced change counters per doc for truthful unsent tracking.
+    unsent_changes: Arc<Mutex<HashMap<DocId, UnsentChangesState>>>,
     endpoint: Endpoint,
-    router: Router,
+    router: Mutex<Option<Router>>,
+    network_status: RwLock<NetworkStatus>,
     app_handle: tauri::AppHandle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NetworkStatus {
+    NotStarted,
+    Starting,
+    Ready,
+    Failed(String),
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct UnsentChangesState {
+    local_changes: u32,
+    synced_changes: u32,
 }
 
 fn require_version_store(
@@ -61,6 +83,7 @@ fn require_version_store(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GenerateInviteResult {
+    invite_id: String,
     passphrase: String,
     peer_id: String,
     expires_at: String,
@@ -112,27 +135,48 @@ fn pending_unsent_changes(state: &AppState, doc_id: DocId) -> u32 {
         .unsent_changes
         .lock()
         .ok()
-        .and_then(|map| map.get(&doc_id).copied())
+        .and_then(|map| {
+            map.get(&doc_id)
+                .map(|entry| entry.local_changes.saturating_sub(entry.synced_changes))
+        })
         .unwrap_or(0)
 }
 
 fn add_unsent_changes(state: &AppState, doc_id: DocId, delta: u32) -> u32 {
+    if delta == 0 {
+        return pending_unsent_changes(state, doc_id);
+    }
+
     let mut map = state
         .unsent_changes
         .lock()
         .expect("unsent changes mutex poisoned");
-    let entry = map.entry(doc_id).or_insert(0);
-    *entry = entry.saturating_add(delta.max(1));
-    *entry
+    let entry = map.entry(doc_id).or_default();
+    entry.local_changes = entry.local_changes.saturating_add(delta);
+    entry.local_changes.saturating_sub(entry.synced_changes)
 }
 
-fn clear_unsent_changes(state: &AppState, doc_id: DocId) -> u32 {
+fn synced_checkpoint(state: &AppState, doc_id: DocId) -> u32 {
+    state
+        .unsent_changes
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&doc_id).map(|entry| entry.local_changes))
+        .unwrap_or(0)
+}
+
+fn mark_unsent_changes_synced(state: &AppState, doc_id: DocId, synced_through: u32) -> u32 {
     let mut map = state
         .unsent_changes
         .lock()
         .expect("unsent changes mutex poisoned");
-    map.remove(&doc_id);
-    0
+    let entry = map.entry(doc_id).or_default();
+    entry.synced_changes = entry.synced_changes.max(synced_through).min(entry.local_changes);
+    let pending = entry.local_changes.saturating_sub(entry.synced_changes);
+    if pending == 0 {
+        map.remove(&doc_id);
+    }
+    pending
 }
 
 fn sync_state_for_project(peer_manager: &PeerManager, project: &str) -> events::SyncState {
@@ -164,6 +208,151 @@ fn emit_sync_status(
     );
 }
 
+fn network_status_message(status: &NetworkStatus) -> &'static str {
+    match status {
+        NetworkStatus::NotStarted | NetworkStatus::Starting => "networking is still starting",
+        NetworkStatus::Ready => "networking is ready",
+        NetworkStatus::Failed(_) => "networking failed to initialize",
+    }
+}
+
+async fn load_seen_state_or_default(project_dir: &std::path::Path) -> notes_core::ProjectSeenState {
+    match notes_core::SeenStateManager::load(project_dir).await {
+        Ok(state) => state,
+        Err(error) => {
+            log::warn!(
+                "Failed to load seen state for {}: {error}. Continuing with empty seen state.",
+                project_dir.display()
+            );
+            notes_core::ProjectSeenState::default()
+        }
+    }
+}
+
+async fn save_seen_state_best_effort(
+    project_dir: &std::path::Path,
+    state: &notes_core::ProjectSeenState,
+) {
+    if let Err(error) = notes_core::SeenStateManager::save(project_dir, state).await {
+        log::warn!(
+            "Failed to save seen state for {}: {error}. Continuing without persisting seen state.",
+            project_dir.display()
+        );
+    }
+}
+
+async fn mark_seen_heads_best_effort(
+    project_manager: &ProjectManager,
+    project: &str,
+    doc_id: DocId,
+    heads: Vec<String>,
+) {
+    let project_dir = project_manager.persistence().project_dir(project);
+    let mut seen_state = load_seen_state_or_default(&project_dir).await;
+    seen_state.mark_seen_heads(&doc_id, heads);
+    save_seen_state_best_effort(&project_dir, &seen_state).await;
+}
+
+async fn get_unseen_docs_for_project(
+    project_manager: &ProjectManager,
+    project: &str,
+) -> Result<Vec<notes_core::UnseenDocInfo>, CoreError> {
+    notes_core::validate_project_name(project)?;
+    let project_dir = project_manager.persistence().project_dir(project);
+    let seen_state = load_seen_state_or_default(&project_dir).await;
+    let files = project_manager.list_files(project).await?;
+
+    let mut results = Vec::new();
+    for file in files {
+        if let Err(_) = project_manager.open_doc(project, &file.id).await {
+            results.push(notes_core::UnseenDocInfo {
+                doc_id: file.id,
+                path: file.path,
+                has_unseen_changes: false,
+                last_seen_at: seen_state.last_seen_at(&file.id),
+            });
+            continue;
+        }
+
+        let doc_arc = project_manager.doc_store().get_doc(&file.id)?;
+        let mut doc = doc_arc.write().await;
+        let has_unseen = seen_state.has_unseen_changes(&file.id, &mut doc);
+
+        results.push(notes_core::UnseenDocInfo {
+            doc_id: file.id,
+            path: file.path,
+            has_unseen_changes: has_unseen,
+            last_seen_at: seen_state.last_seen_at(&file.id),
+        });
+    }
+
+    Ok(results)
+}
+
+async fn mark_doc_seen_for_project(
+    project_manager: &ProjectManager,
+    project: &str,
+    doc_id: DocId,
+) -> Result<(), CoreError> {
+    project_manager.open_doc(project, &doc_id).await?;
+
+    let current_heads = {
+        let doc_arc = project_manager.doc_store().get_doc(&doc_id)?;
+        let mut doc = doc_arc.write().await;
+        doc.get_heads()
+            .iter()
+            .map(|head| head.to_string())
+            .collect::<Vec<_>>()
+    };
+
+    mark_seen_heads_best_effort(project_manager, project, doc_id, current_heads).await;
+
+    Ok(())
+}
+
+fn require_network_ready_status(status: &NetworkStatus) -> Result<(), CoreError> {
+    match status {
+        NetworkStatus::Ready => Ok(()),
+        NetworkStatus::Failed(message) => Err(CoreError::InvalidData(format!(
+            "networking failed to initialize: {message}"
+        ))),
+        other => Err(CoreError::InvalidData(network_status_message(other).into())),
+    }
+}
+
+fn begin_network_startup(status: &RwLock<NetworkStatus>) -> bool {
+    let mut current = status
+        .write()
+        .expect("network status lock poisoned");
+    if !matches!(*current, NetworkStatus::NotStarted) {
+        return false;
+    }
+    *current = NetworkStatus::Starting;
+    true
+}
+
+fn require_network_ready(state: &AppState) -> Result<(), CoreError> {
+    let status = state
+        .network_status
+        .read()
+        .expect("network status lock poisoned");
+    require_network_ready_status(&status)
+}
+
+fn set_network_status(state: &AppState, status: NetworkStatus) {
+    if let Ok(mut current) = state.network_status.write() {
+        *current = status;
+    }
+}
+
+fn is_network_ready(state: &AppState) -> bool {
+    state
+        .network_status
+        .read()
+        .map(|status| matches!(*status, NetworkStatus::Ready))
+        .unwrap_or(false)
+}
+
 // ── Authorization Helpers ────────────────────────────────────────────
 
 /// Minimum role required for an operation.
@@ -183,7 +372,7 @@ async fn check_role(
     project: &str,
     min_role: MinRole,
 ) -> Result<(), CoreError> {
-    let my_peer_id = state.endpoint.id().to_string();
+    let my_peer_id = state.local_peer_id.clone();
     let owner = state
         .project_manager
         .get_project_owner(project)
@@ -240,7 +429,7 @@ async fn create_project(
 ) -> Result<(), CoreError> {
     state.project_manager.create_project(&name).await?;
 
-    let my_peer_id = state.endpoint.id().to_string();
+    let my_peer_id = state.local_peer_id.clone();
     let manifest_arc = state.project_manager.get_manifest_for_ui(&name)?;
     let manifest_data = {
         let mut manifest = manifest_arc.write().await;
@@ -261,7 +450,7 @@ async fn create_project(
 async fn list_project_summaries(
     state: State<'_, AppState>,
 ) -> Result<Vec<ProjectSummary>, CoreError> {
-    let my_peer_id = state.endpoint.id().to_string();
+    let my_peer_id = state.local_peer_id.clone();
     state.project_manager.list_project_summaries(&my_peer_id).await
 }
 
@@ -291,6 +480,11 @@ async fn open_project(
                     .map(|id| (id, p.peer_id.clone()))
             })
             .collect();
+
+        if !is_network_ready(&state) {
+            log::debug!("Skipping peer restore for project {name} because networking is not ready yet");
+            return Ok(());
+        }
 
         for (peer_id, _) in &peer_ids {
             state.peer_manager.add_peer_to_project(&name, *peer_id);
@@ -458,7 +652,7 @@ async fn add_project_todo(
     linked_doc_id: Option<String>,
 ) -> Result<String, CoreError> {
     check_role(&state, &project, MinRole::Editor).await?;
-    let my_peer_id = state.endpoint.id().to_string();
+    let my_peer_id = state.local_peer_id.clone();
     let manifest_arc = state.project_manager.get_manifest_for_ui(&project)?;
     let (todo_id, data) = {
         let mut manifest = manifest_arc.write().await;
@@ -718,7 +912,7 @@ async fn apply_changes(
     // These signatures are stored in the SyncEngine and transmitted
     // as sidecar SignatureBatch messages during sync.
     {
-        let secret_key = state.endpoint.secret_key();
+        let secret_key = state.secret_key.clone();
         for (hash, raw_bytes) in &applied.new_changes {
             let signed = notes_crypto::SignedChange::sign(&secret_key, raw_bytes);
             let sig = notes_sync::protocol::ChangeSignature {
@@ -733,10 +927,7 @@ async fn apply_changes(
     }
 
     // Mark doc as seen after local edits, but keep disk I/O outside the doc lock.
-    let project_dir = state.project_manager.persistence().project_dir(&project);
-    let mut seen_state = notes_core::SeenStateManager::load(&project_dir).await?;
-    seen_state.mark_seen_heads(&doc_id, applied.current_heads);
-    notes_core::SeenStateManager::save(&project_dir, &seen_state).await?;
+    mark_seen_heads_best_effort(&state.project_manager, &project, doc_id, applied.current_heads).await;
 
     let unsent_delta = applied.new_changes.len() as u32;
     let should_track_unsent = !state.peer_manager.get_project_peers(&project).is_empty();
@@ -811,44 +1002,7 @@ async fn get_unseen_docs(
     state: State<'_, AppState>,
     project: String,
 ) -> Result<Vec<notes_core::UnseenDocInfo>, CoreError> {
-    notes_core::validate_project_name(&project)?;
-    // Load seen state for this project
-    let project_dir = state
-        .project_manager
-        .persistence()
-        .project_dir(&project);
-    let seen_state = notes_core::SeenStateManager::load(&project_dir).await?;
-
-    // List all files
-    let files = state.project_manager.list_files(&project).await?;
-
-    let mut results = Vec::new();
-    for file in files {
-        // We need the doc loaded to check heads — try to load if not already
-        if let Err(_) = state.project_manager.open_doc(&project, &file.id).await {
-            // Can't load — report as no unseen
-            results.push(notes_core::UnseenDocInfo {
-                doc_id: file.id,
-                path: file.path,
-                has_unseen_changes: false,
-                last_seen_at: seen_state.last_seen_at(&file.id),
-            });
-            continue;
-        }
-
-        let doc_arc = state.project_manager.doc_store().get_doc(&file.id)?;
-        let mut doc = doc_arc.write().await;
-        let has_unseen = seen_state.has_unseen_changes(&file.id, &mut doc);
-
-        results.push(notes_core::UnseenDocInfo {
-            doc_id: file.id,
-            path: file.path,
-            has_unseen_changes: has_unseen,
-            last_seen_at: seen_state.last_seen_at(&file.id),
-        });
-    }
-
-    Ok(results)
+    get_unseen_docs_for_project(&state.project_manager, &project).await
 }
 
 /// Mark a document as "seen" (user has opened and viewed it).
@@ -859,27 +1013,7 @@ async fn mark_doc_seen(
     project: String,
     doc_id: DocId,
 ) -> Result<(), CoreError> {
-    state.project_manager.open_doc(&project, &doc_id).await?;
-
-    let project_dir = state
-        .project_manager
-        .persistence()
-        .project_dir(&project);
-
-    let current_heads = {
-        let doc_arc = state.project_manager.doc_store().get_doc(&doc_id)?;
-        let mut doc = doc_arc.write().await;
-        doc.get_heads()
-            .iter()
-            .map(|head| head.to_string())
-            .collect::<Vec<_>>()
-    };
-
-    let mut seen_state = notes_core::SeenStateManager::load(&project_dir).await?;
-    seen_state.mark_seen_heads(&doc_id, current_heads);
-    notes_core::SeenStateManager::save(&project_dir, &seen_state).await?;
-
-    Ok(())
+    mark_doc_seen_for_project(&state.project_manager, &project, doc_id).await
 }
 
 // ── Blame Commands ──────────────────────────────────────────────────
@@ -1181,7 +1315,6 @@ async fn restore_to_version_cmd(
     drop(doc);
 
     // Mark seen so restore doesn't appear as "unseen changes"
-    let project_dir = state.project_manager.persistence().project_dir(&project);
     let current_heads = {
         let doc_arc = state.project_manager.doc_store().get_doc(&doc_id)?;
         let mut doc = doc_arc.write().await;
@@ -1191,9 +1324,7 @@ async fn restore_to_version_cmd(
             .collect::<Vec<_>>()
     };
 
-    let mut seen_state = notes_core::SeenStateManager::load(&project_dir).await?;
-    seen_state.mark_seen_heads(&doc_id, current_heads);
-    notes_core::SeenStateManager::save(&project_dir, &seen_state).await?;
+    mark_seen_heads_best_effort(&state.project_manager, &project, doc_id, current_heads).await;
 
     state.project_manager.doc_store().mark_dirty(&doc_id);
     let _ = state.sync_trigger.send((project, doc_id)).await;
@@ -1237,11 +1368,12 @@ async fn search_project_notes(
 
 #[tauri::command]
 async fn get_peer_id(state: State<'_, AppState>) -> Result<String, CoreError> {
-    Ok(state.endpoint.id().to_string())
+    Ok(state.local_peer_id.clone())
 }
 
 #[tauri::command]
 async fn get_peer_addr(state: State<'_, AppState>) -> Result<String, CoreError> {
+    require_network_ready(&state)?;
     Ok(format!("{:?}", state.endpoint.addr()))
 }
 
@@ -1251,6 +1383,7 @@ async fn sync_with_peer(
     peer_addr: String,
     doc_id: DocId,
 ) -> Result<(), CoreError> {
+    require_network_ready(&state)?;
     if state.sync_engine.is_network_blocked() {
         return Err(CoreError::InvalidData("network blocked".into()));
     }
@@ -1288,6 +1421,7 @@ async fn add_peer(
 ) -> Result<(), CoreError> {
     notes_core::validate_project_name(&project)?;
     check_role(&state, &project, MinRole::Owner).await?;
+    require_network_ready(&state)?;
     let peer_id: iroh::EndpointId = peer_id_str
         .parse()
         .map_err(|e| CoreError::InvalidInput(format!("invalid peer ID: {e}")))?;
@@ -1338,6 +1472,7 @@ async fn remove_peer(
 ) -> Result<(), CoreError> {
     notes_core::validate_project_name(&project)?;
     check_role(&state, &project, MinRole::Owner).await?;
+    require_network_ready(&state)?;
     let peer_id: iroh::EndpointId = peer_id_str
         .parse()
         .map_err(|e| CoreError::InvalidInput(format!("invalid peer ID: {e}")))?;
@@ -1404,6 +1539,9 @@ async fn sync_doc_with_project(
     doc_id: DocId,
 ) -> Result<serde_json::Value, CoreError> {
     notes_core::validate_project_name(&project)?;
+    require_network_ready(&state)?;
+    let sync_checkpoint = synced_checkpoint(&state, doc_id);
+
     emit_sync_status(
         &state.app_handle,
         doc_id,
@@ -1420,9 +1558,11 @@ async fn sync_doc_with_project(
     let fail_count = results.iter().filter(|(_, r)| r.is_err()).count();
 
     // Emit final status
-    if success_count > 0 {
-        clear_unsent_changes(&state, doc_id);
-    }
+    let unsent_after = if success_count > 0 {
+        mark_unsent_changes_synced(&state, doc_id, sync_checkpoint)
+    } else {
+        pending_unsent_changes(&state, doc_id)
+    };
 
     let sync_state = if success_count > 0 {
         events::SyncState::Synced
@@ -1436,7 +1576,7 @@ async fn sync_doc_with_project(
         &state.app_handle,
         doc_id,
         sync_state,
-        pending_unsent_changes(&state, doc_id),
+        unsent_after,
     );
 
     Ok(serde_json::json!({
@@ -1452,7 +1592,6 @@ async fn get_peer_status(
     project: String,
 ) -> Result<Vec<PeerStatusSummary>, CoreError> {
     notes_core::validate_project_name(&project)?;
-    let peers = state.peer_manager.get_project_peers(&project);
 
     // Get manifest peer metadata for alias/role lookup
     let manifest_peers = state
@@ -1466,16 +1605,18 @@ async fn get_peer_status(
         .collect();
 
     let mut statuses = Vec::new();
-    for peer_id in peers {
-        let connected = state.peer_manager.is_peer_connected(&peer_id);
-        let peer_id_str = peer_id.to_string();
-        let meta = peer_map.get(&peer_id_str);
-
+    for meta in peer_map.values() {
+        let connected = meta
+            .peer_id
+            .parse::<iroh::EndpointId>()
+            .ok()
+            .map(|peer_id| is_network_ready(&state) && state.peer_manager.is_peer_connected(&peer_id))
+            .unwrap_or(false);
         statuses.push(PeerStatusSummary {
-            peer_id: peer_id_str,
+            peer_id: meta.peer_id.clone(),
             connected,
-            alias: meta.map(|m| m.alias.clone()),
-            role: meta.map(|m| m.role),
+            alias: Some(meta.alias.clone()),
+            role: Some(meta.role),
             active_doc: None,
         });
     }
@@ -1494,6 +1635,7 @@ async fn broadcast_presence(
     cursor_pos: Option<u64>,
     selection: Option<(u64, u64)>,
 ) -> Result<(), CoreError> {
+    require_network_ready(&state)?;
     let settings = notes_core::AppSettings::load(
         state.project_manager.persistence().base_dir(),
     )
@@ -1503,7 +1645,7 @@ async fn broadcast_presence(
     let _ = state.app_handle.emit(
         events::event_names::PRESENCE_UPDATE,
         events::PresenceEvent {
-            peer_id: state.endpoint.id().to_string(),
+            peer_id: state.local_peer_id.clone(),
             alias: settings.display_name,
             active_doc,
             cursor_pos,
@@ -1520,6 +1662,7 @@ async fn e2e_set_network_blocked(
     blocked: bool,
 ) -> Result<(), CoreError> {
     ensure_e2e_mode()?;
+    require_network_ready(&state)?;
     state.sync_engine.set_network_blocked(blocked);
     state.peer_manager.set_network_blocked(blocked);
     Ok(())
@@ -1579,12 +1722,13 @@ async fn generate_invite(
             "invite role must be 'editor' or 'viewer'".into(),
         ));
     }
+    require_network_ready(&state)?;
     // Only the owner (or first sharer) can generate invites
     check_role(&state, &project, MinRole::Owner).await?;
     let _files = state.project_manager.list_files(&project).await?;
 
     // Set owner in manifest (if not already set) and get manifest data
-    let my_peer_id = state.endpoint.id().to_string();
+    let my_peer_id = state.local_peer_id.clone();
     let manifest_arc = state.project_manager.get_manifest_for_ui(&project)?;
     let (manifest_data, project_id) = {
         let mut manifest = manifest_arc.write().await;
@@ -1605,15 +1749,16 @@ async fn generate_invite(
         .await?;
 
     let passphrase = notes_sync::invite::generate_passphrase(6);
-    let peer_id = state.endpoint.id().to_string();
+    let peer_id = state.local_peer_id.clone();
     let invite_ttl = notes_sync::invite::current_invite_ttl();
     let expires_at = chrono::Utc::now() + chrono::Duration::from_std(invite_ttl)
         .map_err(|e| CoreError::InvalidData(format!("invalid invite ttl: {e}")))?;
 
     // Register a lightweight PendingInvite. The actual payload is built later
     // from current state by OwnerInviteCoordinator so it cannot go stale.
+    let invite_id = uuid::Uuid::new_v4().to_string();
     let pending = notes_sync::invite::PendingInvite {
-        invite_id: uuid::Uuid::new_v4().to_string(),
+        invite_id: invite_id.clone(),
         code: notes_sync::invite::InviteCode {
             passphrase: passphrase.clone(),
             peer_id: peer_id.clone(),
@@ -1634,6 +1779,7 @@ async fn generate_invite(
     log::info!("Generated invite for project {project}");
 
     Ok(GenerateInviteResult {
+        invite_id,
         passphrase,
         peer_id,
         expires_at: expires_at.to_rfc3339(),
@@ -1646,22 +1792,59 @@ async fn accept_invite(
     passphrase: String,
     owner_peer_id: String,
 ) -> Result<AcceptInviteResult, CoreError> {
+    require_network_ready(&state)?;
     accept_invite_impl(
         Arc::clone(&state.project_manager),
         Arc::clone(&state.sync_engine),
         Arc::clone(&state.peer_manager),
         Arc::clone(&state.join_session_store),
         state.endpoint.clone(),
+        Some(state.app_handle.clone()),
         passphrase,
         owner_peer_id,
     )
     .await
 }
+
+#[tauri::command]
+async fn list_pending_join_resumes_cmd(
+    state: State<'_, AppState>,
+) -> Result<Vec<PendingJoinResumeStatus>, CoreError> {
+    list_pending_join_resumes(&state.join_session_store)
+}
+
+#[tauri::command]
+async fn resume_pending_joins_cmd(state: State<'_, AppState>) -> Result<(), CoreError> {
+    require_network_ready(&state)?;
+    resume_join_sessions(
+        Arc::clone(&state.join_session_store),
+        Arc::clone(&state.project_manager),
+        Arc::clone(&state.sync_engine),
+        Arc::clone(&state.peer_manager),
+        state.endpoint.clone(),
+        Some(state.app_handle.clone()),
+    )
+    .await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn list_owner_invites_cmd(
+    state: State<'_, AppState>,
+    project: Option<String>,
+) -> Result<Vec<OwnerInviteStatus>, CoreError> {
+    list_owner_invites_from_store(&state.owner_invite_store, project.as_deref())
+}
 async fn populate_doc_acl(state: &AppState, project: &str, doc_id: DocId) {
+    let Ok(local_peer_id) = state.local_peer_id.parse::<iroh::EndpointId>() else {
+        log::warn!("Skipping ACL population for doc {doc_id} because local peer id is invalid");
+        return;
+    };
+
     populate_doc_acl_from_parts(
         &state.project_manager,
         &state.sync_engine,
-        &state.endpoint,
+        &local_peer_id,
         project,
         doc_id,
     )
@@ -1882,6 +2065,253 @@ fn load_or_create_secret_key(
     Ok(key)
 }
 
+fn start_deferred_networking(app_handle: AppHandle) {
+    let (endpoint, sync_engine, peer_manager, invite_handler, project_manager, join_session_store, sync_receiver, unsent_changes, sync_trigger) = {
+        let state = app_handle.state::<AppState>();
+        if !begin_network_startup(&state.network_status) {
+            return;
+        }
+
+        let sync_receiver = match state.sync_receiver.lock() {
+            Ok(mut receiver) => receiver.take(),
+            Err(_) => None,
+        };
+
+        (
+            state.endpoint.clone(),
+            Arc::clone(&state.sync_engine),
+            Arc::clone(&state.peer_manager),
+            Arc::clone(&state.invite_handler),
+            Arc::clone(&state.project_manager),
+            Arc::clone(&state.join_session_store),
+            sync_receiver,
+            Arc::clone(&state.unsent_changes),
+            state.sync_trigger.clone(),
+        )
+    };
+    let app_handle_clone = app_handle;
+
+    tauri::async_runtime::spawn(async move {
+        let Some(mut sync_rx) = sync_receiver else {
+            let managed = app_handle_clone.state::<AppState>();
+            set_network_status(&managed, NetworkStatus::Failed("sync worker was already started".into()));
+            log::error!("Deferred networking startup failed: sync worker receiver unavailable");
+            return;
+        };
+
+        log::info!("Starting deferred networking runtime");
+
+        let router = Router::builder(endpoint.clone())
+            .accept(NOTES_SYNC_ALPN, Arc::clone(&sync_engine))
+            .accept(INVITE_ALPN, Arc::clone(&invite_handler))
+            .spawn();
+
+        {
+            let managed = app_handle_clone.state::<AppState>();
+            if let Ok(mut router_slot) = managed.router.lock() {
+                *router_slot = Some(router.clone());
+            }
+            set_network_status(&managed, NetworkStatus::Ready);
+        }
+
+        log::info!("iroh router started");
+
+        tauri::async_runtime::spawn(resume_join_sessions(
+            Arc::clone(&join_session_store),
+            Arc::clone(&project_manager),
+            Arc::clone(&sync_engine),
+            Arc::clone(&peer_manager),
+            endpoint.clone(),
+            Some(app_handle_clone.clone()),
+        ));
+
+        tauri::async_runtime::spawn({
+            let peer_mgr = Arc::clone(&peer_manager);
+            let interval_ms = peer_monitor_interval_ms();
+            async move {
+                peer_mgr.monitoring_loop(Duration::from_millis(interval_ms)).await;
+            }
+        });
+
+        tauri::async_runtime::spawn({
+            let peer_mgr = Arc::clone(&peer_manager);
+            let handle = app_handle_clone.clone();
+            let debounce_ms = sync_debounce_ms();
+            let unsent_changes = Arc::clone(&unsent_changes);
+            async move {
+                loop {
+                    let first = match sync_rx.recv().await {
+                        Some(v) => v,
+                        None => break,
+                    };
+                    tokio::time::sleep(Duration::from_millis(debounce_ms)).await;
+                    let mut to_sync = std::collections::HashSet::new();
+                    to_sync.insert(first);
+                    while let Ok(item) = sync_rx.try_recv() {
+                        to_sync.insert(item);
+                    }
+                    for (project, doc_id) in to_sync {
+                        let sync_checkpoint = unsent_changes
+                            .lock()
+                            .ok()
+                            .and_then(|map| map.get(&doc_id).map(|entry| entry.local_changes))
+                            .unwrap_or(0);
+                        let pending = unsent_changes
+                            .lock()
+                            .ok()
+                            .and_then(|map| map.get(&doc_id).copied())
+                            .map(|entry| entry.local_changes.saturating_sub(entry.synced_changes))
+                            .unwrap_or(0);
+                        emit_sync_status(&handle, doc_id, events::SyncState::Syncing, pending);
+
+                        let results = peer_mgr.sync_doc_with_project_peers(&project, doc_id).await;
+                        let ok = results.iter().filter(|(_, r)| r.is_ok()).count();
+                        let fail = results.iter().filter(|(_, r)| r.is_err()).count();
+
+                        if ok > 0 {
+                            if let Ok(mut map) = unsent_changes.lock() {
+                                let entry = map.entry(doc_id).or_default();
+                                entry.synced_changes = entry.synced_changes.max(sync_checkpoint).min(entry.local_changes);
+                                if entry.local_changes.saturating_sub(entry.synced_changes) == 0 {
+                                    map.remove(&doc_id);
+                                }
+                            }
+                        }
+
+                        let sync_state = if ok > 0 {
+                            events::SyncState::Synced
+                        } else if fail > 0 {
+                            events::SyncState::LocalOnly
+                        } else {
+                            events::SyncState::LocalOnly
+                        };
+
+                        let pending = unsent_changes
+                            .lock()
+                            .ok()
+                            .and_then(|map| {
+                                map.get(&doc_id)
+                                    .map(|entry| entry.local_changes.saturating_sub(entry.synced_changes))
+                            })
+                            .unwrap_or(0);
+                        emit_sync_status(&handle, doc_id, sync_state, pending);
+
+                        if ok > 0 {
+                            log::debug!("Auto-synced doc {doc_id} with {ok} peers");
+                        }
+                    }
+                }
+            }
+        });
+
+        tauri::async_runtime::spawn({
+            let mut rx = peer_manager.subscribe_peer_status();
+            let handle = app_handle_clone.clone();
+            let pm = Arc::clone(&project_manager);
+            let peer_mgr = Arc::clone(&peer_manager);
+            let sync_tx = sync_trigger.clone();
+            async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(status_event) => {
+                            let connected_peer = reconnect_peer_id(&status_event);
+                            log::debug!(
+                                "Peer status change: {} -> {:?}",
+                                status_event.peer_id,
+                                status_event.state
+                            );
+                            let _ = handle.emit(events::event_names::PEER_STATUS, status_event);
+
+                            if let Some(peer_id) = connected_peer {
+                                for project_name in peer_mgr.get_projects_for_peer(&peer_id) {
+                                    match pm.list_files(&project_name).await {
+                                        Ok(files) => {
+                                            let stats = try_queue_reconnect_syncs(&sync_tx, &project_name, &files);
+                                            if stats.dropped > 0 {
+                                                log::warn!(
+                                                    "Dropped {} reconnect sync jobs for project {}",
+                                                    stats.dropped,
+                                                    project_name
+                                                );
+                                            }
+                                        }
+                                        Err(err) => {
+                                            log::warn!(
+                                                "Failed to queue reconnect sync for project {}: {}",
+                                                project_name,
+                                                err
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            log::warn!("Peer status channel lagged by {n}");
+                        }
+                    }
+                }
+            }
+        });
+
+        tauri::async_runtime::spawn({
+            let mut rx = sync_engine.subscribe_remote_changes();
+            let handle = app_handle_clone.clone();
+            let pm = Arc::clone(&project_manager);
+            async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(doc_id) => {
+                            log::debug!("Remote change detected for doc {doc_id}");
+
+                            if let Some(project_name) = pm.get_project_for_doc(&doc_id) {
+                                if let Ok(owner) = pm.get_project_owner(&project_name).await {
+                                    if !owner.is_empty() {
+                                        if let Ok(manifest_arc) = pm.get_manifest_for_ui(&project_name) {
+                                            let manifest = manifest_arc.read().await;
+                                            if let Ok(aliases) = manifest.get_actor_aliases() {
+                                                let owner_actor = aliases
+                                                    .iter()
+                                                    .find(|(_, alias)| alias.as_str() == owner)
+                                                    .map(|(actor, _)| actor.clone());
+                                                drop(manifest);
+                                                if let Some(actor_hex) = owner_actor {
+                                                    if let Err(e) = pm
+                                                        .validate_manifest_after_sync(&project_name, &[], &actor_hex)
+                                                        .await
+                                                    {
+                                                        log::error!("Manifest validation failed for {project_name}: {e}");
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            let _ = handle.emit(
+                                events::event_names::REMOTE_CHANGE,
+                                events::RemoteChangeEvent {
+                                    doc_id,
+                                    peer_id: None,
+                                },
+                            );
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            log::debug!("Remote change channel closed");
+                            break;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            log::warn!("Remote change channel lagged by {n} messages");
+                        }
+                    }
+                }
+            }
+        });
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
@@ -2071,7 +2501,6 @@ pub fn run() {
             sync_engine_raw.set_sync_state_store(Arc::clone(&sync_state_store));
             let sync_engine = Arc::new(sync_engine_raw);
 
-            let sync_engine_for_router = Arc::clone(&sync_engine);
             let app_handle = app.handle().clone();
 
             // Load settings for relay configuration before creating the endpoint.
@@ -2108,8 +2537,8 @@ pub fn run() {
                 builder
                     .bind()
                     .await
-                    .expect("failed to bind iroh endpoint")
-            });
+                    .map_err(|e| anyhow::anyhow!("failed to bind iroh endpoint: {e}"))
+            })?;
 
             log::info!("iroh endpoint bound, id: {}", endpoint.id());
 
@@ -2141,196 +2570,11 @@ pub fn run() {
             }
             let invite_handler = Arc::new(invite_handler_raw);
 
-            let router = Router::builder(endpoint.clone())
-                .accept(NOTES_SYNC_ALPN, sync_engine_for_router)
-                .accept(INVITE_ALPN, Arc::clone(&invite_handler))
-                .spawn();
-
-            tauri::async_runtime::spawn(resume_join_sessions(
-                Arc::clone(&join_session_store),
-                Arc::clone(&project_manager),
-                Arc::clone(&sync_engine),
-                Arc::clone(&peer_manager),
-                endpoint.clone(),
-            ));
-
-            log::info!("iroh router started");
             // Auto-sync trigger: debounced channel that syncs with peers on local changes
-            let (sync_tx, mut sync_rx) =
+            let (sync_tx, sync_rx) =
                 tokio::sync::mpsc::channel::<(String, DocId)>(256);
-            let unsent_changes = Arc::new(Mutex::new(HashMap::new()));
-
-            tauri::async_runtime::spawn({
-                let peer_mgr = Arc::clone(&peer_manager);
-                let interval_ms = peer_monitor_interval_ms();
-                async move {
-                    peer_mgr.monitoring_loop(Duration::from_millis(interval_ms)).await;
-                }
-            });
-
-            tauri::async_runtime::spawn({
-                let peer_mgr = Arc::clone(&peer_manager);
-                let handle = app_handle.clone();
-                let debounce_ms = sync_debounce_ms();
-                let unsent_changes = Arc::clone(&unsent_changes);
-                async move {
-                    loop {
-                        let first = match sync_rx.recv().await {
-                            Some(v) => v,
-                            None => break,
-                        };
-                        tokio::time::sleep(Duration::from_millis(debounce_ms)).await;
-                        let mut to_sync = std::collections::HashSet::new();
-                        to_sync.insert(first);
-                        while let Ok(item) = sync_rx.try_recv() {
-                            to_sync.insert(item);
-                        }
-                        for (project, doc_id) in to_sync {
-                            let pending = unsent_changes
-                                .lock()
-                                .ok()
-                                .and_then(|map| map.get(&doc_id).copied())
-                                .unwrap_or(0);
-                            emit_sync_status(&handle, doc_id, events::SyncState::Syncing, pending);
-
-                            let results = peer_mgr.sync_doc_with_project_peers(&project, doc_id).await;
-                            let ok = results.iter().filter(|(_, r)| r.is_ok()).count();
-                            let fail = results.iter().filter(|(_, r)| r.is_err()).count();
-
-                            if ok > 0 {
-                                if let Ok(mut map) = unsent_changes.lock() {
-                                    map.remove(&doc_id);
-                                }
-                            }
-
-                            let sync_state = if ok > 0 {
-                                events::SyncState::Synced
-                            } else if fail > 0 {
-                                events::SyncState::LocalOnly
-                            } else {
-                                events::SyncState::LocalOnly
-                            };
-
-                            let pending = unsent_changes
-                                .lock()
-                                .ok()
-                                .and_then(|map| map.get(&doc_id).copied())
-                                .unwrap_or(0);
-                            emit_sync_status(&handle, doc_id, sync_state, pending);
-
-                            if ok > 0 {
-                                log::debug!("Auto-synced doc {doc_id} with {ok} peers");
-                            }
-                        }
-                    }
-                }
-            });
-
-            tauri::async_runtime::spawn({
-                let mut rx = peer_manager.subscribe_peer_status();
-                let handle = app_handle.clone();
-                let pm = Arc::clone(&project_manager);
-                let peer_mgr = Arc::clone(&peer_manager);
-                let sync_tx = sync_tx.clone();
-                async move {
-                    loop {
-                        match rx.recv().await {
-                            Ok(status_event) => {
-                                let connected_peer = reconnect_peer_id(&status_event);
-                                log::debug!(
-                                    "Peer status change: {} -> {:?}",
-                                    status_event.peer_id,
-                                    status_event.state
-                                );
-                                let _ = handle.emit(events::event_names::PEER_STATUS, status_event);
-
-                                if let Some(peer_id) = connected_peer {
-                                    for project_name in peer_mgr.get_projects_for_peer(&peer_id) {
-                                        match pm.list_files(&project_name).await {
-                                            Ok(files) => {
-                                                let stats = try_queue_reconnect_syncs(&sync_tx, &project_name, &files);
-                                                if stats.dropped > 0 {
-                                                    log::warn!(
-                                                        "Dropped {} reconnect sync jobs for project {}",
-                                                        stats.dropped,
-                                                        project_name
-                                                    );
-                                                }
-                                            }
-                                            Err(err) => {
-                                                log::warn!(
-                                                    "Failed to queue reconnect sync for project {}: {}",
-                                                    project_name,
-                                                    err
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                log::warn!("Peer status channel lagged by {n}");
-                            }
-                        }
-                    }
-                }
-            });
-
-            tauri::async_runtime::spawn({
-                let mut rx = sync_engine.subscribe_remote_changes();
-                let handle = app_handle.clone();
-                let pm = Arc::clone(&project_manager);
-                async move {
-                    loop {
-                        match rx.recv().await {
-                            Ok(doc_id) => {
-                                log::debug!("Remote change detected for doc {doc_id}");
-
-                                if let Some(project_name) = pm.get_project_for_doc(&doc_id) {
-                                    if let Ok(owner) = pm.get_project_owner(&project_name).await {
-                                        if !owner.is_empty() {
-                                            if let Ok(manifest_arc) = pm.get_manifest_for_ui(&project_name) {
-                                                let manifest = manifest_arc.read().await;
-                                                if let Ok(aliases) = manifest.get_actor_aliases() {
-                                                    let owner_actor = aliases
-                                                        .iter()
-                                                        .find(|(_, alias)| alias.as_str() == owner)
-                                                        .map(|(actor, _)| actor.clone());
-                                                    drop(manifest);
-                                                    if let Some(actor_hex) = owner_actor {
-                                                        if let Err(e) = pm
-                                                            .validate_manifest_after_sync(&project_name, &[], &actor_hex)
-                                                            .await
-                                                        {
-                                                            log::error!("Manifest validation failed for {project_name}: {e}");
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                let _ = handle.emit(
-                                    events::event_names::REMOTE_CHANGE,
-                                    events::RemoteChangeEvent {
-                                        doc_id,
-                                        peer_id: None,
-                                    },
-                                );
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                log::debug!("Remote change channel closed");
-                                break;
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                log::warn!("Remote change channel lagged by {n} messages");
-                            }
-                        }
-                    }
-                }
-            });
+            let unsent_changes: Arc<Mutex<HashMap<DocId, UnsentChangesState>>> =
+                Arc::new(Mutex::new(HashMap::new()));
 
             app.manage(AppState {
                 project_manager: Arc::clone(&project_manager),
@@ -2344,10 +2588,14 @@ pub fn run() {
                 version_store,
                 blob_store: Arc::clone(&blob_store),
                 device_actor_hex,
+                local_peer_id: endpoint.id().to_string(),
+                secret_key: endpoint.secret_key().clone(),
                 sync_trigger: sync_tx,
+                sync_receiver: Mutex::new(Some(sync_rx)),
                 unsent_changes,
                 endpoint,
-                router,
+                router: Mutex::new(None),
+                network_status: RwLock::new(NetworkStatus::NotStarted),
                 app_handle,
             });
 
@@ -2403,6 +2651,9 @@ pub fn run() {
             get_peer_status,
             generate_invite,
             accept_invite,
+            list_pending_join_resumes_cmd,
+            resume_pending_joins_cmd,
+            list_owner_invites_cmd,
             // Blame + Search + Unseen
             get_doc_blame,
             get_actor_aliases,
@@ -2431,18 +2682,24 @@ pub fn run() {
         .expect("error while building tauri application");
 
     app.run(|app_handle, event| {
+        if let RunEvent::Ready = &event {
+            start_deferred_networking(app_handle.clone());
+        }
+
         if let RunEvent::ExitRequested { .. } = &event {
             let state = app_handle.state::<AppState>();
             let pm = Arc::clone(&state.project_manager);
             let peer_mgr = Arc::clone(&state.peer_manager);
-            let router = state.router.clone();
+            let router = state.router.lock().ok().and_then(|slot| slot.clone());
             tauri::async_runtime::block_on(async {
                 // 1. Save all documents
                 pm.shutdown().await;
                 // 2. Close peer connections
                 peer_mgr.shutdown().await;
                 // 3. Shut down the router (stops accepting new connections)
-                router.shutdown().await.ok();
+                if let Some(router) = router {
+                    router.shutdown().await.ok();
+                }
                 log::info!("Graceful shutdown complete");
             });
         }
@@ -2568,5 +2825,90 @@ mod tests {
         let second = rx.recv().await.unwrap();
         let queued = vec![first, second];
         assert!(queued.contains(&("project".to_string(), files[0].id)) || queued.contains(&("project".to_string(), files[1].id)));
+    }
+
+    #[test]
+    fn begin_network_startup_transitions_only_once() {
+        let status = RwLock::new(NetworkStatus::NotStarted);
+
+        assert!(begin_network_startup(&status));
+        assert_eq!(*status.read().unwrap(), NetworkStatus::Starting);
+
+        assert!(!begin_network_startup(&status));
+        assert_eq!(*status.read().unwrap(), NetworkStatus::Starting);
+
+        *status.write().unwrap() = NetworkStatus::Ready;
+        assert!(!begin_network_startup(&status));
+        assert_eq!(*status.read().unwrap(), NetworkStatus::Ready);
+    }
+
+    #[test]
+    fn require_network_ready_status_matches_lifecycle() {
+        assert!(require_network_ready_status(&NetworkStatus::Ready).is_ok());
+
+        let not_started = require_network_ready_status(&NetworkStatus::NotStarted)
+            .expect_err("not-started networking should be gated");
+        assert!(not_started.to_string().contains("still starting"));
+
+        let starting = require_network_ready_status(&NetworkStatus::Starting)
+            .expect_err("starting networking should be gated");
+        assert!(starting.to_string().contains("still starting"));
+
+        let failed = require_network_ready_status(&NetworkStatus::Failed("boom".into()))
+            .expect_err("failed networking should return detailed error");
+        assert!(failed.to_string().contains("failed to initialize: boom"));
+    }
+
+    #[test]
+    fn network_status_message_covers_all_states() {
+        assert_eq!(network_status_message(&NetworkStatus::NotStarted), "networking is still starting");
+        assert_eq!(network_status_message(&NetworkStatus::Starting), "networking is still starting");
+        assert_eq!(network_status_message(&NetworkStatus::Ready), "networking is ready");
+        assert_eq!(network_status_message(&NetworkStatus::Failed("x".into())), "networking failed to initialize");
+    }
+
+    #[tokio::test]
+    async fn load_seen_state_or_default_recovers_from_malformed_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let p2p_dir = dir.path().join(".p2p");
+        tokio::fs::create_dir_all(&p2p_dir).await.unwrap();
+        tokio::fs::write(p2p_dir.join("seen_state.json"), "{not valid json")
+            .await
+            .unwrap();
+
+        let state = load_seen_state_or_default(dir.path()).await;
+        assert_eq!(state.last_seen_at(&uuid::Uuid::new_v4()), None);
+    }
+
+    #[tokio::test]
+    async fn save_seen_state_best_effort_does_not_fail_for_unwritable_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("not-a-project-dir");
+        tokio::fs::write(&file_path, "occupied").await.unwrap();
+
+        save_seen_state_best_effort(&file_path, &notes_core::ProjectSeenState::default()).await;
+    }
+
+    #[tokio::test]
+    async fn malformed_seen_state_does_not_break_unseen_or_mark_seen_flows() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_manager = ProjectManager::new(dir.path().to_path_buf());
+        project_manager.create_project("shared").await.unwrap();
+        project_manager.open_project("shared").await.unwrap();
+        let doc_id = project_manager.create_note("shared", "hello.md").await.unwrap();
+
+        let seen_state_path = dir.path().join("shared").join(".p2p").join("seen_state.json");
+        tokio::fs::write(&seen_state_path, "{bad json").await.unwrap();
+
+        let unseen = get_unseen_docs_for_project(&project_manager, "shared").await.unwrap();
+        assert_eq!(unseen.len(), 1);
+        assert_eq!(unseen[0].doc_id, doc_id);
+
+        mark_doc_seen_for_project(&project_manager, "shared", doc_id)
+            .await
+            .unwrap();
+
+        let repaired = tokio::fs::read_to_string(&seen_state_path).await.unwrap();
+        assert!(repaired.contains(&doc_id.to_string()));
     }
 }

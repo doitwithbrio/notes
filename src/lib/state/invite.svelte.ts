@@ -2,7 +2,13 @@ import { tauriApi } from '../api/tauri.js';
 import { TauriRuntimeUnavailableError } from '../runtime/tauri.js';
 import { loadProjects } from './projects.svelte.js';
 import { loadProjectDocs } from './documents.svelte.js';
-import type { GenerateInviteResult, AcceptInviteResult } from '../types/index.js';
+import type {
+  AcceptInviteResult,
+  BackendInviteAcceptEvent,
+  BackendOwnerInviteStatus,
+  BackendPendingJoinResume,
+  GenerateInviteResult,
+} from '../types/index.js';
 
 /** Extract a human-readable message from a Tauri IPC error.
  *  Backend CoreError is serialized as { code, message }, not a JS Error. */
@@ -57,7 +63,94 @@ export const inviteState = $state({
   shareDialogOpen: false,
   shareProjectId: null as string | null,
   inviteRole: 'editor' as 'editor' | 'viewer',
+
+  // Resume / owner observability
+  pendingJoinResumes: [] as BackendPendingJoinResume[],
+  latestInviteEvent: null as BackendInviteAcceptEvent | null,
+  ownerInviteStatuses: [] as BackendOwnerInviteStatus[],
 });
+
+let ownerInvitePollTimer: ReturnType<typeof setInterval> | null = null;
+let clearInviteEventTimer: ReturnType<typeof setTimeout> | null = null;
+
+function startOwnerInvitePolling(projectId: string) {
+  stopOwnerInvitePolling();
+  ownerInvitePollTimer = setInterval(() => {
+    void loadOwnerInviteStatuses(projectId);
+  }, 2000);
+}
+
+function stopOwnerInvitePolling() {
+  if (ownerInvitePollTimer) {
+    clearInterval(ownerInvitePollTimer);
+    ownerInvitePollTimer = null;
+  }
+}
+
+export function clearInviteBanner() {
+  inviteState.latestInviteEvent = null;
+}
+
+export async function hydrateInviteStatus() {
+  try {
+    inviteState.pendingJoinResumes = await tauriApi.listPendingJoinResumes();
+  } catch {
+    inviteState.pendingJoinResumes = [];
+  }
+}
+
+export async function loadOwnerInviteStatuses(projectId?: string | null) {
+  try {
+    inviteState.ownerInviteStatuses = await tauriApi.listOwnerInvites(projectId ?? undefined);
+  } catch {
+    inviteState.ownerInviteStatuses = [];
+  }
+}
+
+export async function resumePendingJoins() {
+  try {
+    await tauriApi.resumePendingJoins();
+  } finally {
+    await hydrateInviteStatus();
+  }
+}
+
+export function handleInviteAcceptEvent(event: BackendInviteAcceptEvent) {
+  inviteState.latestInviteEvent = event;
+  if (clearInviteEventTimer) clearTimeout(clearInviteEventTimer);
+
+  const localProjectName = event.localProjectName ?? event.projectName;
+  const nextResume: BackendPendingJoinResume = {
+    sessionId: event.sessionId,
+    ownerPeerId: event.ownerPeerId,
+    projectId: event.projectId,
+    projectName: event.projectName,
+    localProjectName,
+    role: event.role,
+    stage:
+      event.stage === 'payload-staged'
+        ? 'payload-staged'
+        : event.stage === 'finalized'
+          ? 'finalized'
+          : 'commit-confirmed',
+    updatedAt: new Date().toISOString(),
+  };
+
+  if (event.stage === 'completed' || event.stage === 'failed') {
+    inviteState.pendingJoinResumes = inviteState.pendingJoinResumes.filter(
+      (resume) => resume.sessionId !== event.sessionId,
+    );
+    clearInviteEventTimer = setTimeout(() => {
+      if (inviteState.latestInviteEvent?.sessionId === event.sessionId) {
+        inviteState.latestInviteEvent = null;
+      }
+    }, 8000);
+  } else {
+    const idx = inviteState.pendingJoinResumes.findIndex((resume) => resume.sessionId === event.sessionId);
+    if (idx >= 0) inviteState.pendingJoinResumes[idx] = nextResume;
+    else inviteState.pendingJoinResumes = [...inviteState.pendingJoinResumes, nextResume];
+  }
+}
 
 export function openShareDialog(projectId: string, role: 'editor' | 'viewer' = 'editor') {
   inviteState.shareProjectId = projectId;
@@ -65,6 +158,8 @@ export function openShareDialog(projectId: string, role: 'editor' | 'viewer' = '
   inviteState.inviteRole = role;
   inviteState.activeInvite = null;
   inviteState.generateError = null;
+  void loadOwnerInviteStatuses(projectId);
+  startOwnerInvitePolling(projectId);
 }
 
 export async function generateInvite(projectId: string, role: 'editor' | 'viewer') {
@@ -85,10 +180,12 @@ export async function generateInvite(projectId: string, role: 'editor' | 'viewer
 
     const result = await tauriApi.generateInvite(projectId, role);
     inviteState.activeInvite = result;
+    await loadOwnerInviteStatuses(projectId);
   } catch (error) {
     if (error instanceof TauriRuntimeUnavailableError) {
       // Dev mode — show mock data for testing
       inviteState.activeInvite = {
+        inviteId: 'mock-invite-id',
         passphrase: 'tiger-marble-ocean-violet-canyon-frost',
         peerId: 'mock-peer-id-for-dev',
         expiresAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
@@ -103,12 +200,14 @@ export async function generateInvite(projectId: string, role: 'editor' | 'viewer
 }
 
 export function closeShareDialog() {
+  stopOwnerInvitePolling();
   inviteState.shareDialogOpen = false;
   inviteState.activeInvite = null;
   inviteState.generateError = null;
   inviteState.shareProjectId = null;
   inviteState.localPeerId = null;
   inviteState.inviteRole = 'editor';
+  inviteState.ownerInviteStatuses = [];
 }
 
 export function openJoinDialog() {

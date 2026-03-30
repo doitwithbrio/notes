@@ -8,6 +8,9 @@ import type {
   BackendPeerStatusSummary,
   BackendPresenceEvent,
   BackendProjectSummary,
+  BackendPendingJoinResume,
+  BackendOwnerInviteStatus,
+  BackendInviteAcceptEvent,
   BackendRemoteChangeEvent,
   BackendSearchResult,
   BackendSyncStatusEvent,
@@ -65,6 +68,9 @@ export const tauriApi = {
     guardedInvoke<import('../types/index.js').GenerateInviteResult>('generate_invite', { project, role }),
   acceptInvite: (passphrase: string, ownerPeerId: string) =>
     guardedInvoke<import('../types/index.js').AcceptInviteResult>('accept_invite', { passphrase, ownerPeerId }),
+  listPendingJoinResumes: () => guardedInvoke<BackendPendingJoinResume[]>('list_pending_join_resumes_cmd'),
+  resumePendingJoins: () => guardedInvoke<void>('resume_pending_joins_cmd'),
+  listOwnerInvites: (project?: string) => guardedInvoke<BackendOwnerInviteStatus[]>('list_owner_invites_cmd', { project }),
   addPeer: (project: string, peerIdStr: string) =>
     guardedInvoke<void>('add_peer', { project, peerIdStr }),
   removePeer: (project: string, peerIdStr: string) =>
@@ -102,6 +108,8 @@ export const tauriApi = {
     guardedListen<BackendPeerStatusEvent>('p2p:peer-status', handler),
   onPresenceUpdate: (handler: (payload: BackendPresenceEvent) => void): Promise<UnlistenFn> =>
     guardedListen<BackendPresenceEvent>('p2p:presence-update', handler),
+  onInviteAcceptStatus: (handler: (payload: BackendInviteAcceptEvent) => void): Promise<UnlistenFn> =>
+    guardedListen<BackendInviteAcceptEvent>('p2p:invite-accept', handler),
 
   // ── Auto-update ──────────────────────────────────────────────────
   /** Ask the Rust backend to fetch latest.json and compare versions. */

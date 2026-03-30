@@ -40,8 +40,12 @@
     newTodoText = '';
   }
 
-  function openDoc(docId: string) {
-    void navigateToDoc(project.id, docId);
+  async function openDoc(docId: string) {
+    try {
+      await navigateToDoc(project.id, docId);
+    } catch (error) {
+      console.error('Failed to open note from project overview:', error);
+    }
   }
 
   function getLinkedDocTitle(docId: string | undefined): string | null {

@@ -9,6 +9,7 @@ import { loadSettings } from './settings.svelte.js';
 import { applySyncState, setPeerCount, setSharedProject } from './sync.svelte.js';
 import { checkForUpdate } from './updates.svelte.js';
 import { getActiveSession, reloadActiveSession } from '../session/editor-session.svelte.js';
+import { handleInviteAcceptEvent, hydrateInviteStatus } from './invite.svelte.js';
 
 export const appSessionState = $state({
   booting: false,
@@ -56,7 +57,7 @@ export async function initializeApp() {
       return;
     }
 
-    const [remoteUnlisten, syncUnlisten, peerUnlisten, presenceUnlisten] = await Promise.all([
+    const [remoteUnlisten, syncUnlisten, peerUnlisten, presenceUnlisten, inviteUnlisten] = await Promise.all([
       tauriApi.onRemoteChange(async ({ docId }) => {
         const active = getActiveSession();
         if (active?.docId === docId) {
@@ -77,14 +78,18 @@ export async function initializeApp() {
       tauriApi.onPresenceUpdate(({ peerId, alias, activeDoc, cursorPos, selection }) => {
         updatePresence(peerId, alias, activeDoc, cursorPos, selection);
       }),
+      tauriApi.onInviteAcceptStatus((event) => {
+        handleInviteAcceptEvent(event);
+      }),
     ]);
 
-    appSessionState.unlistenFns = [remoteUnlisten, syncUnlisten, peerUnlisten, presenceUnlisten];
+    appSessionState.unlistenFns = [remoteUnlisten, syncUnlisten, peerUnlisten, presenceUnlisten, inviteUnlisten];
 
     // Load saved ordering from localStorage before fetching projects/docs
     loadOrder();
 
     await loadProjects();
+    await hydrateInviteStatus();
 
     appSessionState.ready = true;
 

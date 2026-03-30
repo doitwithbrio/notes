@@ -168,11 +168,14 @@
   }
 
   async function handleMoveDoc(sourceProjectId: string, docId: string, targetProjectId: string) {
+    let newDocId: string | null = null;
+    let shouldOpenMovedDoc = false;
+    let sourceDeleted = false;
     try {
       const doc = getDocById(docId);
       if (!doc) return;
       const currentRoute = getWorkspaceRoute();
-      const shouldOpenMovedDoc = currentRoute?.kind === 'doc' && currentRoute.docId === docId;
+      shouldOpenMovedDoc = currentRoute !== null && currentRoute.kind === 'doc' && currentRoute.docId === docId;
 
       // Close editor session if this doc is active
       if (shouldOpenMovedDoc) {
@@ -183,18 +186,22 @@
       const filename = doc.path.split('/').pop() ?? doc.path;
 
       // Create in target project, delete from source
-      const newDocId = await tauriApi.createNote(targetProjectId, filename);
+      newDocId = await tauriApi.createNote(targetProjectId, filename);
 
-      // Copy content: get binary from source, apply to target
       try {
         const binary = await tauriApi.getDocBinary(sourceProjectId, docId);
         await tauriApi.openDoc(targetProjectId, newDocId);
         await tauriApi.applyChanges(targetProjectId, newDocId, binary);
         await tauriApi.saveDoc(targetProjectId, newDocId);
         await tauriApi.closeDoc(targetProjectId, newDocId);
-      } catch {
-        // Content copy failed — note still created but empty
-        console.warn('Could not copy document content during move');
+      } catch (error) {
+        await tauriApi.closeDoc(targetProjectId, newDocId).catch(() => undefined);
+        await tauriApi.deleteNote(targetProjectId, newDocId).catch(() => undefined);
+        throw new Error(
+          error instanceof Error
+            ? `Could not copy document content during move: ${error.message}`
+            : 'Could not copy document content during move',
+        );
       }
 
       // Delete from source
@@ -205,6 +212,7 @@
         toDocId: newDocId,
       });
       await deleteDoc(sourceProjectId, docId);
+      sourceDeleted = true;
 
       // Reload both projects
       await loadProjectDocs(sourceProjectId, { force: true });
@@ -220,7 +228,22 @@
         await navigateToDoc(targetProjectId, newDocId);
       }
     } catch (err) {
-      clearMovedDoc({ fromProjectId: sourceProjectId, fromDocId: docId });
+      if (sourceDeleted && newDocId) {
+        handleMovedDoc({
+          fromProjectId: sourceProjectId,
+          fromDocId: docId,
+          toProjectId: targetProjectId,
+          toDocId: newDocId,
+        });
+        if (shouldOpenMovedDoc && editorSessionState.docId !== newDocId) {
+          await navigateToDoc(targetProjectId, newDocId).catch(() => undefined);
+        }
+      } else {
+        clearMovedDoc({ fromProjectId: sourceProjectId, fromDocId: docId });
+        if (shouldOpenMovedDoc) {
+          await navigateToDoc(sourceProjectId, docId).catch(() => undefined);
+        }
+      }
       console.error('Failed to move doc:', err);
     }
   }
@@ -336,6 +359,14 @@
   async function handleOpenProject(projectId: string) {
     await navigateToProject(projectId);
   }
+
+  async function handleDocOpen(projectId: string, docId: string) {
+    try {
+      await navigateToDoc(projectId, docId);
+    } catch (error) {
+      console.error('Failed to open note from sidebar:', error);
+    }
+  }
 </script>
 
 <svelte:window onclick={handleWindowClick} onkeydown={handleKeydown} />
@@ -415,7 +446,7 @@
           oncancel={() => { renamingProjectId = null; cancelNewProject(); }}
           onnewnote={() => startNewNote(project.id)}
           onprojectclick={() => void handleOpenProject(project.id)}
-          ondocopen={(docId) => void navigateToDoc(project.id, docId)}
+          ondocopen={(docId) => void handleDocOpen(project.id, docId)}
           ondoccommit={(title) => {
             if (renamingDocId) {
               const docId = renamingDocId;

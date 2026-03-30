@@ -4,7 +4,8 @@
   import { navigateToDoc } from '../../navigation/workspace-router.svelte.js';
 
   let query = $state('');
-  let inputEl: HTMLInputElement;
+  let inputEl = $state<HTMLInputElement | null>(null);
+  let opening = $state(false);
 
   const searchableDocs = $derived(
     documentState.docs.map((doc) => ({
@@ -27,14 +28,18 @@
   );
 
   async function select(docId: string) {
+    if (opening) return;
     const doc = searchableDocs.find((entry) => entry.doc.id === docId)?.doc;
     if (!doc) return;
+    opening = true;
     try {
       await navigateToDoc(doc.projectId, doc.id);
       closeQuickOpen();
       query = '';
     } catch (error) {
       console.error('Failed to open note from quick open:', error);
+    } finally {
+      opening = false;
     }
   }
 
@@ -61,10 +66,15 @@
   });
 </script>
 
-<!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="quick-open-backdrop" onclick={closeQuickOpen}>
-  <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <div class="quick-open" onclick={(e) => e.stopPropagation()}>
+<div class="quick-open-shell">
+  <button
+    aria-label="close quick open"
+    class="quick-open-backdrop"
+    onclick={closeQuickOpen}
+    tabindex="-1"
+    type="button"
+  ></button>
+  <div class="quick-open" data-testid="quick-open-panel">
     <input
       bind:this={inputEl}
       bind:value={query}
@@ -96,13 +106,20 @@
 </div>
 
 <style>
-  .quick-open-backdrop {
+  .quick-open-shell {
     position: fixed;
     inset: 0;
     z-index: 100;
     display: flex;
     justify-content: center;
     padding-top: 100px;
+  }
+
+  .quick-open-backdrop {
+    position: absolute;
+    inset: 0;
+    border: none;
+    padding: 0;
     background: var(--overlay-backdrop);
     backdrop-filter: blur(2px);
     -webkit-backdrop-filter: blur(2px);
@@ -115,6 +132,8 @@
   }
 
   .quick-open {
+    position: relative;
+    z-index: 1;
     width: 560px;
     max-height: 440px;
     background: var(--surface);

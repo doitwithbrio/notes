@@ -5,7 +5,7 @@
 
   let passphrase = $state('');
   let ownerPeerId = $state('');
-  let inputEl: HTMLInputElement;
+  let inputEl = $state<HTMLInputElement | null>(null);
 
   function handleSubmit() {
     if (!passphrase.trim() || !ownerPeerId.trim()) return;
@@ -34,8 +34,14 @@
 
 <svelte:window onkeydown={handleKeydown} />
 
-<!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
-<div class="backdrop" onclick={closeJoinDialog}>
+<div class="dialog-shell">
+  <button
+    aria-label="close join dialog"
+    class="backdrop"
+    onclick={closeJoinDialog}
+    tabindex="-1"
+    type="button"
+  ></button>
   <div
     class="panel"
     data-testid="join-dialog"
@@ -43,7 +49,6 @@
     tabindex="-1"
     aria-modal="true"
     aria-labelledby="join-title"
-    onclick={(e) => e.stopPropagation()}
   >
     {#if inviteState.acceptResult}
       <div class="panel-header">
@@ -115,13 +120,20 @@
 </div>
 
 <style>
-  .backdrop {
+  .dialog-shell {
     position: fixed;
     inset: 0;
     z-index: 100;
     display: flex;
     justify-content: center;
     padding-top: 100px;
+  }
+
+  .backdrop {
+    position: absolute;
+    inset: 0;
+    border: none;
+    padding: 0;
     background: var(--overlay-backdrop);
     backdrop-filter: blur(2px);
     -webkit-backdrop-filter: blur(2px);
@@ -134,6 +146,8 @@
   }
 
   .panel {
+    position: relative;
+    z-index: 1;
     width: 560px;
     max-height: 440px;
     background: var(--surface);

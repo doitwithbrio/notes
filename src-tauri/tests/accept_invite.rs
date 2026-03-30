@@ -188,6 +188,7 @@ async fn accept_invite_happy_path_installs_project() {
         Arc::clone(&invitee.peer_manager),
         Arc::clone(&invitee.join_session_store),
         invitee.endpoint.clone(),
+        None,
         "alpha-beta-gamma-delta-epsilon-zeta".into(),
         owner.endpoint.id().to_string(),
     )
@@ -229,6 +230,7 @@ async fn accept_invite_commit_failure_does_not_install_project() {
         Arc::clone(&invitee.peer_manager),
         Arc::clone(&invitee.join_session_store),
         invitee.endpoint.clone(),
+        None,
         "commit-fails-alpha-beta".into(),
         owner.endpoint.id().to_string(),
     )
@@ -480,6 +482,7 @@ async fn resume_join_sessions_finalizes_commit_confirmed_install() {
         Arc::clone(&invitee.sync_engine),
         Arc::clone(&invitee.peer_manager),
         invitee.endpoint.clone(),
+        None,
     )
     .await;
 
@@ -577,6 +580,7 @@ async fn resume_join_sessions_recovers_payload_staged_session() {
         Arc::clone(&invitee.sync_engine),
         Arc::clone(&invitee.peer_manager),
         invitee.endpoint.clone(),
+        None,
     )
     .await;
 

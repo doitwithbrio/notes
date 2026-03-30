@@ -7,12 +7,12 @@
   import { closeQuickOpen, toggleQuickOpen, uiState } from '../state/ui.svelte.js';
   import { projectState } from '../state/projects.svelte.js';
   import { isMac } from '../utils/platform.js';
-  import { getSelectedDoc, getWorkspaceRoute, isProjectRoute, reconcileMissingSelectedDoc } from '../navigation/workspace-router.svelte.js';
+  import { getSelectedDoc, getWorkspaceRoute, isProjectRoute, navigateToDoc, navigateToProject, reconcileMissingSelectedDoc } from '../navigation/workspace-router.svelte.js';
   import Sidebar from './sidebar/Sidebar.svelte';
   import ProjectOverview from './editor/ProjectOverview.svelte';
   import RightSidebar from './rightsidebar/RightSidebar.svelte';
   import UpdateBanner from './UpdateBanner.svelte';
-  import { inviteState } from '../state/invite.svelte.js';
+  import { clearInviteBanner, inviteState, resumePendingJoins } from '../state/invite.svelte.js';
   import { installE2EBridge, teardownE2EBridge } from '../e2e/bridge.js';
 
   const activeDoc = $derived(getSelectedDoc());
@@ -22,12 +22,56 @@
       ? (projectState.projects.find((project) => project.id === route.projectId) ?? null)
       : null,
   );
+  const selectedDocOpenFailed = $derived.by(() => {
+    if (!route || route.kind !== 'doc') return false;
+    if (!activeDoc) return false;
+    if (editorSessionState.loading || !editorSessionState.lastError) return false;
+    return editorSessionState.projectId !== activeDoc.projectId || editorSessionState.docId !== activeDoc.id;
+  });
 
   let editorPanePromise = $state<Promise<typeof import('./editor/EditorPane.svelte')> | null>(null);
   let settingsPanePromise = $state<Promise<typeof import('./settings/SettingsPane.svelte')> | null>(null);
   let quickOpenPromise = $state<Promise<typeof import('./sidebar/QuickOpen.svelte')> | null>(null);
   let shareDialogPromise = $state<Promise<typeof import('./dialogs/ShareDialog.svelte')> | null>(null);
   let joinDialogPromise = $state<Promise<typeof import('./dialogs/JoinDialog.svelte')> | null>(null);
+  const currentJoinResume = $derived(inviteState.pendingJoinResumes[0] ?? null);
+  const pendingJoinCount = $derived(inviteState.pendingJoinResumes.length);
+  const inviteBanner = $derived.by(() => {
+    if (inviteState.latestInviteEvent?.stage === 'completed') {
+      return {
+        kind: 'success' as const,
+        title: `joined ${inviteState.latestInviteEvent.localProjectName ?? inviteState.latestInviteEvent.projectName}`,
+        body: `you are now a ${inviteState.latestInviteEvent.role} on this project`,
+        cta: 'open project',
+        project: inviteState.latestInviteEvent.localProjectName ?? inviteState.latestInviteEvent.projectName,
+      };
+    }
+    if (inviteState.latestInviteEvent?.stage === 'failed') {
+      return {
+        kind: 'error' as const,
+        title: `couldn't finish joining ${inviteState.latestInviteEvent.projectName}`,
+        body: inviteState.latestInviteEvent.error ?? 'you can retry without re-entering the code',
+        cta: 'retry',
+        project: null,
+      };
+    }
+    if (currentJoinResume) {
+      return {
+        kind: 'info' as const,
+        title:
+          pendingJoinCount > 1
+            ? `finishing ${pendingJoinCount} project joins`
+            : `finishing join for ${currentJoinResume.localProjectName}`,
+        body:
+          pendingJoinCount > 1
+            ? 'the app is resuming all pending joins automatically in the background'
+            : 'you can keep using the app while this resumes automatically',
+        cta: 'retry',
+        project: null,
+      };
+    }
+    return null;
+  });
 
   $effect(() => {
     if ((activeDoc || editorSessionState.loading) && !editorPanePromise) {
@@ -90,6 +134,26 @@
       closeQuickOpen();
     }
   }
+
+  function handleInviteBannerAction() {
+    if (!inviteBanner) return;
+    if (inviteBanner.cta === 'open project' && inviteBanner.project) {
+      void navigateToProject(inviteBanner.project);
+      clearInviteBanner();
+      return;
+    }
+    if (inviteBanner.cta === 'retry') {
+      clearInviteBanner();
+      void resumePendingJoins();
+    }
+  }
+
+  function handleRetrySelectedDoc() {
+    if (!route || route.kind !== 'doc') return;
+    void navigateToDoc(route.projectId, route.docId).catch((error) => {
+      console.error('Failed to retry opening note:', error);
+    });
+  }
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
@@ -104,6 +168,15 @@
 
   <div class="editor-panel">
     <UpdateBanner />
+    {#if inviteBanner}
+      <div class={`invite-banner ${inviteBanner.kind}`} data-testid="invite-banner">
+        <div class="invite-copy">
+          <p class="invite-title">{inviteBanner.title}</p>
+          <p class="invite-body">{inviteBanner.body}</p>
+        </div>
+        <button class="invite-action" onclick={handleInviteBannerAction}>{inviteBanner.cta}</button>
+      </div>
+    {/if}
     {#if appSessionState.error}
       <div class="app-message">
         <p class="title">could not load notes</p>
@@ -131,6 +204,12 @@
           {:else if editorSessionState.loading}
             <div class="app-message inline-message" data-testid="editor-loading">
               <p class="title">loading editor...</p>
+            </div>
+          {:else if selectedDocOpenFailed && activeDoc}
+            <div class="app-message inline-message" data-testid="editor-open-failed">
+              <p class="title">could not open {activeDoc.title}</p>
+              <p class="body">{editorSessionState.lastError}</p>
+              <button class="invite-action" data-testid="editor-open-retry" onclick={handleRetrySelectedDoc}>retry</button>
             </div>
           {:else if activeDoc}
             {#if editorPanePromise}
@@ -218,6 +297,55 @@
     min-width: 0;
     background: var(--surface);
     position: relative;
+  }
+
+  .invite-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border-subtle);
+    background: var(--surface-sidebar);
+  }
+
+  .invite-banner.info {
+    background: var(--surface-sidebar);
+  }
+
+  .invite-banner.success {
+    background: color-mix(in srgb, var(--surface-sidebar) 78%, #dff4e8 22%);
+  }
+
+  .invite-banner.error {
+    background: color-mix(in srgb, var(--surface-sidebar) 78%, #f7ded8 22%);
+  }
+
+  .invite-copy {
+    min-width: 0;
+  }
+
+  .invite-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .invite-body {
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-top: 2px;
+  }
+
+  .invite-action {
+    flex-shrink: 0;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-primary);
+    background: var(--surface);
+    border: 1px solid var(--border-default);
+    border-radius: 999px;
+    padding: 6px 10px;
   }
 
   .main-view {

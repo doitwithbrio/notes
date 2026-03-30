@@ -5,6 +5,9 @@
 
   const project = $derived(getProject(inviteState.shareProjectId));
   const invite = $derived(inviteState.activeInvite);
+  const ownerInviteStatus = $derived(
+    inviteState.ownerInviteStatuses.find((status) => status.inviteId === invite?.inviteId) ?? null,
+  );
 
   let copiedPassphrase = $state(false);
   let copiedPeerId = $state(false);
@@ -73,8 +76,14 @@
 
 <svelte:window onkeydown={handleKeydown} />
 
-<!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
-<div class="backdrop" onclick={closeShareDialog}>
+<div class="dialog-shell">
+  <button
+    aria-label="close share dialog"
+    class="backdrop"
+    onclick={closeShareDialog}
+    tabindex="-1"
+    type="button"
+  ></button>
   <div
     class="panel"
     data-testid="share-dialog"
@@ -82,7 +91,6 @@
     tabindex="-1"
     aria-modal="true"
     aria-labelledby="share-title"
-    onclick={(e) => e.stopPropagation()}
   >
     <div class="panel-header">
       <h3 id="share-title">share {project?.name ?? 'project'}</h3>
@@ -105,45 +113,69 @@
         <p class="hint">share this code and your peer ID with the person you want to invite</p>
         <p class="hint-subtle">this invite is single-use, expires in 10 minutes, and stops working if you close the app</p>
 
-        <div class="field-row">
-          <span class="field-label">invite code</span>
-          <div class="code-box">
-            <span class="passphrase" data-testid="share-passphrase">{invite.passphrase}</span>
-            <button class="copy-btn" onclick={() => copyToClipboard(invite.passphrase, 'passphrase')}>
-              {#if copiedPassphrase}
-                <Check size={13} strokeWidth={1.5} />
-              {:else}
-                <Copy size={13} strokeWidth={1.5} />
-              {/if}
-            </button>
+        {#if ownerInviteStatus && ownerInviteStatus.phase !== 'open'}
+          <div class="status-pill" data-testid="share-owner-status">
+            {#if ownerInviteStatus.phase === 'reserved'}
+              waiting for them to finish joining...
+            {:else if ownerInviteStatus.phase === 'prepared-ack-received' || ownerInviteStatus.phase === 'committed-pending-ack'}
+              adding them to the project...
+            {:else if ownerInviteStatus.phase === 'consumed'}
+              invite complete
+            {/if}
           </div>
-        </div>
+        {/if}
 
-        <div class="field-row">
-          <span class="field-label">your peer ID</span>
-          <div class="code-box small">
-            <span class="peer-id" data-testid="share-peer-id">{inviteState.localPeerId ?? invite.peerId}</span>
-            <button class="copy-btn" onclick={() => copyToClipboard(inviteState.localPeerId ?? invite.peerId, 'peerId')}>
-              {#if copiedPeerId}
-                <Check size={13} strokeWidth={1.5} />
-              {:else}
-                <Copy size={13} strokeWidth={1.5} />
-              {/if}
-            </button>
+        {#if ownerInviteStatus?.phase === 'consumed'}
+          <div class="consumed-note" data-testid="share-consumed-note">
+            this invite has already been used. generate a new code to invite someone else.
           </div>
-        </div>
+          <div class="footer-row consumed-only">
+            <div class="footer-actions">
+              <button class="btn-accent" data-testid="share-new-code" onclick={handleGenerate}>new code</button>
+              <button class="btn-muted" onclick={closeShareDialog}>done</button>
+            </div>
+          </div>
+        {:else}
+          <div class="field-row">
+            <span class="field-label">invite code</span>
+            <div class="code-box">
+              <span class="passphrase" data-testid="share-passphrase">{invite.passphrase}</span>
+              <button aria-label="copy invite code" class="copy-btn" data-testid="share-copy-passphrase" onclick={() => copyToClipboard(invite.passphrase, 'passphrase')}>
+                {#if copiedPassphrase}
+                  <Check size={13} strokeWidth={1.5} />
+                {:else}
+                  <Copy size={13} strokeWidth={1.5} />
+                {/if}
+              </button>
+            </div>
+          </div>
 
-        <div class="footer-row">
-          {#if expired}
-            <span class="expired" data-testid="share-expired">invite expired</span>
-          {:else}
-            <span class="timer" data-testid="share-timer">expires in {timerLabel()}</span>
-          {/if}
-          <div class="footer-actions">
-            <button class="btn-accent" data-testid="share-new-code" onclick={handleGenerate}>new code</button>
-            <button class="btn-muted" onclick={closeShareDialog}>done</button>
+          <div class="field-row">
+            <span class="field-label">your peer ID</span>
+            <div class="code-box small">
+              <span class="peer-id" data-testid="share-peer-id">{inviteState.localPeerId ?? invite.peerId}</span>
+              <button aria-label="copy peer id" class="copy-btn" data-testid="share-copy-peer-id" onclick={() => copyToClipboard(inviteState.localPeerId ?? invite.peerId, 'peerId')}>
+                {#if copiedPeerId}
+                  <Check size={13} strokeWidth={1.5} />
+                {:else}
+                  <Copy size={13} strokeWidth={1.5} />
+                {/if}
+              </button>
+            </div>
           </div>
-        </div>
+
+          <div class="footer-row">
+            {#if expired}
+              <span class="expired" data-testid="share-expired">invite expired</span>
+            {:else}
+              <span class="timer" data-testid="share-timer">expires in {timerLabel()}</span>
+            {/if}
+            <div class="footer-actions">
+              <button class="btn-accent" data-testid="share-new-code" onclick={handleGenerate}>new code</button>
+              <button class="btn-muted" onclick={closeShareDialog}>done</button>
+            </div>
+          </div>
+        {/if}
       {:else}
         <p class="hint">choose a role, then generate a one-time invite code</p>
         <button class="action-row" data-testid="share-generate" onclick={handleGenerate}>generate invite</button>
@@ -153,13 +185,20 @@
 </div>
 
 <style>
-  .backdrop {
+  .dialog-shell {
     position: fixed;
     inset: 0;
     z-index: 100;
     display: flex;
     justify-content: center;
     padding-top: 100px;
+  }
+
+  .backdrop {
+    position: absolute;
+    inset: 0;
+    border: none;
+    padding: 0;
     background: var(--overlay-backdrop);
     backdrop-filter: blur(2px);
     -webkit-backdrop-filter: blur(2px);
@@ -172,6 +211,8 @@
   }
 
   .panel {
+    position: relative;
+    z-index: 1;
     width: 560px;
     max-height: 440px;
     background: var(--surface);
@@ -253,6 +294,31 @@
     padding: 20px 0;
     font-size: 14px;
     color: var(--text-secondary);
+  }
+
+  .status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 12px;
+    padding: 7px 10px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-primary);
+    background: var(--surface-hover);
+    border: 1px solid var(--border-subtle);
+    border-radius: 999px;
+  }
+
+  .consumed-note {
+    margin-bottom: 14px;
+    font-size: 13px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+  }
+
+  .footer-row.consumed-only {
+    justify-content: flex-end;
   }
 
   .status-row :global(.spin) {

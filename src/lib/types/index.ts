@@ -230,6 +230,7 @@ export interface BackendPeerStatusEvent {
 }
 
 export interface GenerateInviteResult {
+  inviteId: string;
   passphrase: string;
   peerId: string;
   expiresAt: string;
@@ -239,6 +240,43 @@ export interface AcceptInviteResult {
   projectId: string;
   projectName: string;
   role: string;
+}
+
+export type InviteResumeStage = 'payload-staged' | 'commit-confirmed' | 'finalized';
+export type InviteAcceptStage = 'resuming' | 'payload-staged' | 'finalized' | 'completed' | 'failed';
+
+export interface BackendPendingJoinResume {
+  sessionId: string;
+  ownerPeerId: string;
+  projectId: string;
+  projectName: string;
+  localProjectName: string;
+  role: string;
+  stage: InviteResumeStage;
+  updatedAt: string;
+}
+
+export interface BackendOwnerInviteStatus {
+  inviteId: string;
+  projectId: string;
+  projectName: string;
+  role: string;
+  expiresAt: string;
+  phase: 'open' | 'reserved' | 'prepared-ack-received' | 'committed-pending-ack' | 'consumed';
+  inviteePeerId: string | null;
+  sessionId: string | null;
+}
+
+export interface BackendInviteAcceptEvent {
+  stage: InviteAcceptStage;
+  source: 'interactive' | 'resume';
+  sessionId: string;
+  ownerPeerId: string;
+  projectId: string;
+  projectName: string;
+  localProjectName: string | null;
+  role: string;
+  error: string | null;
 }
 
 export interface BackendPeerStatusSummary {

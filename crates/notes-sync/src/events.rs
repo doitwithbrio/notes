@@ -16,6 +16,40 @@ pub mod event_names {
     pub const PRESENCE_UPDATE: &str = "p2p:presence-update";
     /// A peer connected or disconnected.
     pub const PEER_STATUS: &str = "p2p:peer-status";
+    /// Invite accept / resume lifecycle updates.
+    pub const INVITE_ACCEPT_STATUS: &str = "p2p:invite-accept";
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InviteAcceptStage {
+    Resuming,
+    PayloadStaged,
+    CommitConfirmed,
+    Finalized,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InviteAcceptSource {
+    Interactive,
+    Resume,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InviteAcceptEvent {
+    pub stage: InviteAcceptStage,
+    pub source: InviteAcceptSource,
+    pub session_id: String,
+    pub owner_peer_id: String,
+    pub project_id: String,
+    pub project_name: String,
+    pub local_project_name: Option<String>,
+    pub role: String,
+    pub error: Option<String>,
 }
 
 /// Emitted when a remote peer changes a document.
