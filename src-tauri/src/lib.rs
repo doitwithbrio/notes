@@ -11,9 +11,7 @@ use notes_core::{
     PeerStatusSummary, ProjectManager, ProjectSummary,
 };
 use notes_sync::events;
-use notes_sync::invite::{
-    InviteHandler, INVITE_ALPN,
-};
+use notes_sync::invite::{InviteHandler, INVITE_ALPN};
 use notes_sync::peer_manager::PeerManager;
 use notes_sync::sync_engine::{SyncEngine, NOTES_SYNC_ALPN};
 use notes_sync::SyncStateStore;
@@ -96,9 +94,7 @@ struct ReconnectQueueStats {
     dropped: usize,
 }
 
-fn reconnect_peer_id(
-    status_event: &events::PeerStatusEvent,
-) -> Option<iroh::EndpointId> {
+fn reconnect_peer_id(status_event: &events::PeerStatusEvent) -> Option<iroh::EndpointId> {
     if !matches!(
         status_event.state,
         notes_sync::events::PeerConnectionState::Connected
@@ -120,7 +116,10 @@ fn try_queue_reconnect_syncs(
     };
 
     for file in files {
-        if sync_tx.try_send((project_name.to_string(), file.id)).is_ok() {
+        if sync_tx
+            .try_send((project_name.to_string(), file.id))
+            .is_ok()
+        {
             stats.queued += 1;
         } else {
             stats.dropped += 1;
@@ -171,7 +170,10 @@ fn mark_unsent_changes_synced(state: &AppState, doc_id: DocId, synced_through: u
         .lock()
         .expect("unsent changes mutex poisoned");
     let entry = map.entry(doc_id).or_default();
-    entry.synced_changes = entry.synced_changes.max(synced_through).min(entry.local_changes);
+    entry.synced_changes = entry
+        .synced_changes
+        .max(synced_through)
+        .min(entry.local_changes);
     let pending = entry.local_changes.saturating_sub(entry.synced_changes);
     if pending == 0 {
         map.remove(&doc_id);
@@ -321,9 +323,7 @@ fn require_network_ready_status(status: &NetworkStatus) -> Result<(), CoreError>
 }
 
 fn begin_network_startup(status: &RwLock<NetworkStatus>) -> bool {
-    let mut current = status
-        .write()
-        .expect("network status lock poisoned");
+    let mut current = status.write().expect("network status lock poisoned");
     if !matches!(*current, NetworkStatus::NotStarted) {
         return false;
     }
@@ -376,19 +376,23 @@ fn is_authorized_for_min_role(
     match min_role {
         MinRole::Owner => match access_state {
             notes_core::ProjectAccessState::Owner => Ok(()),
-            notes_core::ProjectAccessState::IdentityMismatch => Err(CoreError::ProjectIdentityMismatch),
+            notes_core::ProjectAccessState::IdentityMismatch => {
+                Err(CoreError::ProjectIdentityMismatch)
+            }
             _ => match role {
                 Some(PeerRole::Owner) | Some(PeerRole::Editor) | Some(PeerRole::Viewer) => {
-                    Err(CoreError::InvalidInput("only the project owner can perform this action".into()))
+                    Err(CoreError::InvalidInput(
+                        "only the project owner can perform this action".into(),
+                    ))
                 }
                 None => Err(CoreError::ProjectIdentityMismatch),
             },
         },
         MinRole::Editor => match role {
             Some(PeerRole::Owner) | Some(PeerRole::Editor) => Ok(()),
-            Some(PeerRole::Viewer) => {
-                Err(CoreError::InvalidInput("viewers cannot modify documents".into()))
-            }
+            Some(PeerRole::Viewer) => Err(CoreError::InvalidInput(
+                "viewers cannot modify documents".into(),
+            )),
             None => Err(CoreError::ProjectIdentityMismatch),
         },
     }
@@ -397,11 +401,7 @@ fn is_authorized_for_min_role(
 /// Check the local device's role in a project. Returns Ok(()) if authorized,
 /// Err if the role is insufficient. For local-only projects (no owner set),
 /// all operations are allowed.
-async fn check_role(
-    state: &AppState,
-    project: &str,
-    min_role: MinRole,
-) -> Result<(), CoreError> {
+async fn check_role(state: &AppState, project: &str, min_role: MinRole) -> Result<(), CoreError> {
     let my_peer_id = state.local_peer_id.clone();
     let (my_role, access_state) = state
         .project_manager
@@ -419,10 +419,7 @@ async fn list_projects(state: State<'_, AppState>) -> Result<Vec<String>, CoreEr
 }
 
 #[tauri::command]
-async fn create_project(
-    state: State<'_, AppState>,
-    name: String,
-) -> Result<(), CoreError> {
+async fn create_project(state: State<'_, AppState>, name: String) -> Result<(), CoreError> {
     state.project_manager.create_project(&name).await?;
 
     let my_peer_id = state.local_peer_id.clone();
@@ -447,7 +444,10 @@ async fn list_project_summaries(
     state: State<'_, AppState>,
 ) -> Result<Vec<ProjectSummary>, CoreError> {
     let my_peer_id = state.local_peer_id.clone();
-    state.project_manager.list_project_summaries(&my_peer_id).await
+    state
+        .project_manager
+        .list_project_summaries(&my_peer_id)
+        .await
 }
 
 #[tauri::command]
@@ -478,7 +478,9 @@ async fn open_project(
             .collect();
 
         if !is_network_ready(&state) {
-            log::debug!("Skipping peer restore for project {name} because networking is not ready yet");
+            log::debug!(
+                "Skipping peer restore for project {name} because networking is not ready yet"
+            );
             return Ok(());
         }
 
@@ -536,10 +538,7 @@ async fn rename_project(
 }
 
 #[tauri::command]
-async fn delete_project(
-    state: State<'_, AppState>,
-    name: String,
-) -> Result<(), CoreError> {
+async fn delete_project(state: State<'_, AppState>, name: String) -> Result<(), CoreError> {
     // Unregister all docs from sync engine
     if let Ok(files) = state.project_manager.list_files(&name).await {
         for file in &files {
@@ -549,9 +548,7 @@ async fn delete_project(
     // Remove all peers for this project from peer manager
     let peers = state.peer_manager.get_project_peers(&name);
     for peer_id in &peers {
-        state
-            .peer_manager
-            .remove_peer_from_project(&name, peer_id);
+        state.peer_manager.remove_peer_from_project(&name, peer_id);
     }
     state.project_manager.delete_project(&name).await
 }
@@ -565,8 +562,16 @@ async fn get_project_metadata(
     let manifest_arc = state.project_manager.get_manifest_for_ui(&project)?;
     let manifest = manifest_arc.read().await;
 
-    let files = state.project_manager.list_files(&project).await.unwrap_or_default();
-    let peers = state.project_manager.get_project_peers(&project).await.unwrap_or_default();
+    let files = state
+        .project_manager
+        .list_files(&project)
+        .await
+        .unwrap_or_default();
+    let peers = state
+        .project_manager
+        .get_project_peers(&project)
+        .await
+        .unwrap_or_default();
 
     Ok(notes_core::ProjectMetadata {
         name: manifest.name().unwrap_or_default(),
@@ -764,10 +769,7 @@ async fn import_image(
 /// Get the raw bytes of a blob by its hash.
 /// Used by the frontend to display images via object URLs.
 #[tauri::command]
-async fn get_image(
-    state: State<'_, AppState>,
-    hash: String,
-) -> Result<Response, CoreError> {
+async fn get_image(state: State<'_, AppState>, hash: String) -> Result<Response, CoreError> {
     let data = state
         .blob_store
         .read(&hash)
@@ -778,10 +780,7 @@ async fn get_image(
 
 /// Check if a blob exists locally.
 #[tauri::command]
-async fn has_image(
-    state: State<'_, AppState>,
-    hash: String,
-) -> Result<bool, CoreError> {
+async fn has_image(state: State<'_, AppState>, hash: String) -> Result<bool, CoreError> {
     Ok(state.blob_store.has(&hash).await)
 }
 
@@ -930,14 +929,18 @@ async fn apply_changes(
                 author: signed.author,
                 signature: signed.signature,
             };
-            state
-                .sync_engine
-                .store_signature(doc_id, hash.clone(), sig);
+            state.sync_engine.store_signature(doc_id, hash.clone(), sig);
         }
     }
 
     // Mark doc as seen after local edits, but keep disk I/O outside the doc lock.
-    mark_seen_heads_best_effort(&state.project_manager, &project, doc_id, applied.current_heads).await;
+    mark_seen_heads_best_effort(
+        &state.project_manager,
+        &project,
+        doc_id,
+        applied.current_heads,
+    )
+    .await;
 
     let unsent_delta = applied.new_changes.len() as u32;
     let should_track_unsent = !state.peer_manager.get_project_peers(&project).is_empty();
@@ -977,10 +980,7 @@ async fn compact_doc(
     doc_id: DocId,
 ) -> Result<(), CoreError> {
     notes_core::validate_project_name(&project)?;
-    state
-        .project_manager
-        .compact_doc(&project, &doc_id)
-        .await?;
+    state.project_manager.compact_doc(&project, &doc_id).await?;
     // Invalidate persisted sync states and signatures for this doc (compaction changes internal state)
     state.sync_state_store.delete_all_for_doc(&doc_id).await;
     state.sync_engine.evict_signatures(doc_id);
@@ -1072,9 +1072,7 @@ async fn get_actor_aliases(
 
 /// Get the stable device actor ID (hex string) for the frontend to use.
 #[tauri::command]
-async fn get_device_actor_id(
-    state: State<'_, AppState>,
-) -> Result<String, CoreError> {
+async fn get_device_actor_id(state: State<'_, AppState>) -> Result<String, CoreError> {
     Ok(state.device_actor_hex.clone())
 }
 
@@ -1134,7 +1132,9 @@ async fn create_version(
 
     // Skip trivial auto-versions
     if !is_named && significance == notes_core::version::VersionSignificance::Skip {
-        return Err(CoreError::InvalidInput("no significant changes to version".into()));
+        return Err(CoreError::InvalidInput(
+            "no significant changes to version".into(),
+        ));
     }
 
     let change_count = notes_core::version::count_changes_since(&mut doc, &prev_heads);
@@ -1173,23 +1173,29 @@ async fn create_version(
         snapshot_doc.save()
     };
 
-    let snapshot_to_store = if let Ok(epoch_mgr_arc) = state.project_manager.get_epoch_keys(&project) {
-        let mgr = epoch_mgr_arc.read().await;
-        if let Ok(key) = mgr.current_key() {
-            let doc_id_bytes = *doc_id.as_bytes();
-            match notes_crypto::encrypt_snapshot(key.as_bytes(), &doc_id_bytes, mgr.current_epoch(), &snapshot_raw) {
-                Ok(encrypted) => encrypted,
-                Err(e) => {
-                    log::warn!("Snapshot encryption failed, storing plaintext: {e}");
-                    snapshot_raw
+    let snapshot_to_store =
+        if let Ok(epoch_mgr_arc) = state.project_manager.get_epoch_keys(&project) {
+            let mgr = epoch_mgr_arc.read().await;
+            if let Ok(key) = mgr.current_key() {
+                let doc_id_bytes = *doc_id.as_bytes();
+                match notes_crypto::encrypt_snapshot(
+                    key.as_bytes(),
+                    &doc_id_bytes,
+                    mgr.current_epoch(),
+                    &snapshot_raw,
+                ) {
+                    Ok(encrypted) => encrypted,
+                    Err(e) => {
+                        log::warn!("Snapshot encryption failed, storing plaintext: {e}");
+                        snapshot_raw
+                    }
                 }
+            } else {
+                snapshot_raw
             }
         } else {
             snapshot_raw
-        }
-    } else {
-        snapshot_raw
-    };
+        };
 
     {
         let store = require_version_store(&state)?;
@@ -1240,19 +1246,20 @@ async fn get_version_text(
     // Fall back to snapshot (try decrypting if it's encrypted)
     if let Some(data) = snapshot_data {
         // Try to decrypt the snapshot if epoch keys are available
-        let snapshot_bytes = if let Ok(epoch_mgr_arc) = state.project_manager.get_epoch_keys(&project) {
-            let mgr = epoch_mgr_arc.read().await;
-            if let Ok(key) = mgr.current_key() {
-                let doc_id_bytes = *doc_id.as_bytes();
-                notes_crypto::decrypt_snapshot(key.as_bytes(), &doc_id_bytes, &data)
-                    .map(|(_, plaintext)| plaintext)
-                    .unwrap_or(data) // Fall back to raw (pre-encryption snapshot)
+        let snapshot_bytes =
+            if let Ok(epoch_mgr_arc) = state.project_manager.get_epoch_keys(&project) {
+                let mgr = epoch_mgr_arc.read().await;
+                if let Ok(key) = mgr.current_key() {
+                    let doc_id_bytes = *doc_id.as_bytes();
+                    notes_crypto::decrypt_snapshot(key.as_bytes(), &doc_id_bytes, &data)
+                        .map(|(_, plaintext)| plaintext)
+                        .unwrap_or(data) // Fall back to raw (pre-encryption snapshot)
+                } else {
+                    data
+                }
             } else {
                 data
-            }
-        } else {
-            data
-        };
+            };
 
         if let Ok(snapshot_doc) = automerge::AutoCommit::load(&snapshot_bytes) {
             use automerge::ReadDoc as _;
@@ -1317,11 +1324,7 @@ async fn restore_to_version_cmd(
     let doc_arc = state.project_manager.doc_store().get_doc(&doc_id)?;
     let mut doc = doc_arc.write().await;
 
-    notes_core::version::restore_to_version(
-        &mut doc,
-        &heads,
-        decrypted_snapshot.as_deref(),
-    )?;
+    notes_core::version::restore_to_version(&mut doc, &heads, decrypted_snapshot.as_deref())?;
     drop(doc);
 
     // Mark seen so restore doesn't appear as "unseen changes"
@@ -1582,12 +1585,7 @@ async fn sync_doc_with_project(
         events::SyncState::LocalOnly
     };
 
-    emit_sync_status(
-        &state.app_handle,
-        doc_id,
-        sync_state,
-        unsent_after,
-    );
+    emit_sync_status(&state.app_handle, doc_id, sync_state, unsent_after);
 
     Ok(serde_json::json!({
         "synced": success_count,
@@ -1620,7 +1618,9 @@ async fn get_peer_status(
             .peer_id
             .parse::<iroh::EndpointId>()
             .ok()
-            .map(|peer_id| is_network_ready(&state) && state.peer_manager.is_peer_connected(&peer_id))
+            .map(|peer_id| {
+                is_network_ready(&state) && state.peer_manager.is_peer_connected(&peer_id)
+            })
             .unwrap_or(false);
         statuses.push(PeerStatusSummary {
             peer_id: meta.peer_id.clone(),
@@ -1646,10 +1646,8 @@ async fn broadcast_presence(
     selection: Option<(u64, u64)>,
 ) -> Result<(), CoreError> {
     require_network_ready(&state)?;
-    let settings = notes_core::AppSettings::load(
-        state.project_manager.persistence().base_dir(),
-    )
-    .await;
+    let settings =
+        notes_core::AppSettings::load(state.project_manager.persistence().base_dir()).await;
 
     // Emit presence event for the frontend
     let _ = state.app_handle.emit(
@@ -1687,9 +1685,7 @@ fn e2e_is_enabled() -> bool {
 
 /// Get the current app settings.
 #[tauri::command]
-async fn get_settings(
-    state: State<'_, AppState>,
-) -> Result<notes_core::AppSettings, CoreError> {
+async fn get_settings(state: State<'_, AppState>) -> Result<notes_core::AppSettings, CoreError> {
     let notes_dir = state.project_manager.persistence().base_dir();
     Ok(notes_core::AppSettings::load(notes_dir).await)
 }
@@ -1761,8 +1757,9 @@ async fn generate_invite(
     let passphrase = notes_sync::invite::generate_passphrase(6);
     let peer_id = state.local_peer_id.clone();
     let invite_ttl = notes_sync::invite::current_invite_ttl();
-    let expires_at = chrono::Utc::now() + chrono::Duration::from_std(invite_ttl)
-        .map_err(|e| CoreError::InvalidData(format!("invalid invite ttl: {e}")))?;
+    let expires_at = chrono::Utc::now()
+        + chrono::Duration::from_std(invite_ttl)
+            .map_err(|e| CoreError::InvalidData(format!("invalid invite ttl: {e}")))?;
 
     // Register a lightweight PendingInvite. The actual payload is built later
     // from current state by OwnerInviteCoordinator so it cannot go stale.
@@ -1878,6 +1875,36 @@ struct UpdateInfo {
     date: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdaterAvailability {
+    enabled: bool,
+    reason: Option<String>,
+}
+
+fn updater_availability() -> UpdaterAvailability {
+    let raw = std::env::var("NOTES_DISABLE_UPDATER").unwrap_or_default();
+    let disabled = matches!(
+        raw.as_str(),
+        "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+    );
+    let reason = std::env::var("NOTES_UPDATER_REASON")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+
+    UpdaterAvailability {
+        enabled: !disabled,
+        reason: if disabled {
+            Some(reason.unwrap_or_else(|| {
+                "Updates are managed by your system package install for this copy of notes."
+                    .to_string()
+            }))
+        } else {
+            None
+        },
+    }
+}
+
 /// Progress events streamed to the frontend during download via a Channel.
 #[derive(Clone, Serialize)]
 #[serde(tag = "event", content = "data")]
@@ -1892,6 +1919,11 @@ enum DownloadEvent {
     Finished,
 }
 
+#[tauri::command]
+fn get_updater_availability() -> UpdaterAvailability {
+    updater_availability()
+}
+
 /// Check if a newer version is available on GitHub Releases.
 /// Returns Some(UpdateInfo) if an update exists, None if up to date.
 /// The Update object is stored in PendingUpdate for install_update to use.
@@ -1900,6 +1932,11 @@ async fn check_for_update(
     app: AppHandle,
     pending: State<'_, PendingUpdate>,
 ) -> Result<Option<UpdateInfo>, String> {
+    let availability = updater_availability();
+    if !availability.enabled {
+        return Ok(None);
+    }
+
     let update = app
         .updater_builder()
         .build()
@@ -1928,6 +1965,13 @@ async fn install_update(
     pending: State<'_, PendingUpdate>,
     on_event: Channel<DownloadEvent>,
 ) -> Result<(), String> {
+    let availability = updater_availability();
+    if !availability.enabled {
+        return Err(availability.reason.unwrap_or_else(|| {
+            "updates are managed outside the app for this install".to_string()
+        }));
+    }
+
     // Take the pending Update — this consumes it so it can't be installed twice
     let update = pending
         .0
@@ -1956,9 +2000,9 @@ async fn install_update(
         }
     };
 
-    // Downloads the .app.tar.gz, verifies the minisign signature
-    // against the pubkey in tauri.conf.json, extracts it, and replaces
-    // the running .app bundle on macOS.
+    // Downloads the platform-specific updater bundle, verifies the
+    // minisign signature against the pubkey in tauri.conf.json, and
+    // lets Tauri install it for the current platform.
     update
         .download_and_install(on_chunk, on_finished)
         .await
@@ -2064,8 +2108,7 @@ fn load_or_create_secret_key(
 
     // Generate new key
     let mut key_bytes = [0u8; 32];
-    getrandom::fill(&mut key_bytes)
-        .map_err(|e| format!("failed to generate random key: {e}"))?;
+    getrandom::fill(&mut key_bytes).map_err(|e| format!("failed to generate random key: {e}"))?;
     let key = iroh::SecretKey::from_bytes(&key_bytes);
 
     // Store in keystore (OS keychain on macOS, file with 0o600 elsewhere)
@@ -2076,7 +2119,17 @@ fn load_or_create_secret_key(
 }
 
 fn start_deferred_networking(app_handle: AppHandle) {
-    let (endpoint, sync_engine, peer_manager, invite_handler, project_manager, join_session_store, sync_receiver, unsent_changes, sync_trigger) = {
+    let (
+        endpoint,
+        sync_engine,
+        peer_manager,
+        invite_handler,
+        project_manager,
+        join_session_store,
+        sync_receiver,
+        unsent_changes,
+        sync_trigger,
+    ) = {
         let state = app_handle.state::<AppState>();
         if !begin_network_startup(&state.network_status) {
             return;
@@ -2104,7 +2157,10 @@ fn start_deferred_networking(app_handle: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let Some(mut sync_rx) = sync_receiver else {
             let managed = app_handle_clone.state::<AppState>();
-            set_network_status(&managed, NetworkStatus::Failed("sync worker was already started".into()));
+            set_network_status(
+                &managed,
+                NetworkStatus::Failed("sync worker was already started".into()),
+            );
             log::error!("Deferred networking startup failed: sync worker receiver unavailable");
             return;
         };
@@ -2139,7 +2195,9 @@ fn start_deferred_networking(app_handle: AppHandle) {
             let peer_mgr = Arc::clone(&peer_manager);
             let interval_ms = peer_monitor_interval_ms();
             async move {
-                peer_mgr.monitoring_loop(Duration::from_millis(interval_ms)).await;
+                peer_mgr
+                    .monitoring_loop(Duration::from_millis(interval_ms))
+                    .await;
             }
         });
 
@@ -2181,7 +2239,10 @@ fn start_deferred_networking(app_handle: AppHandle) {
                         if ok > 0 {
                             if let Ok(mut map) = unsent_changes.lock() {
                                 let entry = map.entry(doc_id).or_default();
-                                entry.synced_changes = entry.synced_changes.max(sync_checkpoint).min(entry.local_changes);
+                                entry.synced_changes = entry
+                                    .synced_changes
+                                    .max(sync_checkpoint)
+                                    .min(entry.local_changes);
                                 if entry.local_changes.saturating_sub(entry.synced_changes) == 0 {
                                     map.remove(&doc_id);
                                 }
@@ -2200,8 +2261,9 @@ fn start_deferred_networking(app_handle: AppHandle) {
                             .lock()
                             .ok()
                             .and_then(|map| {
-                                map.get(&doc_id)
-                                    .map(|entry| entry.local_changes.saturating_sub(entry.synced_changes))
+                                map.get(&doc_id).map(|entry| {
+                                    entry.local_changes.saturating_sub(entry.synced_changes)
+                                })
                             })
                             .unwrap_or(0);
                         emit_sync_status(&handle, doc_id, sync_state, pending);
@@ -2236,7 +2298,11 @@ fn start_deferred_networking(app_handle: AppHandle) {
                                 for project_name in peer_mgr.get_projects_for_peer(&peer_id) {
                                     match pm.list_files(&project_name).await {
                                         Ok(files) => {
-                                            let stats = try_queue_reconnect_syncs(&sync_tx, &project_name, &files);
+                                            let stats = try_queue_reconnect_syncs(
+                                                &sync_tx,
+                                                &project_name,
+                                                &files,
+                                            );
                                             if stats.dropped > 0 {
                                                 log::warn!(
                                                     "Dropped {} reconnect sync jobs for project {}",
@@ -2278,7 +2344,9 @@ fn start_deferred_networking(app_handle: AppHandle) {
                             if let Some(project_name) = pm.get_project_for_doc(&doc_id) {
                                 if let Ok(owner) = pm.get_project_owner(&project_name).await {
                                     if !owner.is_empty() {
-                                        if let Ok(manifest_arc) = pm.get_manifest_for_ui(&project_name) {
+                                        if let Ok(manifest_arc) =
+                                            pm.get_manifest_for_ui(&project_name)
+                                        {
                                             let manifest = manifest_arc.read().await;
                                             if let Ok(aliases) = manifest.get_actor_aliases() {
                                                 let owner_actor = aliases
@@ -2288,7 +2356,11 @@ fn start_deferred_networking(app_handle: AppHandle) {
                                                 drop(manifest);
                                                 if let Some(actor_hex) = owner_actor {
                                                     if let Err(e) = pm
-                                                        .validate_manifest_after_sync(&project_name, &[], &actor_hex)
+                                                        .validate_manifest_after_sync(
+                                                            &project_name,
+                                                            &[],
+                                                            &actor_hex,
+                                                        )
                                                         .await
                                                     {
                                                         log::error!("Manifest validation failed for {project_name}: {e}");
@@ -2686,6 +2758,7 @@ pub fn run() {
             e2e_set_network_blocked,
             e2e_is_enabled,
             // Auto-update
+            get_updater_availability,
             check_for_update,
             install_update,
         ])
@@ -2754,7 +2827,8 @@ mod tests {
     #[tokio::test]
     async fn try_queue_reconnect_syncs_counts_queued_and_dropped() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, DocId)>(1);
-        tx.try_send(("prefill".into(), uuid::Uuid::new_v4())).unwrap();
+        tx.try_send(("prefill".into(), uuid::Uuid::new_v4()))
+            .unwrap();
 
         let files = vec![
             DocInfo {
@@ -2811,7 +2885,8 @@ mod tests {
     #[tokio::test]
     async fn try_queue_reconnect_syncs_mixed_capacity() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, DocId)>(2);
-        tx.try_send(("prefill".into(), uuid::Uuid::new_v4())).unwrap();
+        tx.try_send(("prefill".into(), uuid::Uuid::new_v4()))
+            .unwrap();
         let files = vec![
             DocInfo {
                 id: uuid::Uuid::new_v4(),
@@ -2835,7 +2910,10 @@ mod tests {
         let first = rx.recv().await.unwrap();
         let second = rx.recv().await.unwrap();
         let queued = vec![first, second];
-        assert!(queued.contains(&("project".to_string(), files[0].id)) || queued.contains(&("project".to_string(), files[1].id)));
+        assert!(
+            queued.contains(&("project".to_string(), files[0].id))
+                || queued.contains(&("project".to_string(), files[1].id))
+        );
     }
 
     #[test]
@@ -2872,10 +2950,22 @@ mod tests {
 
     #[test]
     fn network_status_message_covers_all_states() {
-        assert_eq!(network_status_message(&NetworkStatus::NotStarted), "networking is still starting");
-        assert_eq!(network_status_message(&NetworkStatus::Starting), "networking is still starting");
-        assert_eq!(network_status_message(&NetworkStatus::Ready), "networking is ready");
-        assert_eq!(network_status_message(&NetworkStatus::Failed("x".into())), "networking failed to initialize");
+        assert_eq!(
+            network_status_message(&NetworkStatus::NotStarted),
+            "networking is still starting"
+        );
+        assert_eq!(
+            network_status_message(&NetworkStatus::Starting),
+            "networking is still starting"
+        );
+        assert_eq!(
+            network_status_message(&NetworkStatus::Ready),
+            "networking is ready"
+        );
+        assert_eq!(
+            network_status_message(&NetworkStatus::Failed("x".into())),
+            "networking failed to initialize"
+        );
     }
 
     #[tokio::test]
@@ -2906,12 +2996,23 @@ mod tests {
         let project_manager = ProjectManager::new(dir.path().to_path_buf());
         project_manager.create_project("shared").await.unwrap();
         project_manager.open_project("shared").await.unwrap();
-        let doc_id = project_manager.create_note("shared", "hello.md").await.unwrap();
+        let doc_id = project_manager
+            .create_note("shared", "hello.md")
+            .await
+            .unwrap();
 
-        let seen_state_path = dir.path().join("shared").join(".p2p").join("seen_state.json");
-        tokio::fs::write(&seen_state_path, "{bad json").await.unwrap();
+        let seen_state_path = dir
+            .path()
+            .join("shared")
+            .join(".p2p")
+            .join("seen_state.json");
+        tokio::fs::write(&seen_state_path, "{bad json")
+            .await
+            .unwrap();
 
-        let unseen = get_unseen_docs_for_project(&project_manager, "shared").await.unwrap();
+        let unseen = get_unseen_docs_for_project(&project_manager, "shared")
+            .await
+            .unwrap();
         assert_eq!(unseen.len(), 1);
         assert_eq!(unseen[0].doc_id, doc_id);
 

@@ -1,0 +1,17 @@
+pkgbase = notes-bin
+	pkgdesc = Local-first, peer-to-peer, end-to-end encrypted markdown notes app
+	pkgver = 0.1.5
+	pkgrel = 1
+	url = https://github.com/doitwithbrio/notes
+	install = notes-bin.install
+	arch = x86_64
+	license = MIT
+	depends = desktop-file-utils
+	depends = hicolor-icon-theme
+	provides = notes
+	conflicts = notes
+	options = !strip
+	source_x86_64 = https://github.com/doitwithbrio/notes/releases/download/v0.1.5/notes_0.1.5_amd64.AppImage
+	sha256sums_x86_64 = b37b0244ee87122ff77a166a5d64c6cb6b140a531e5ffec44adbb31168fd183d
+
+pkgname = notes-bin

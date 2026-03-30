@@ -6,6 +6,7 @@
   import {
     checkForUpdate,
     ensureCurrentVersion,
+    ensureUpdaterAvailability,
     installUpdate,
     updateState,
   } from '../../state/updates.svelte.js';
@@ -34,6 +35,7 @@
       void loadSettings();
     }
     void ensureCurrentVersion();
+    void ensureUpdaterAvailability();
   });
 
   const updateStatus = $derived(updateState.status);
@@ -41,6 +43,8 @@
   const currentVersion = $derived(updateState.currentVersion);
   const updateProgress = $derived(updateState.progress);
   const lastCheckResult = $derived(updateState.lastCheckResult);
+  const updaterEnabled = $derived(updateState.updaterEnabled);
+  const updaterReason = $derived(updateState.updaterReason);
 
   function formatCheckedAt(timestamp: number | null) {
     if (!timestamp) return 'never';
@@ -343,25 +347,34 @@
                 <div class="field-label">current version</div>
                 <div class="update-meta">{currentVersion || 'loading...'}</div>
               </div>
-              <button
-                class="update-check-btn"
-                type="button"
-                disabled={updateStatus === 'checking' || updateStatus === 'downloading' || updateStatus === 'installing'}
-                onclick={handleManualUpdateCheck}
-              >
-                {#if updateStatus === 'checking'}
-                  <LoaderCircle size={13} strokeWidth={1.8} class="spinning" />
-                  checking...
-                {:else}
-                  <RefreshCw size={13} strokeWidth={1.8} />
-                  check for updates
-                {/if}
-              </button>
+              {#if updaterEnabled}
+                <button
+                  class="update-check-btn"
+                  type="button"
+                  disabled={updateStatus === 'checking' || updateStatus === 'downloading' || updateStatus === 'installing'}
+                  onclick={handleManualUpdateCheck}
+                >
+                  {#if updateStatus === 'checking'}
+                    <LoaderCircle size={13} strokeWidth={1.8} class="spinning" />
+                    checking...
+                  {:else}
+                    <RefreshCw size={13} strokeWidth={1.8} />
+                    check for updates
+                  {/if}
+                </button>
+              {:else}
+                <div class="update-managed-pill">managed by system</div>
+              {/if}
             </div>
 
             <div class="update-subtle">last checked: {formatCheckedAt(updateState.lastCheckedAt)}</div>
 
-            {#if updateStatus === 'available' && updateInfo}
+            {#if !updaterEnabled}
+              <div class="update-panel" role="status" aria-live="polite">
+                <div class="update-panel-title">updates are managed by your Linux package install</div>
+                <div class="update-subtle">{updaterReason || 'Use Omarchy or your package manager to install new versions.'}</div>
+              </div>
+            {:else if updateStatus === 'available' && updateInfo}
               <div class="update-panel success" role="status" aria-live="polite">
                 <div class="update-panel-head">
                   <div>
@@ -714,6 +727,19 @@
     font-weight: 500;
     white-space: nowrap;
     transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
+  }
+
+  .update-managed-pill {
+    display: inline-flex;
+    align-items: center;
+    padding: 8px 12px;
+    border-radius: 999px;
+    background: var(--surface-sidebar);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-weight: 500;
+    white-space: nowrap;
   }
 
   .update-check-btn:hover,

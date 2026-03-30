@@ -1,0 +1,80 @@
+pkgname=notes-bin
+_pkgname=notes
+pkgver=0.1.5
+pkgrel=1
+pkgdesc="Local-first, peer-to-peer, end-to-end encrypted markdown notes app"
+arch=('x86_64')
+url="https://github.com/doitwithbrio/notes"
+license=('MIT')
+depends=('desktop-file-utils' 'hicolor-icon-theme')
+provides=('notes')
+conflicts=('notes')
+options=('!strip')
+install=${pkgname}.install
+source_x86_64=("${url}/releases/download/v${pkgver}/${_pkgname}_${pkgver}_amd64.AppImage")
+sha256sums_x86_64=('b37b0244ee87122ff77a166a5d64c6cb6b140a531e5ffec44adbb31168fd183d')
+
+package() {
+  cd "$srcdir"
+
+  chmod +x "${_pkgname}_${pkgver}_amd64.AppImage"
+  install -Dm755 "${_pkgname}_${pkgver}_amd64.AppImage" "$pkgdir/opt/${_pkgname}/${_pkgname}.AppImage"
+
+  rm -rf squashfs-root
+  "${srcdir}/${_pkgname}_${pkgver}_amd64.AppImage" --appimage-extract >/dev/null
+
+  local desktop_file
+  desktop_file=$(find squashfs-root -name '*.desktop' | head -n 1)
+  if [[ -z "$desktop_file" || ! -f "$desktop_file" ]]; then
+    echo "could not locate desktop file inside AppImage" >&2
+    return 1
+  fi
+
+  local icon_file
+  icon_file=$(find squashfs-root -path '*/128x128/*' -name '*.png' | head -n 1)
+  if [[ -z "$icon_file" || ! -f "$icon_file" ]]; then
+    icon_file=$(find squashfs-root -name '*.png' | head -n 1)
+  fi
+  if [[ -z "$icon_file" || ! -f "$icon_file" ]]; then
+    echo "could not locate icon inside AppImage" >&2
+    return 1
+  fi
+
+  install -Dm755 /dev/stdin "$pkgdir/usr/bin/${_pkgname}" <<'EOF'
+#!/bin/sh
+export NOTES_DISABLE_UPDATER=1
+export NOTES_UPDATER_REASON="${NOTES_UPDATER_REASON:-Updates are managed by Omarchy/AUR for this install.}"
+: "${WEBKIT_DISABLE_DMABUF_RENDERER:=1}"
+export WEBKIT_DISABLE_DMABUF_RENDERER
+exec /opt/${_pkgname}/${_pkgname}.AppImage --appimage-extract-and-run "$@"
+EOF
+
+  install -Dm644 "$desktop_file" "$pkgdir/usr/share/applications/${_pkgname}.desktop"
+  sed -i 's|^Exec=.*|Exec=/usr/bin/notes %U|' "$pkgdir/usr/share/applications/${_pkgname}.desktop"
+  sed -i 's|^Icon=.*|Icon=notes|' "$pkgdir/usr/share/applications/${_pkgname}.desktop"
+
+  install -Dm644 "$icon_file" "$pkgdir/usr/share/icons/hicolor/128x128/apps/${_pkgname}.png"
+  install -Dm644 /dev/stdin "$pkgdir/usr/share/licenses/${pkgname}/LICENSE" <<'EOF'
+MIT License
+
+Copyright (c) 2026 doitwithbrio
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+EOF
+}

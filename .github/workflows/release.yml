@@ -38,6 +38,7 @@ jobs:
             NOTES=$(printf '%s\n' \
               "- macOS: if you see 'unidentified developer', right-click the app and select Open." \
               "- Linux (AppImage): download the .AppImage asset, run chmod +x on it, then launch it." \
+              "- Linux (deb/AUR): Omarchy and Arch users should prefer the packaged install path when available." \
               "- Arch/Omarchy: if AppImage mounting fails, install fuse2 or run with --appimage-extract-and-run.")
             gh release create "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" \
@@ -207,26 +208,58 @@ jobs:
       - name: Install Tauri CLI
         run: bun add -g @tauri-apps/cli@2
 
-      - name: Build AppImage
+      - name: Build Linux bundles
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: tauri build --bundles appimage
+        run: tauri build --bundles appimage,deb
 
-      - name: Capture updater metadata
-        id: bundle_meta
+      - name: Normalize Debian bundle name
+        run: |
+          DIR="target/release/bundle/deb"
+          shopt -s nullglob
+          DEBS=("$DIR"/*.deb)
+          if [ "${#DEBS[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one deb bundle in $DIR"
+            ls -laR "$DIR" || true
+            exit 1
+          fi
+          EXPECTED="$DIR/notes_${{ needs.verify-version.outputs.version }}_amd64.deb"
+          if [ "${DEBS[0]}" != "$EXPECTED" ]; then
+            mv "${DEBS[0]}" "$EXPECTED"
+          fi
+
+      - name: Normalize AppImage bundle name
         run: |
           DIR="target/release/bundle/appimage"
           shopt -s nullglob
           APPS=("$DIR"/*.AppImage)
           SIGS=("$DIR"/*.AppImage.sig)
           if [ "${#APPS[@]}" -ne 1 ] || [ "${#SIGS[@]}" -ne 1 ]; then
-            echo "::error::Missing AppImage or signature in $DIR"
+            echo "::error::Expected exactly one AppImage and signature in $DIR"
             ls -laR "$DIR" || true
             exit 1
           fi
-          APP="${APPS[0]}"
-          SIG_FILE="${SIGS[0]}"
+          EXPECTED_APP="$DIR/notes_${{ needs.verify-version.outputs.version }}_amd64.AppImage"
+          EXPECTED_SIG="${EXPECTED_APP}.sig"
+          if [ "${APPS[0]}" != "$EXPECTED_APP" ]; then
+            mv "${APPS[0]}" "$EXPECTED_APP"
+          fi
+          if [ "${SIGS[0]}" != "$EXPECTED_SIG" ]; then
+            mv "${SIGS[0]}" "$EXPECTED_SIG"
+          fi
+
+      - name: Capture updater metadata
+        id: bundle_meta
+        run: |
+          DIR="target/release/bundle/appimage"
+          APP="$DIR/notes_${{ needs.verify-version.outputs.version }}_amd64.AppImage"
+          SIG_FILE="${APP}.sig"
+          if [ ! -f "$APP" ] || [ ! -f "$SIG_FILE" ]; then
+            echo "::error::Missing normalized AppImage or signature in $DIR"
+            ls -laR "$DIR" || true
+            exit 1
+          fi
           {
             echo "updater_bundle=$(basename "$APP")"
             echo "updater_signature<<EOF"
@@ -243,7 +276,7 @@ jobs:
           TAG="$GITHUB_REF_NAME"
           REPO="$GITHUB_REPOSITORY"
 
-          for f in "$DIR"/*.AppImage "$DIR"/*.AppImage.sig; do
+          for f in "$DIR"/*.AppImage "$DIR"/*.AppImage.sig target/release/bundle/deb/*.deb; do
             if [ -f "$f" ]; then
               echo "Uploading: $(basename "$f")"
               gh release upload "$TAG" "$f" --repo "$REPO" --clobber

@@ -16,12 +16,15 @@ import { invoke } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
 import { relaunch } from '@tauri-apps/plugin-process';
 
-import type { UpdateInfo, UpdateStatus } from '../types/index.js';
+import type { UpdateInfo, UpdateStatus, UpdaterAvailability } from '../types/index.js';
 
 export const updateState = $state({
   status: 'idle' as UpdateStatus,
   currentVersion: '',
   info: null as UpdateInfo | null,
+  updaterEnabled: true,
+  updaterReason: null as string | null,
+  updaterChecked: false,
   /** Download progress 0–100. */
   progress: 0,
   /** Total bytes to download (from Content-Length header). */
@@ -37,6 +40,34 @@ export const updateState = $state({
 });
 
 let versionPromise: Promise<void> | null = null;
+let availabilityPromise: Promise<void> | null = null;
+
+export async function ensureUpdaterAvailability(): Promise<void> {
+  if (updateState.updaterChecked || availabilityPromise) {
+    return availabilityPromise ?? Promise.resolve();
+  }
+
+  availabilityPromise = invoke<UpdaterAvailability>('get_updater_availability')
+    .then((availability) => {
+      updateState.updaterEnabled = availability.enabled;
+      updateState.updaterReason = availability.reason;
+      updateState.updaterChecked = true;
+      if (!availability.enabled) {
+        updateState.status = 'idle';
+        updateState.info = null;
+      }
+    })
+    .catch(() => {
+      updateState.updaterEnabled = true;
+      updateState.updaterReason = null;
+      updateState.updaterChecked = true;
+    })
+    .finally(() => {
+      availabilityPromise = null;
+    });
+
+  return availabilityPromise;
+}
 
 /** Load the current installed app version once so Settings can always show it. */
 export async function ensureCurrentVersion(): Promise<void> {
@@ -66,6 +97,13 @@ export async function ensureCurrentVersion(): Promise<void> {
  * @returns true if an update is available.
  */
 export async function checkForUpdate(silent = false): Promise<boolean> {
+  await ensureUpdaterAvailability();
+  if (!updateState.updaterEnabled) {
+    updateState.status = 'idle';
+    updateState.info = null;
+    return false;
+  }
+
   if (updateState.status === 'checking' || updateState.status === 'downloading') return false;
 
   updateState.status = 'checking';
@@ -118,6 +156,12 @@ export async function checkForUpdate(silent = false): Promise<boolean> {
  * After installation, auto-relaunches the app.
  */
 export async function installUpdate(): Promise<void> {
+  await ensureUpdaterAvailability();
+  if (!updateState.updaterEnabled) {
+    updateState.status = 'idle';
+    return;
+  }
+
   if (updateState.status !== 'available' || !updateState.info) return;
 
   updateState.status = 'downloading';
@@ -155,10 +199,9 @@ export async function installUpdate(): Promise<void> {
       }
     };
 
-    // This calls the Rust install_update command, which:
-    // 1. Downloads the .app.tar.gz from GitHub Releases
-    // 2. Verifies the minisign signature against the embedded pubkey
-    // 3. Extracts the archive and replaces the running .app bundle
+    // This calls the Rust install_update command, which downloads the
+    // platform-specific updater bundle from GitHub Releases, verifies the
+    // minisign signature against the embedded pubkey, and lets Tauri apply it.
     await invoke('install_update', { onEvent });
 
     updateState.status = 'ready';

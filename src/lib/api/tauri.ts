@@ -18,6 +18,7 @@ import type {
   BackendVersion,
   BackendRecoverableDocCorruptionDetails,
   UpdateInfo,
+  UpdaterAvailability,
 } from '../types/index.js';
 import { assertTauriRuntime } from '../runtime/tauri.js';
 
@@ -148,6 +149,7 @@ export const tauriApi = {
     guardedListen<BackendInviteAcceptEvent>('p2p:invite-accept', handler),
 
   // ── Auto-update ──────────────────────────────────────────────────
+  getUpdaterAvailability: () => guardedInvoke<UpdaterAvailability>('get_updater_availability'),
   /** Ask the Rust backend to fetch latest.json and compare versions. */
   checkForUpdate: () => guardedInvoke<UpdateInfo | null>('check_for_update'),
 };

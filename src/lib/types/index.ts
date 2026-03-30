@@ -372,8 +372,8 @@ export type UpdateStatus =
   | 'idle'         // No update activity
   | 'checking'     // Fetching latest.json from GitHub
   | 'available'    // Newer version found, waiting for user action
-  | 'downloading'  // .app.tar.gz being downloaded
-  | 'installing'   // Extracting and replacing the .app bundle
+  | 'downloading'  // Updater bundle is being downloaded
+  | 'installing'   // Tauri is applying the update
   | 'ready'        // Install done, about to relaunch
   | 'error';       // Something went wrong
 
@@ -383,4 +383,9 @@ export interface UpdateInfo {
   currentVersion: string;
   body: string | null;
   date: string | null;
+}
+
+export interface UpdaterAvailability {
+  enabled: boolean;
+  reason: string | null;
 }

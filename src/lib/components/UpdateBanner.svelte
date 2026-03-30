@@ -23,14 +23,16 @@
   const info = $derived(updateState.info);
   const progress = $derived(updateState.progress);
   const error = $derived(updateState.error);
+  const updaterEnabled = $derived(updateState.updaterEnabled);
 
   // Only render the banner when there's something to show
   const visible = $derived(
-    status === 'available' ||
-      status === 'downloading' ||
-      status === 'installing' ||
-      status === 'ready' ||
-      status === 'error',
+    updaterEnabled &&
+      (status === 'available' ||
+        status === 'downloading' ||
+        status === 'installing' ||
+        status === 'ready' ||
+        status === 'error'),
   );
 
   function handleInstall() {
