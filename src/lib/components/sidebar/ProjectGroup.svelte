@@ -97,7 +97,7 @@
   });
 </script>
 
-<div class="project-group">
+<div class="project-group" data-testid={`project-group-${project.id}`}>
   {#if !sidebarCollapsed}
     {#if editing}
       <div class="project-header editing">
@@ -126,6 +126,7 @@
       >
         <button
           class="project-name-btn"
+          data-testid={`project-open-${project.id}`}
           class:active={isActiveProject}
           onclick={handleProjectClick}
           disabled={editMode}
@@ -133,7 +134,7 @@
           {project.name}
         </button>
         {#if !editMode}
-          <button class="add-note-btn" onclick={handleAddNote} aria-label="new note in {project.name}">
+          <button class="add-note-btn" data-testid={`project-add-note-${project.id}`} onclick={handleAddNote} aria-label="new note in {project.name}">
             <FilePlus size={13} strokeWidth={1.5} />
           </button>
         {/if}

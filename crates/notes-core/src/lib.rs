@@ -1,6 +1,7 @@
 pub mod blame;
 pub mod doc_store;
 pub mod error;
+pub mod invite_state;
 pub mod manifest;
 pub mod persistence;
 pub mod project;
@@ -15,6 +16,10 @@ pub mod version_store;
 pub use blame::get_document_blame;
 pub use doc_store::DocStore;
 pub use error::CoreError;
+pub use invite_state::{
+    JoinSessionStore, OwnerInviteStateStore, PersistedJoinSession, PersistedJoinStage,
+    PersistedOwnerInvitePhase, PersistedOwnerInviteRecord,
+};
 pub use manifest::ProjectManifest;
 pub use project::ProjectManager;
 pub use search::{SearchIndex, SearchResult};

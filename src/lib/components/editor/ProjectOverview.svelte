@@ -3,9 +3,9 @@
   import { documentState } from '../../state/documents.svelte.js';
   import { todoState, addTodo, toggleTodo, removeTodo } from '../../state/todos.svelte.js';
   import { presenceState } from '../../state/presence.svelte.js';
-  import { openEditorSession } from '../../session/editor-session.svelte.js';
   import { openShareDialog } from '../../state/invite.svelte.js';
   import { FileText, X, Share2 } from 'lucide-svelte';
+  import { navigateToDoc } from '../../navigation/workspace-router.svelte.js';
 
   let { project }: { project: Project } = $props();
 
@@ -41,7 +41,7 @@
   }
 
   function openDoc(docId: string) {
-    void openEditorSession(project.id, docId);
+    void navigateToDoc(project.id, docId);
   }
 
   function getLinkedDocTitle(docId: string | undefined): string | null {

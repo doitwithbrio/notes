@@ -1,10 +1,8 @@
 import { tauriApi } from '../api/tauri.js';
 import type { BackendDocInfo, BackendUnseenDocInfo, Document, SyncStatus } from '../types/index.js';
-import { uiState } from './ui.svelte.js';
 import { applyDocOrder, saveDocOrder } from './ordering.svelte.js';
 
 export const documentState = $state({
-  activeDocId: null as string | null,
   docs: [] as Document[],
   loading: false,
   loadingProjectIds: [] as string[],
@@ -97,26 +95,9 @@ async function fetchProjectDocs(projectId: string): Promise<Document[]> {
   );
 }
 
-export function getActiveDoc(): Document | null {
-  return documentState.docs.find((doc) => doc.id === documentState.activeDocId) ?? null;
-}
-
 export function getDocById(docId: string | null): Document | null {
   if (!docId) return null;
   return documentState.docs.find((doc) => doc.id === docId) ?? null;
-}
-
-export function setActiveDoc(docId: string | null) {
-  documentState.activeDocId = docId;
-  if (!docId) return;
-  const doc = getDocById(docId);
-  if (!doc) return;
-  uiState.view = 'editor';
-  uiState.activeProjectId = doc.projectId;
-}
-
-export function clearActiveDocSelection() {
-  documentState.activeDocId = null;
 }
 
 export async function loadProjectDocs(
@@ -189,9 +170,6 @@ export function addDoc(doc: Document) {
 export function removeDoc(docId: string) {
   const index = documentState.docs.findIndex((doc) => doc.id === docId);
   if (index >= 0) documentState.docs.splice(index, 1);
-  if (documentState.activeDocId === docId) {
-    documentState.activeDocId = null;
-  }
 }
 
 export async function deleteDoc(projectId: string, docId: string) {

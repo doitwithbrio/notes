@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use automerge::AutoCommit;
 use dashmap::DashMap;
@@ -69,6 +70,9 @@ pub struct SyncEngine {
 
     /// Semaphore limiting concurrent incoming connections.
     connection_semaphore: Arc<Semaphore>,
+
+    /// Test-only network gate used by desktop E2E.
+    network_blocked: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for SyncEngine {
@@ -90,6 +94,7 @@ impl SyncEngine {
             sync_state_store: None,
             change_tx,
             connection_semaphore: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            network_blocked: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -102,6 +107,14 @@ impl SyncEngine {
     /// Returns a receiver that yields the DocId (as Uuid) of changed documents.
     pub fn subscribe_remote_changes(&self) -> tokio::sync::broadcast::Receiver<Uuid> {
         self.change_tx.subscribe()
+    }
+
+    pub fn set_network_blocked(&self, blocked: bool) {
+        self.network_blocked.store(blocked, Ordering::Relaxed);
+    }
+
+    pub fn is_network_blocked(&self) -> bool {
+        self.network_blocked.load(Ordering::Relaxed)
     }
 
 
@@ -226,6 +239,10 @@ impl SyncEngine {
         connection: &Connection,
         doc_id: Uuid,
     ) -> Result<(), SyncError> {
+        if self.is_network_blocked() {
+            return Err(SyncError::Protocol("network blocked".to_string()));
+        }
+
         let key = uuid_to_doc_key(doc_id);
         let doc = self
             .get_doc(&key)
@@ -272,6 +289,12 @@ impl SyncEngine {
         let stream_semaphore = Semaphore::new(MAX_STREAMS_PER_CONNECTION);
 
         loop {
+            if self.is_network_blocked() {
+                log::debug!("Closing active sync connection because network is blocked");
+                connection.close(0u32.into(), b"e2e-network-blocked");
+                break;
+            }
+
             // Limit concurrent streams per connection
             let _stream_permit = stream_semaphore.acquire().await.map_err(|_| {
                 SyncError::Protocol("stream semaphore closed".to_string())
@@ -440,6 +463,7 @@ impl iroh::protocol::ProtocolHandler for SyncEngine {
             sync_state_store: self.sync_state_store.clone(),
             change_tx: self.change_tx.clone(),
             connection_semaphore: Arc::clone(&self.connection_semaphore),
+            network_blocked: Arc::clone(&self.network_blocked),
         };
         let semaphore = Arc::clone(&self.connection_semaphore);
 
@@ -452,6 +476,12 @@ impl iroh::protocol::ProtocolHandler for SyncEngine {
                     return Ok(());
                 }
             };
+
+            if engine.is_network_blocked() {
+                log::debug!("Dropping incoming sync connection because network is blocked");
+                connection.close(0u32.into(), b"e2e-network-blocked");
+                return Ok(());
+            }
 
             if let Err(e) = engine.handle_connection(connection).await {
                 log::error!("Sync protocol error: {e}");

@@ -145,7 +145,6 @@ export const CURSOR_COLORS = [
 export type ConnectionStatus = 'connected' | 'slow' | 'offline' | 'local';
 export type SyncStatus = 'synced' | 'syncing' | 'local-only';
 export type PeerRole = 'owner' | 'editor' | 'viewer';
-export type AppView = 'editor' | 'settings' | 'project-overview' | 'history-review';
 
 export interface BackendProjectSummary {
   name: string;

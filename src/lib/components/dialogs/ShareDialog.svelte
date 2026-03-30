@@ -77,6 +77,7 @@
 <div class="backdrop" onclick={closeShareDialog}>
   <div
     class="panel"
+    data-testid="share-dialog"
     role="dialog"
     tabindex="-1"
     aria-modal="true"
@@ -86,8 +87,8 @@
     <div class="panel-header">
       <h3 id="share-title">share {project?.name ?? 'project'}</h3>
       <div class="role-switcher">
-        <button class="role-btn" class:active={inviteState.inviteRole === 'editor'} onclick={() => setRole('editor')}>editor</button>
-        <button class="role-btn" class:active={inviteState.inviteRole === 'viewer'} onclick={() => setRole('viewer')}>viewer</button>
+        <button class="role-btn" data-testid="share-role-editor" class:active={inviteState.inviteRole === 'editor'} onclick={() => setRole('editor')}>editor</button>
+        <button class="role-btn" data-testid="share-role-viewer" class:active={inviteState.inviteRole === 'viewer'} onclick={() => setRole('viewer')}>viewer</button>
       </div>
     </div>
 
@@ -98,8 +99,8 @@
           <span>generating invite code...</span>
         </div>
       {:else if inviteState.generateError}
-        <div class="error-row">{inviteState.generateError}</div>
-        <button class="action-row" onclick={handleGenerate}>try again</button>
+        <div class="error-row" data-testid="share-error">{inviteState.generateError}</div>
+        <button class="action-row" data-testid="share-regenerate" onclick={handleGenerate}>try again</button>
       {:else if invite}
         <p class="hint">share this code and your peer ID with the person you want to invite</p>
         <p class="hint-subtle">this invite is single-use, expires in 10 minutes, and stops working if you close the app</p>
@@ -107,7 +108,7 @@
         <div class="field-row">
           <span class="field-label">invite code</span>
           <div class="code-box">
-            <span class="passphrase">{invite.passphrase}</span>
+            <span class="passphrase" data-testid="share-passphrase">{invite.passphrase}</span>
             <button class="copy-btn" onclick={() => copyToClipboard(invite.passphrase, 'passphrase')}>
               {#if copiedPassphrase}
                 <Check size={13} strokeWidth={1.5} />
@@ -121,7 +122,7 @@
         <div class="field-row">
           <span class="field-label">your peer ID</span>
           <div class="code-box small">
-            <span class="peer-id">{inviteState.localPeerId ?? invite.peerId}</span>
+            <span class="peer-id" data-testid="share-peer-id">{inviteState.localPeerId ?? invite.peerId}</span>
             <button class="copy-btn" onclick={() => copyToClipboard(inviteState.localPeerId ?? invite.peerId, 'peerId')}>
               {#if copiedPeerId}
                 <Check size={13} strokeWidth={1.5} />
@@ -134,18 +135,18 @@
 
         <div class="footer-row">
           {#if expired}
-            <span class="expired">invite expired</span>
+            <span class="expired" data-testid="share-expired">invite expired</span>
           {:else}
-            <span class="timer">expires in {timerLabel()}</span>
+            <span class="timer" data-testid="share-timer">expires in {timerLabel()}</span>
           {/if}
           <div class="footer-actions">
-            <button class="btn-accent" onclick={handleGenerate}>new code</button>
+            <button class="btn-accent" data-testid="share-new-code" onclick={handleGenerate}>new code</button>
             <button class="btn-muted" onclick={closeShareDialog}>done</button>
           </div>
         </div>
       {:else}
         <p class="hint">choose a role, then generate a one-time invite code</p>
-        <button class="action-row" onclick={handleGenerate}>generate invite</button>
+        <button class="action-row" data-testid="share-generate" onclick={handleGenerate}>generate invite</button>
       {/if}
     </div>
   </div>

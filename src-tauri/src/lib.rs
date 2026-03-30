@@ -1,13 +1,19 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+pub mod invite_accept;
 
 use iroh::endpoint::Endpoint;
 use iroh::protocol::Router;
 use notes_core::{
-    CoreError, DocId, DocInfo, PeerRole, PeerStatusSummary, ProjectManager, ProjectSummary,
+    CoreError, DocId, DocInfo, JoinSessionStore, OwnerInviteStateStore, PeerRole,
+    PeerStatusSummary, ProjectManager, ProjectSummary,
 };
 use notes_sync::events;
-use notes_sync::invite::{InviteHandler, INVITE_ALPN};
+use notes_sync::invite::{
+    InviteHandler, INVITE_ALPN,
+};
 use notes_sync::peer_manager::PeerManager;
 use notes_sync::sync_engine::{SyncEngine, NOTES_SYNC_ALPN};
 use notes_sync::SyncStateStore;
@@ -16,12 +22,20 @@ use tauri::ipc::{Channel, InvokeResponseBody, Response};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 use tauri_plugin_updater::UpdaterExt;
 
+use crate::invite_accept::{
+    accept_invite_impl, populate_doc_acl_from_parts, resume_join_sessions, AcceptInviteResult,
+    OwnerInviteCoordinator, OwnerInvitePersistence,
+};
+
 /// Shared app state accessible from all Tauri commands.
 struct AppState {
     project_manager: Arc<ProjectManager>,
     sync_engine: Arc<SyncEngine>,
     peer_manager: Arc<PeerManager>,
     invite_handler: Arc<InviteHandler>,
+    #[allow(dead_code)]
+    owner_invite_store: Arc<OwnerInviteStateStore>,
+    join_session_store: Arc<JoinSessionStore>,
     #[allow(dead_code)] // Used by sync sessions — wired via SyncEngine in Phase 2+
     sync_state_store: Arc<SyncStateStore>,
     search_index: Arc<std::sync::Mutex<notes_core::SearchIndex>>,
@@ -31,6 +45,8 @@ struct AppState {
     device_actor_hex: String,
     /// Channel to trigger auto-sync when documents change.
     sync_trigger: tokio::sync::mpsc::Sender<(String, DocId)>,
+    /// Count of local changes not yet confirmed synced to at least one peer.
+    unsent_changes: Arc<Mutex<HashMap<DocId, u32>>>,
     endpoint: Endpoint,
     router: Router,
     app_handle: tauri::AppHandle,
@@ -50,12 +66,102 @@ struct GenerateInviteResult {
     expires_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AcceptInviteResult {
-    project_id: String,
-    project_name: String,
-    role: String,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReconnectQueueStats {
+    attempted: usize,
+    queued: usize,
+    dropped: usize,
+}
+
+fn reconnect_peer_id(
+    status_event: &events::PeerStatusEvent,
+) -> Option<iroh::EndpointId> {
+    if !matches!(
+        status_event.state,
+        notes_sync::events::PeerConnectionState::Connected
+    ) {
+        return None;
+    }
+    status_event.peer_id.parse::<iroh::EndpointId>().ok()
+}
+
+fn try_queue_reconnect_syncs(
+    sync_tx: &tokio::sync::mpsc::Sender<(String, DocId)>,
+    project_name: &str,
+    files: &[DocInfo],
+) -> ReconnectQueueStats {
+    let mut stats = ReconnectQueueStats {
+        attempted: files.len(),
+        queued: 0,
+        dropped: 0,
+    };
+
+    for file in files {
+        if sync_tx.try_send((project_name.to_string(), file.id)).is_ok() {
+            stats.queued += 1;
+        } else {
+            stats.dropped += 1;
+        }
+    }
+
+    stats
+}
+
+fn pending_unsent_changes(state: &AppState, doc_id: DocId) -> u32 {
+    state
+        .unsent_changes
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&doc_id).copied())
+        .unwrap_or(0)
+}
+
+fn add_unsent_changes(state: &AppState, doc_id: DocId, delta: u32) -> u32 {
+    let mut map = state
+        .unsent_changes
+        .lock()
+        .expect("unsent changes mutex poisoned");
+    let entry = map.entry(doc_id).or_insert(0);
+    *entry = entry.saturating_add(delta.max(1));
+    *entry
+}
+
+fn clear_unsent_changes(state: &AppState, doc_id: DocId) -> u32 {
+    let mut map = state
+        .unsent_changes
+        .lock()
+        .expect("unsent changes mutex poisoned");
+    map.remove(&doc_id);
+    0
+}
+
+fn sync_state_for_project(peer_manager: &PeerManager, project: &str) -> events::SyncState {
+    let peer_count = peer_manager.get_project_peers(project).len();
+    let connected_count = peer_manager.active_connection_count();
+
+    if peer_count == 0 {
+        events::SyncState::LocalOnly
+    } else if connected_count > 0 {
+        events::SyncState::Synced
+    } else {
+        events::SyncState::LocalOnly
+    }
+}
+
+fn emit_sync_status(
+    app_handle: &AppHandle,
+    doc_id: DocId,
+    state: events::SyncState,
+    unsent_changes: u32,
+) {
+    let _ = app_handle.emit(
+        events::event_names::SYNC_STATUS,
+        events::SyncStatusEvent {
+            doc_id,
+            state,
+            unsent_changes,
+        },
+    );
 }
 
 // ── Authorization Helpers ────────────────────────────────────────────
@@ -526,23 +632,11 @@ async fn open_doc(
     // Populate ACL for this doc
     populate_doc_acl(&state, &project, doc_id).await;
 
-    // Emit initial sync status for this document
-    let peer_count = state.peer_manager.get_project_peers(&project).len();
-    let connected_count = state.peer_manager.active_connection_count();
-    let sync_state = if peer_count == 0 {
-        events::SyncState::LocalOnly // No peers → local project
-    } else if connected_count > 0 {
-        events::SyncState::Synced    // Peers connected → synced
-    } else {
-        events::SyncState::Syncing   // Peers registered but not yet connected
-    };
-    let _ = state.app_handle.emit(
-        events::event_names::SYNC_STATUS,
-        events::SyncStatusEvent {
-            doc_id,
-            state: sync_state,
-            unsent_changes: 0,
-        },
+    emit_sync_status(
+        &state.app_handle,
+        doc_id,
+        sync_state_for_project(&state.peer_manager, &project),
+        pending_unsent_changes(&state, doc_id),
     );
 
     Ok(())
@@ -643,6 +737,21 @@ async fn apply_changes(
     let mut seen_state = notes_core::SeenStateManager::load(&project_dir).await?;
     seen_state.mark_seen_heads(&doc_id, applied.current_heads);
     notes_core::SeenStateManager::save(&project_dir, &seen_state).await?;
+
+    let unsent_delta = applied.new_changes.len() as u32;
+    let should_track_unsent = !state.peer_manager.get_project_peers(&project).is_empty();
+    let unsent_changes = if should_track_unsent {
+        add_unsent_changes(&state, doc_id, unsent_delta)
+    } else {
+        0
+    };
+
+    emit_sync_status(
+        &state.app_handle,
+        doc_id,
+        sync_state_for_project(&state.peer_manager, &project),
+        unsent_changes,
+    );
 
     // Trigger auto-sync with peers (debounced by the receiver)
     let _ = state.sync_trigger.send((project.clone(), doc_id)).await;
@@ -1142,6 +1251,10 @@ async fn sync_with_peer(
     peer_addr: String,
     doc_id: DocId,
 ) -> Result<(), CoreError> {
+    if state.sync_engine.is_network_blocked() {
+        return Err(CoreError::InvalidData("network blocked".into()));
+    }
+
     let peer_id: iroh::EndpointId = peer_addr
         .parse()
         .map_err(|e| CoreError::InvalidInput(format!("invalid peer ID: {e}")))?;
@@ -1229,15 +1342,13 @@ async fn remove_peer(
         .parse()
         .map_err(|e| CoreError::InvalidInput(format!("invalid peer ID: {e}")))?;
 
-    // Remove from PeerManager
-    state
-        .peer_manager
-        .remove_peer_from_project(&project, &peer_id);
-
-    // Remove from manifest and save
+    // Remove from manifest and save; keep a rollback snapshot so peer removal
+    // fails closed if epoch ratcheting cannot complete.
+    let previous_manifest_data;
     {
         let manifest_arc = state.project_manager.get_manifest_for_ui(&project)?;
         let mut manifest = manifest_arc.write().await;
+        previous_manifest_data = manifest.save();
         let _ = manifest.remove_peer(&peer_id_str);
         let data = manifest.save();
         drop(manifest);
@@ -1250,8 +1361,21 @@ async fn remove_peer(
 
     // Ratchet epoch keys (forward secrecy — removed peer can't decrypt new data)
     if let Err(e) = state.project_manager.ratchet_epoch_keys(&project).await {
-        log::warn!("Epoch key ratchet failed for {project}: {e}");
+        state
+            .project_manager
+            .persistence()
+            .save_manifest(&project, &previous_manifest_data)
+            .await?;
+        state.project_manager.reload_manifest(&project).await?;
+        return Err(CoreError::InvalidData(format!(
+            "failed to rotate project keys while removing peer: {e}"
+        )));
     }
+
+    // Removal is now durable; disconnect and de-authorize the peer.
+    state
+        .peer_manager
+        .remove_peer_from_project(&project, &peer_id);
 
     // Remove ACL entries for all docs in this project
     if let Ok(files) = state.project_manager.list_files(&project).await {
@@ -1280,14 +1404,11 @@ async fn sync_doc_with_project(
     doc_id: DocId,
 ) -> Result<serde_json::Value, CoreError> {
     notes_core::validate_project_name(&project)?;
-    // Emit syncing status
-    let _ = state.app_handle.emit(
-        events::event_names::SYNC_STATUS,
-        events::SyncStatusEvent {
-            doc_id,
-            state: events::SyncState::Syncing,
-            unsent_changes: 0,
-        },
+    emit_sync_status(
+        &state.app_handle,
+        doc_id,
+        events::SyncState::Syncing,
+        pending_unsent_changes(&state, doc_id),
     );
 
     let results = state
@@ -1299,6 +1420,10 @@ async fn sync_doc_with_project(
     let fail_count = results.iter().filter(|(_, r)| r.is_err()).count();
 
     // Emit final status
+    if success_count > 0 {
+        clear_unsent_changes(&state, doc_id);
+    }
+
     let sync_state = if success_count > 0 {
         events::SyncState::Synced
     } else if fail_count > 0 {
@@ -1307,13 +1432,11 @@ async fn sync_doc_with_project(
         events::SyncState::LocalOnly
     };
 
-    let _ = state.app_handle.emit(
-        events::event_names::SYNC_STATUS,
-        events::SyncStatusEvent {
-            doc_id,
-            state: sync_state,
-            unsent_changes: 0,
-        },
+    emit_sync_status(
+        &state.app_handle,
+        doc_id,
+        sync_state,
+        pending_unsent_changes(&state, doc_id),
     );
 
     Ok(serde_json::json!({
@@ -1391,6 +1514,22 @@ async fn broadcast_presence(
     Ok(())
 }
 
+#[tauri::command]
+async fn e2e_set_network_blocked(
+    state: State<'_, AppState>,
+    blocked: bool,
+) -> Result<(), CoreError> {
+    ensure_e2e_mode()?;
+    state.sync_engine.set_network_blocked(blocked);
+    state.peer_manager.set_network_blocked(blocked);
+    Ok(())
+}
+
+#[tauri::command]
+fn e2e_is_enabled() -> bool {
+    std::env::var("P2P_E2E").ok().as_deref() == Some("1")
+}
+
 // ── Settings Commands ────────────────────────────────────────────────
 
 /// Get the current app settings.
@@ -1465,45 +1604,16 @@ async fn generate_invite(
         .save_manifest(&project, &manifest_data)
         .await?;
 
-    // Initialize epoch keys for the project (if not already done)
-    state
-        .project_manager
-        .init_epoch_keys(&project)
-        .await?;
-
-    // Get or create X25519 keypair for key wrapping
-    let keys_dir = state
-        .project_manager
-        .persistence()
-        .project_dir(&project)
-        .join(".p2p")
-        .join("keys");
-    std::fs::create_dir_all(&keys_dir).ok();
-    let keystore = notes_crypto::KeyStore::new(keys_dir);
-    let (_owner_x25519_secret, owner_x25519_public) = keystore
-        .get_or_create_x25519("x25519-identity")
-        .map_err(|e| CoreError::InvalidData(format!("X25519 key generation failed: {e}")))?;
-
-    // Wrap the current epoch key for the invitee.
-    // Get the current epoch key to include in the invite payload.
-    // The epoch key is transmitted inside the SPAKE2-encrypted payload, so it's
-    // protected by the session key. For subsequent key rotations (after peer removal),
-    // X25519 ECDH wrapping is used to distribute new keys.
-    let (current_epoch, epoch_key_bytes) = if let Ok(epoch_mgr_arc) = state.project_manager.get_epoch_keys(&project) {
-        let mgr = epoch_mgr_arc.read().await;
-        let epoch = mgr.current_epoch();
-        let key = mgr.current_key().ok().map(|k| *k.as_bytes());
-        (epoch, key)
-    } else {
-        (0, None)
-    };
-
     let passphrase = notes_sync::invite::generate_passphrase(6);
     let peer_id = state.endpoint.id().to_string();
-    let expires_at = chrono::Utc::now() + chrono::Duration::minutes(10);
+    let invite_ttl = notes_sync::invite::current_invite_ttl();
+    let expires_at = chrono::Utc::now() + chrono::Duration::from_std(invite_ttl)
+        .map_err(|e| CoreError::InvalidData(format!("invalid invite ttl: {e}")))?;
 
-    // Register a PendingInvite with real manifest data + X25519 info
+    // Register a lightweight PendingInvite. The actual payload is built later
+    // from current state by OwnerInviteCoordinator so it cannot go stale.
     let pending = notes_sync::invite::PendingInvite {
+        invite_id: uuid::Uuid::new_v4().to_string(),
         code: notes_sync::invite::InviteCode {
             passphrase: passphrase.clone(),
             peer_id: peer_id.clone(),
@@ -1513,15 +1623,13 @@ async fn generate_invite(
         attempts: 0,
         project_name: project.clone(),
         project_id,
-        manifest_data,
         invite_role: role,
-        owner_x25519_public: Some(*owner_x25519_public.as_bytes()),
-        epoch_key: epoch_key_bytes,
-        current_epoch,
+        state: notes_sync::invite::InviteState::Open,
     };
     state
         .invite_handler
-        .add_pending(passphrase.clone(), pending);
+        .add_pending_checked(passphrase.clone(), pending)
+        .map_err(|e| CoreError::InvalidData(format!("failed to persist invite: {e}")))?;
 
     log::info!("Generated invite for project {project}");
 
@@ -1538,326 +1646,26 @@ async fn accept_invite(
     passphrase: String,
     owner_peer_id: String,
 ) -> Result<AcceptInviteResult, CoreError> {
-    use notes_sync::invite;
-    use tokio::io::AsyncWriteExt;
-
-    let peer_id: iroh::EndpointId = owner_peer_id
-        .parse()
-        .map_err(|e| CoreError::InvalidInput(format!("invalid owner peer ID: {e}")))?;
-
-    // ── Phase 1: SPAKE2 handshake + payload receipt (30s hard timeout) ──────
-    //
-    // Only the network-bound portion runs inside the timeout. Project setup and
-    // initial sync happen after the command returns, so a large project can never
-    // cause the frontend to see "invite timed out" after a successful handshake.
-    //
-    // The network handshake stays inside the timeout. We close our send half at
-    // the end of Phase 1 so the owner can safely drop the connection only after
-    // it sees our FIN.
-    let (payload, peer_id) = tokio::time::timeout(Duration::from_secs(30), async {
-        let connection = state
-            .endpoint
-            .connect(peer_id, invite::INVITE_ALPN)
-            .await
-            .map_err(|e| CoreError::InvalidInput(format!("connection failed: {e}")))?;
-
-        let (mut send, mut recv) = connection
-            .open_bi()
-            .await
-            .map_err(|e| CoreError::InvalidData(format!("stream open failed: {e}")))?;
-
-        // SPAKE2 handshake
-        let (invitee_state, invitee_msg) = invite::start_invitee_handshake(&passphrase);
-
-        // Send our SPAKE2 message (length-prefixed)
-        let len = (invitee_msg.len() as u32).to_be_bytes();
-        send.write_all(&len)
-            .await
-            .map_err(|e| CoreError::InvalidData(format!("send spake2 len failed: {e}")))?;
-        send.write_all(&invitee_msg)
-            .await
-            .map_err(|e| CoreError::InvalidData(format!("send spake2 msg failed: {e}")))?;
-
-        // Read owner's SPAKE2 message (length-prefixed)
-        let mut owner_msg_len_buf = [0u8; 4];
-        recv.read_exact(&mut owner_msg_len_buf)
-            .await
-            .map_err(|e| CoreError::InvalidData(format!("read spake2 len failed: {e}")))?;
-        let owner_msg_len = u32::from_be_bytes(owner_msg_len_buf) as usize;
-        if owner_msg_len > 256 {
-            return Err(CoreError::InvalidData("SPAKE2 message too large".into()));
-        }
-        let mut owner_msg = vec![0u8; owner_msg_len];
-        recv.read_exact(&mut owner_msg)
-            .await
-            .map_err(|e| CoreError::InvalidData(format!("read spake2 msg failed: {e}")))?;
-
-        // Finish handshake to derive shared session key
-        let shared_key = invite::finish_handshake(invitee_state, &owner_msg)
-            .map_err(|_| CoreError::InvalidData("SPAKE2 handshake failed — wrong code".into()))?;
-
-        // Read encrypted payload
-        let mut len_buf = [0u8; 4];
-        recv.read_exact(&mut len_buf)
-            .await
-            .map_err(|e| CoreError::InvalidData(format!("read length failed: {e}")))?;
-        let payload_len = u32::from_be_bytes(len_buf) as usize;
-
-        if payload_len > 16 * 1024 * 1024 {
-            return Err(CoreError::InvalidData("invite payload too large".into()));
-        }
-
-        let mut encrypted = vec![0u8; payload_len];
-        recv.read_exact(&mut encrypted)
-            .await
-            .map_err(|e| CoreError::InvalidData(format!("read payload failed: {e}")))?;
-
-        let plaintext = invite::decrypt_payload(&shared_key, &encrypted)
-            .map_err(|e| CoreError::InvalidData(format!("decrypt failed — wrong code: {e}")))?;
-
-        // Zeroize the SPAKE2 shared key immediately after decryption
-        {
-            use zeroize::Zeroize;
-            let mut key_to_zeroize = shared_key;
-            key_to_zeroize.zeroize();
-        }
-
-        let payload: invite::InvitePayload = serde_json::from_slice(&plaintext)
-            .map_err(|e| CoreError::InvalidData(format!("invalid payload: {e}")))?;
-
-        send.write_all(&[1])
-            .await
-            .map_err(|e| CoreError::InvalidData(format!("send invite ack failed: {e}")))?;
-        send.flush()
-            .await
-            .map_err(|e| CoreError::InvalidData(format!("flush invite ack failed: {e}")))?;
-        let _ = send.finish();
-        tokio::task::yield_now().await;
-
-        let resolved_peer_id = connection.remote_id();
-        Ok::<_, CoreError>((payload, resolved_peer_id))
-    })
+    accept_invite_impl(
+        Arc::clone(&state.project_manager),
+        Arc::clone(&state.sync_engine),
+        Arc::clone(&state.peer_manager),
+        Arc::clone(&state.join_session_store),
+        state.endpoint.clone(),
+        passphrase,
+        owner_peer_id,
+    )
     .await
-    .map_err(|_| CoreError::InvalidData("invite timed out after 30s".into()))??;
-
-    // ── Phase 2: Project setup (no timeout — purely local I/O) ──────────────
-    let project_name = payload.project_name.clone();
-    let pm = Arc::clone(&state.project_manager);
-
-    // Decode manifest hex to bytes
-    let manifest_bytes: Vec<u8> = (0..payload.manifest_hex.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&payload.manifest_hex[i..i + 2], 16)
-                .unwrap_or(0)
-        })
-        .collect();
-
-    // Create the project directory structure
-    pm.create_project(&project_name).await.or_else(|e| {
-        // If project already exists, that's OK (might be re-joining)
-        if matches!(e, CoreError::ProjectAlreadyExists(_)) {
-            Ok(())
-        } else {
-            Err(e)
-        }
-    })?;
-
-    // Save the received manifest (overwriting the fresh one) and reload it
-    // into memory. We must use reload_manifest() instead of open_project()
-    // because open_project() short-circuits when the project is already cached.
-    if !manifest_bytes.is_empty() {
-        pm.persistence()
-            .save_manifest(&project_name, &manifest_bytes)
-            .await?;
-        pm.reload_manifest(&project_name).await?;
-        log::info!("Saved and reloaded received manifest for project {project_name}");
-    }
-
-    // Add the owner as a peer in PeerManager for sync
-    state
-        .peer_manager
-        .add_peer_to_project(&project_name, peer_id);
-
-    // Store owner's X25519 public key, generate our own, and import epoch key
-    {
-        let keys_dir = pm
-            .persistence()
-            .project_dir(&project_name)
-            .join(".p2p")
-            .join("keys");
-        std::fs::create_dir_all(&keys_dir).ok();
-        let keystore = notes_crypto::KeyStore::new(keys_dir);
-
-        // Store the owner's X25519 public key for future key rotation wrapping
-        if !payload.owner_x25519_public_hex.is_empty() {
-            if let Ok(owner_pk_bytes) = hex_decode_32(&payload.owner_x25519_public_hex) {
-                keystore.store_key("owner-x25519-public", &owner_pk_bytes).ok();
-            }
-        }
-
-        // Generate our own X25519 keypair
-        let _ = keystore.get_or_create_x25519("x25519-identity");
-
-        // Import the epoch key received from the owner (transmitted inside SPAKE2-encrypted payload)
-        if !payload.epoch_key_hex.is_empty() {
-            if let Ok(epoch_key_bytes) = hex_decode_32(&payload.epoch_key_hex) {
-                let mgr = notes_crypto::EpochKeyManager::from_key(
-                    payload.epoch,
-                    &epoch_key_bytes,
-                );
-                if let Ok(data) = mgr.serialize() {
-                    let keychain_name = format!("epoch-keys-{project_name}");
-                    keystore.store_key(&keychain_name, &data).ok();
-                    log::info!(
-                        "Imported epoch key (epoch {}) for project {project_name}",
-                        payload.epoch
-                    );
-                }
-            }
-        }
-    }
-
-    // Prepare placeholder docs for each file in the manifest
-    let files_for_sync = {
-        let manifest_arc = pm.get_manifest_for_ui(&project_name)?;
-        let manifest = manifest_arc.read().await;
-        manifest.list_files().unwrap_or_default()
-    };
-    log::info!(
-        "Initial sync: preparing {} docs for {project_name}",
-        files_for_sync.len()
-    );
-
-    for file_info in &files_for_sync {
-        let doc_id = file_info.id;
-        if pm.doc_store().get_doc(&doc_id).is_err() {
-            if let Err(e) = pm.doc_store().create_doc_with_id(doc_id) {
-                log::warn!("Failed to create placeholder doc {doc_id}: {e}");
-                continue;
-            }
-        }
-        if let Ok(doc_arc) = pm.doc_store().get_doc(&doc_id) {
-            state.sync_engine.register_doc(doc_id, doc_arc);
-            populate_doc_acl(&state, &project_name, doc_id).await;
-        }
-    }
-    // ── Phase 3: Initial content sync (background, non-blocking) ────────────
-    //
-    // Kicked off after accept_invite returns Ok to the frontend, so the UI
-    // shows the project immediately. A large project with many files cannot
-    // cause the command to time out here.
-    {
-        let peer_mgr = Arc::clone(&state.peer_manager);
-        let pm_bg = Arc::clone(&state.project_manager);
-        let project_name_bg = project_name.clone();
-
-        tauri::async_runtime::spawn(async move {
-            log::info!(
-                "Background initial sync starting for {project_name_bg} ({} docs)",
-                files_for_sync.len()
-            );
-            for file_info in &files_for_sync {
-                let mut ok = 0;
-                for attempt in 0..10 {
-                    let results = peer_mgr
-                        .sync_doc_with_project_peers(&project_name_bg, file_info.id)
-                        .await;
-                    ok = results.iter().filter(|(_, r)| r.is_ok()).count();
-                    if ok > 0 {
-                        break;
-                    }
-                    let delay_ms = 200 + (attempt * 100);
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                }
-                if ok > 0 {
-                    log::info!("Synced doc {} from owner", file_info.id);
-                    if let Err(e) = pm_bg.save_doc(&project_name_bg, &file_info.id).await {
-                        log::warn!("Failed to save synced doc {}: {e}", file_info.id);
-                    }
-                } else {
-                    log::warn!(
-                        "Background initial sync never succeeded for doc {} in project {}",
-                        file_info.id,
-                        project_name_bg
-                    );
-                }
-            }
-            log::info!("Background initial sync complete for {project_name_bg}");
-        });
-    }
-
-    Ok(AcceptInviteResult {
-        project_id: payload.project_id,
-        project_name: payload.project_name,
-        role: payload.role,
-    })
 }
-
-// ── Helpers ──────────────────────────────────────────────────────────
-
-/// Decode a hex string to a 32-byte array.
-fn hex_decode_32(hex: &str) -> Result<[u8; 32], CoreError> {
-    if hex.len() != 64 {
-        return Err(CoreError::InvalidData(format!(
-            "expected 64 hex chars, got {}",
-            hex.len()
-        )));
-    }
-    let bytes: Vec<u8> = (0..hex.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&hex[i..i + 2], 16)
-                .map_err(|_| CoreError::InvalidData("bad hex".into()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&bytes);
-    Ok(arr)
-}
-
-/// Populate the SyncEngine ACL for a document from the project's manifest peer list.
-/// Also sets Owner role for the local device's peer ID.
 async fn populate_doc_acl(state: &AppState, project: &str, doc_id: DocId) {
-    use notes_sync::sync_engine::PeerRole as SyncPeerRole;
-
-    // Always allow the local peer (we're always Owner or Editor of our own open docs)
-    state
-        .sync_engine
-        .set_peer_role(doc_id, state.endpoint.id(), SyncPeerRole::Owner);
-
-    // Add all project peers from the manifest
-    if let Ok(peers) = state.project_manager.get_project_peers(project).await {
-        for peer in peers {
-            if let Ok(peer_id) = peer.peer_id.parse::<iroh::EndpointId>() {
-                let sync_role = match peer.role {
-                    PeerRole::Owner => SyncPeerRole::Owner,
-                    PeerRole::Editor => SyncPeerRole::Editor,
-                    PeerRole::Viewer => SyncPeerRole::Viewer,
-                };
-                state.sync_engine.set_peer_role(doc_id, peer_id, sync_role);
-            }
-        }
-    }
-
-    // Populate known actor IDs for actor-based verification during sync.
-    // This enables verify_new_changes() to reject changes from unknown actors.
-    if let Ok(manifest_arc) = state.project_manager.get_manifest_for_ui(project) {
-        let manifest = manifest_arc.read().await;
-        if let Ok(aliases) = manifest.get_actor_aliases() {
-            let mut known_actors: std::collections::HashSet<String> =
-                aliases.keys().cloned().collect();
-
-            // Also include the local device's actor ID
-            if let Some(actor) = state.project_manager.doc_store().device_actor_hex() {
-                known_actors.insert(actor);
-            }
-
-            if !known_actors.is_empty() {
-                state.sync_engine.set_known_actors(doc_id, known_actors);
-            }
-        }
-    }
+    populate_doc_acl_from_parts(
+        &state.project_manager,
+        &state.sync_engine,
+        &state.endpoint,
+        project,
+        doc_id,
+    )
+    .await;
 }
 
 // ── Update Commands ──────────────────────────────────────────────────
@@ -1972,6 +1780,14 @@ fn resolve_notes_dir() -> Result<std::path::PathBuf, String> {
     if let Ok(dir) = std::env::var("NOTES_DIR") {
         return Ok(std::path::PathBuf::from(dir));
     }
+    if std::env::var("P2P_E2E").ok().as_deref() == Some("1") {
+        if let Ok(dir) = std::env::var("TAURI_DATA_DIR") {
+            return Ok(std::path::PathBuf::from(dir).join("Notes"));
+        }
+        if let Ok(dir) = std::env::var("XDG_DATA_HOME") {
+            return Ok(std::path::PathBuf::from(dir).join("Notes"));
+        }
+    }
     if let Some(home) = dirs::home_dir() {
         return Ok(home.join("Notes"));
     }
@@ -1979,6 +1795,38 @@ fn resolve_notes_dir() -> Result<std::path::PathBuf, String> {
         return Ok(doc_dir.join("Notes"));
     }
     Err("Could not determine a suitable notes directory".to_string())
+}
+
+fn sync_debounce_ms() -> u64 {
+    if std::env::var("P2P_E2E").ok().as_deref() != Some("1") {
+        return 500;
+    }
+
+    std::env::var("P2P_SYNC_DEBOUNCE_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .unwrap_or(500)
+}
+
+fn peer_monitor_interval_ms() -> u64 {
+    if std::env::var("P2P_E2E").ok().as_deref() != Some("1") {
+        return 15_000;
+    }
+
+    std::env::var("P2P_MONITOR_INTERVAL_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .unwrap_or(15_000)
+}
+
+fn ensure_e2e_mode() -> Result<(), CoreError> {
+    if std::env::var("P2P_E2E").ok().as_deref() == Some("1") {
+        Ok(())
+    } else {
+        Err(CoreError::InvalidInput("e2e mode is not enabled".into()))
+    }
 }
 
 /// Load or generate a persistent iroh SecretKey using the OS keychain.
@@ -2222,10 +2070,8 @@ pub fn run() {
             let mut sync_engine_raw = SyncEngine::new();
             sync_engine_raw.set_sync_state_store(Arc::clone(&sync_state_store));
             let sync_engine = Arc::new(sync_engine_raw);
-            let invite_handler = Arc::new(InviteHandler::new());
 
             let sync_engine_for_router = Arc::clone(&sync_engine);
-            let invite_handler_for_router = Arc::clone(&invite_handler);
             let app_handle = app.handle().clone();
 
             // Load settings for relay configuration before creating the endpoint.
@@ -2233,7 +2079,7 @@ pub fn run() {
                 notes_core::AppSettings::load(&notes_dir)
             );
 
-            let (endpoint, router) = tauri::async_runtime::block_on(async {
+            let endpoint = tauri::async_runtime::block_on(async {
                 let mut builder = Endpoint::builder(iroh::endpoint::presets::N0)
                     .secret_key(secret_key)
                     .address_lookup(iroh::address_lookup::MdnsAddressLookupBuilder::default());
@@ -2259,67 +2105,103 @@ pub fn run() {
                     }
                 }
 
-                let endpoint = builder
+                builder
                     .bind()
                     .await
-                    .expect("failed to bind iroh endpoint");
-
-                log::info!("iroh endpoint bound, id: {}", endpoint.id());
-
-                let router = Router::builder(endpoint.clone())
-                    .accept(NOTES_SYNC_ALPN, sync_engine_for_router)
-                    .accept(INVITE_ALPN, invite_handler_for_router)
-                    .spawn();
-
-                log::info!("iroh router started");
-
-                (endpoint, router)
+                    .expect("failed to bind iroh endpoint")
             });
+
+            log::info!("iroh endpoint bound, id: {}", endpoint.id());
 
             // Create the PeerManager for managing persistent connections
             let peer_manager = Arc::new(PeerManager::new(
                 endpoint.clone(),
                 Arc::clone(&sync_engine),
             ));
+            let owner_invite_store = Arc::new(OwnerInviteStateStore::new(notes_dir.clone()));
+            let join_session_store = Arc::new(JoinSessionStore::new(notes_dir.clone()));
+
+            let coordinator = Arc::new(OwnerInviteCoordinator::new(
+                Arc::clone(&project_manager),
+                Arc::clone(&sync_engine),
+                Arc::clone(&peer_manager),
+                endpoint.id(),
+            ));
+            let invite_persistence = Arc::new(OwnerInvitePersistence::new(
+                notes_dir.clone(),
+                endpoint.id().to_string(),
+            ));
+            let mut invite_handler_raw = InviteHandler::new();
+            invite_handler_raw.set_lifecycle_handler(coordinator);
+            invite_handler_raw.set_persistence_handler(invite_persistence.clone());
+            if let Ok(restored) = invite_persistence.load_runtime_invites_with_manifest_reconcile() {
+                for (passphrase, invite) in restored {
+                    let _ = invite_handler_raw.add_pending_checked(passphrase, invite);
+                }
+            }
+            let invite_handler = Arc::new(invite_handler_raw);
+
+            let router = Router::builder(endpoint.clone())
+                .accept(NOTES_SYNC_ALPN, sync_engine_for_router)
+                .accept(INVITE_ALPN, Arc::clone(&invite_handler))
+                .spawn();
+
+            tauri::async_runtime::spawn(resume_join_sessions(
+                Arc::clone(&join_session_store),
+                Arc::clone(&project_manager),
+                Arc::clone(&sync_engine),
+                Arc::clone(&peer_manager),
+                endpoint.clone(),
+            ));
+
+            log::info!("iroh router started");
             // Auto-sync trigger: debounced channel that syncs with peers on local changes
             let (sync_tx, mut sync_rx) =
                 tokio::sync::mpsc::channel::<(String, DocId)>(256);
+            let unsent_changes = Arc::new(Mutex::new(HashMap::new()));
 
             tauri::async_runtime::spawn({
                 let peer_mgr = Arc::clone(&peer_manager);
+                let interval_ms = peer_monitor_interval_ms();
                 async move {
-                    peer_mgr.monitoring_loop(Duration::from_secs(15)).await;
+                    peer_mgr.monitoring_loop(Duration::from_millis(interval_ms)).await;
                 }
             });
 
             tauri::async_runtime::spawn({
                 let peer_mgr = Arc::clone(&peer_manager);
                 let handle = app_handle.clone();
+                let debounce_ms = sync_debounce_ms();
+                let unsent_changes = Arc::clone(&unsent_changes);
                 async move {
                     loop {
                         let first = match sync_rx.recv().await {
                             Some(v) => v,
                             None => break,
                         };
-                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        tokio::time::sleep(Duration::from_millis(debounce_ms)).await;
                         let mut to_sync = std::collections::HashSet::new();
                         to_sync.insert(first);
                         while let Ok(item) = sync_rx.try_recv() {
                             to_sync.insert(item);
                         }
                         for (project, doc_id) in to_sync {
-                            let _ = handle.emit(
-                                events::event_names::SYNC_STATUS,
-                                events::SyncStatusEvent {
-                                    doc_id,
-                                    state: events::SyncState::Syncing,
-                                    unsent_changes: 0,
-                                },
-                            );
+                            let pending = unsent_changes
+                                .lock()
+                                .ok()
+                                .and_then(|map| map.get(&doc_id).copied())
+                                .unwrap_or(0);
+                            emit_sync_status(&handle, doc_id, events::SyncState::Syncing, pending);
 
                             let results = peer_mgr.sync_doc_with_project_peers(&project, doc_id).await;
                             let ok = results.iter().filter(|(_, r)| r.is_ok()).count();
                             let fail = results.iter().filter(|(_, r)| r.is_err()).count();
+
+                            if ok > 0 {
+                                if let Ok(mut map) = unsent_changes.lock() {
+                                    map.remove(&doc_id);
+                                }
+                            }
 
                             let sync_state = if ok > 0 {
                                 events::SyncState::Synced
@@ -2329,14 +2211,12 @@ pub fn run() {
                                 events::SyncState::LocalOnly
                             };
 
-                            let _ = handle.emit(
-                                events::event_names::SYNC_STATUS,
-                                events::SyncStatusEvent {
-                                    doc_id,
-                                    state: sync_state,
-                                    unsent_changes: 0,
-                                },
-                            );
+                            let pending = unsent_changes
+                                .lock()
+                                .ok()
+                                .and_then(|map| map.get(&doc_id).copied())
+                                .unwrap_or(0);
+                            emit_sync_status(&handle, doc_id, sync_state, pending);
 
                             if ok > 0 {
                                 log::debug!("Auto-synced doc {doc_id} with {ok} peers");
@@ -2347,112 +2227,46 @@ pub fn run() {
             });
 
             tauri::async_runtime::spawn({
-                let mut rx = invite_handler.subscribe_accepted();
-                let pm = Arc::clone(&project_manager);
-                let peer_mgr = Arc::clone(&peer_manager);
-                let sync_engine = Arc::clone(&sync_engine);
-                async move {
-                    loop {
-                        match rx.recv().await {
-                            Ok(accepted) => {
-                                log::info!(
-                                    "Invite accepted: adding peer {} to project {}",
-                                    accepted.invitee_peer_id,
-                                    accepted.project_name
-                                );
-                                match pm.get_manifest_for_ui(&accepted.project_name) {
-                                    Ok(manifest_arc) => {
-                                        let mut manifest = manifest_arc.write().await;
-                                        if let Err(e) = manifest.add_peer(
-                                            &accepted.invitee_peer_id,
-                                            &accepted.role,
-                                            "",
-                                        ) {
-                                            log::error!(
-                                                "Failed to add peer {} to manifest for {}: {e}",
-                                                accepted.invitee_peer_id,
-                                                accepted.project_name
-                                            );
-                                        }
-                                        let data = manifest.save();
-                                        drop(manifest);
-                                        if let Err(e) = pm
-                                            .persistence()
-                                            .save_manifest(&accepted.project_name, &data)
-                                            .await
-                                        {
-                                            log::error!(
-                                                "Failed to save manifest after adding peer to {}: {e}",
-                                                accepted.project_name
-                                            );
-                                        }
-                                    }
-                                    Err(e) => {
-                                        log::error!(
-                                            "Failed to get manifest for {} after invite acceptance: {e}",
-                                            accepted.project_name
-                                        );
-                                    }
-                                }
-                                match accepted.invitee_peer_id.parse::<iroh::EndpointId>() {
-                                    Ok(peer_id) => {
-                                        peer_mgr.add_peer_to_project(&accepted.project_name, peer_id);
-
-                                        // Immediately refresh SyncEngine ACLs for any docs already
-                                        // registered/open on the owner, so the invitee's first
-                                        // bootstrap sync is not rejected as unauthorized.
-                                        if let Ok(manifest_arc) = pm.get_manifest_for_ui(&accepted.project_name) {
-                                            let (doc_ids, sync_role) = {
-                                                let manifest = manifest_arc.read().await;
-                                                let doc_ids = manifest
-                                                    .list_files()
-                                                    .unwrap_or_default()
-                                                    .into_iter()
-                                                    .map(|f| f.id)
-                                                    .collect::<Vec<_>>();
-                                                let sync_role = match accepted.role.as_str() {
-                                                    "owner" => notes_sync::sync_engine::PeerRole::Owner,
-                                                    "viewer" => notes_sync::sync_engine::PeerRole::Viewer,
-                                                    _ => notes_sync::sync_engine::PeerRole::Editor,
-                                                };
-                                                (doc_ids, sync_role)
-                                            };
-
-                                            for doc_id in doc_ids {
-                                                sync_engine.set_peer_role(doc_id, peer_id, sync_role);
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        log::error!(
-                                            "Failed to parse invitee peer ID '{}': {e}",
-                                            accepted.invitee_peer_id
-                                        );
-                                    }
-                                }
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                log::warn!("Invite accepted channel lagged by {n}");
-                            }
-                        }
-                    }
-                }
-            });
-
-            tauri::async_runtime::spawn({
                 let mut rx = peer_manager.subscribe_peer_status();
                 let handle = app_handle.clone();
+                let pm = Arc::clone(&project_manager);
+                let peer_mgr = Arc::clone(&peer_manager);
+                let sync_tx = sync_tx.clone();
                 async move {
                     loop {
                         match rx.recv().await {
                             Ok(status_event) => {
+                                let connected_peer = reconnect_peer_id(&status_event);
                                 log::debug!(
                                     "Peer status change: {} -> {:?}",
                                     status_event.peer_id,
                                     status_event.state
                                 );
                                 let _ = handle.emit(events::event_names::PEER_STATUS, status_event);
+
+                                if let Some(peer_id) = connected_peer {
+                                    for project_name in peer_mgr.get_projects_for_peer(&peer_id) {
+                                        match pm.list_files(&project_name).await {
+                                            Ok(files) => {
+                                                let stats = try_queue_reconnect_syncs(&sync_tx, &project_name, &files);
+                                                if stats.dropped > 0 {
+                                                    log::warn!(
+                                                        "Dropped {} reconnect sync jobs for project {}",
+                                                        stats.dropped,
+                                                        project_name
+                                                    );
+                                                }
+                                            }
+                                            Err(err) => {
+                                                log::warn!(
+                                                    "Failed to queue reconnect sync for project {}: {}",
+                                                    project_name,
+                                                    err
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -2523,12 +2337,15 @@ pub fn run() {
                 sync_engine,
                 peer_manager,
                 invite_handler,
+                owner_invite_store,
+                join_session_store,
                 sync_state_store,
                 search_index: Arc::clone(&search_index),
                 version_store,
                 blob_store: Arc::clone(&blob_store),
                 device_actor_hex,
                 sync_trigger: sync_tx,
+                unsent_changes,
                 endpoint,
                 router,
                 app_handle,
@@ -2604,6 +2421,8 @@ pub fn run() {
             update_settings,
             get_doc_degradation,
             broadcast_presence,
+            e2e_set_network_blocked,
+            e2e_is_enabled,
             // Auto-update
             check_for_update,
             install_update,
@@ -2628,4 +2447,126 @@ pub fn run() {
             });
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use notes_core::FileType;
+
+    #[test]
+    fn reconnect_peer_id_only_allows_connected_valid_peers() {
+        let mut secret = [0u8; 32];
+        getrandom::fill(&mut secret).unwrap();
+        let valid = iroh::SecretKey::from_bytes(&secret).public().to_string();
+
+        let connected = events::PeerStatusEvent {
+            peer_id: valid.clone(),
+            state: events::PeerConnectionState::Connected,
+            alias: None,
+        };
+        assert!(reconnect_peer_id(&connected).is_some());
+
+        let invalid = events::PeerStatusEvent {
+            peer_id: "not-a-peer-id".into(),
+            state: events::PeerConnectionState::Connected,
+            alias: None,
+        };
+        assert!(reconnect_peer_id(&invalid).is_none());
+
+        let disconnected = events::PeerStatusEvent {
+            peer_id: valid,
+            state: events::PeerConnectionState::Disconnected,
+            alias: None,
+        };
+        assert!(reconnect_peer_id(&disconnected).is_none());
+    }
+
+    #[tokio::test]
+    async fn try_queue_reconnect_syncs_counts_queued_and_dropped() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, DocId)>(1);
+        tx.try_send(("prefill".into(), uuid::Uuid::new_v4())).unwrap();
+
+        let files = vec![
+            DocInfo {
+                id: uuid::Uuid::new_v4(),
+                path: "a.md".into(),
+                file_type: FileType::Note,
+                created: chrono::Utc::now(),
+            },
+            DocInfo {
+                id: uuid::Uuid::new_v4(),
+                path: "b.md".into(),
+                file_type: FileType::Note,
+                created: chrono::Utc::now(),
+            },
+        ];
+
+        let stats = try_queue_reconnect_syncs(&tx, "project", &files);
+        assert_eq!(stats.attempted, 2);
+        assert_eq!(stats.queued, 0);
+        assert_eq!(stats.dropped, 2);
+        assert!(rx.recv().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn try_queue_reconnect_syncs_enqueues_payloads() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, DocId)>(4);
+        let files = vec![
+            DocInfo {
+                id: uuid::Uuid::new_v4(),
+                path: "a.md".into(),
+                file_type: FileType::Note,
+                created: chrono::Utc::now(),
+            },
+            DocInfo {
+                id: uuid::Uuid::new_v4(),
+                path: "b.md".into(),
+                file_type: FileType::Note,
+                created: chrono::Utc::now(),
+            },
+        ];
+
+        let stats = try_queue_reconnect_syncs(&tx, "project", &files);
+        assert_eq!(stats.attempted, 2);
+        assert_eq!(stats.queued, 2);
+        assert_eq!(stats.dropped, 0);
+
+        let first = rx.recv().await.unwrap();
+        let second = rx.recv().await.unwrap();
+        let queued = vec![first, second];
+        assert!(queued.contains(&("project".to_string(), files[0].id)));
+        assert!(queued.contains(&("project".to_string(), files[1].id)));
+    }
+
+    #[tokio::test]
+    async fn try_queue_reconnect_syncs_mixed_capacity() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, DocId)>(2);
+        tx.try_send(("prefill".into(), uuid::Uuid::new_v4())).unwrap();
+        let files = vec![
+            DocInfo {
+                id: uuid::Uuid::new_v4(),
+                path: "a.md".into(),
+                file_type: FileType::Note,
+                created: chrono::Utc::now(),
+            },
+            DocInfo {
+                id: uuid::Uuid::new_v4(),
+                path: "b.md".into(),
+                file_type: FileType::Note,
+                created: chrono::Utc::now(),
+            },
+        ];
+
+        let stats = try_queue_reconnect_syncs(&tx, "project", &files);
+        assert_eq!(stats.attempted, 2);
+        assert_eq!(stats.queued, 1);
+        assert_eq!(stats.dropped, 1);
+
+        let first = rx.recv().await.unwrap();
+        let second = rx.recv().await.unwrap();
+        let queued = vec![first, second];
+        assert!(queued.contains(&("project".to_string(), files[0].id)) || queued.contains(&("project".to_string(), files[1].id)));
+    }
 }

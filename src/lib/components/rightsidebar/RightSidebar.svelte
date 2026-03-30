@@ -9,7 +9,7 @@
   const collapsed = $derived(!uiState.rightSidebarOpen);
 </script>
 
-<aside class="right-sidebar" class:collapsed>
+<aside class="right-sidebar" class:collapsed data-testid="right-sidebar">
   <div class="right-sidebar-header">
     <button
       class="collapse-toggle"
@@ -26,7 +26,7 @@
 
   {#if collapsed}
     <div class="collapsed-icons">
-      <button class="collapsed-icon-btn" onclick={toggleRightSidebar} aria-label="peers" title="peers">
+      <button class="collapsed-icon-btn" data-testid="right-sidebar-peers-trigger" onclick={toggleRightSidebar} aria-label="peers" title="peers">
         <Users size={15} strokeWidth={1.5} />
       </button>
       <button class="collapsed-icon-btn" onclick={toggleRightSidebar} aria-label="todos" title="todos">

@@ -32,8 +32,8 @@ vi.mock('../api/tauri.js', () => ({
 async function loadFreshModules() {
   vi.resetModules();
   const documents = await import('../state/documents.svelte.js');
-  const ui = await import('../state/ui.svelte.js');
   const versions = await import('../state/versions.svelte.js');
+  const review = await import('../state/version-review.svelte.js');
   const session = await import('./editor-session.svelte.js');
 
   documents.documentState.docs = [
@@ -58,17 +58,13 @@ async function loadFreshModules() {
       hasUnread: false,
     },
   ];
-  documents.documentState.activeDocId = null;
-  ui.uiState.view = 'project-overview';
-  ui.uiState.activeProjectId = 'project-1';
-  ui.uiState.historyReviewSessionId = null;
   versions.versionState.supported = true;
   versions.versionState.deviceActorId = '0123456789abcdef0123456789abcdef';
   versions.versionState.versions = [];
   versions.versionState.activeDocId = null;
-  versions.exitVersionReview();
+  review.clearVersionPreview();
 
-  return { documents, ui, session };
+  return { documents, session };
 }
 
 function makeBinary(text: string) {
@@ -105,17 +101,14 @@ afterEach(() => {
 });
 
 describe('editor session navigation behavior', () => {
-  it('selects the target doc immediately when opening from project overview', async () => {
-    const { documents, ui, session } = await loadFreshModules();
+  it('does not mutate route state when opening from project overview', async () => {
+    const { documents, session } = await loadFreshModules();
     const binaryGate = deferred<Uint8Array>();
     tauriApiMock.getDocBinary.mockImplementationOnce(async () => binaryGate.promise);
 
     const openPromise = session.openEditorSession('project-1', 'doc-b');
 
     expect(session.editorSessionState.loading).toBe(true);
-    expect(ui.uiState.view).toBe('editor');
-    expect(ui.uiState.activeProjectId).toBe('project-1');
-    expect(documents.documentState.activeDocId).toBe('doc-b');
 
     binaryGate.resolve(makeBinary('doc-b body'));
     await openPromise;
@@ -124,7 +117,7 @@ describe('editor session navigation behavior', () => {
     expect(session.editorSessionState.text).toBe('doc-b body');
   });
 
-  it('moves sidebar selection to the latest clicked doc while a previous doc is still loading', async () => {
+  it('keeps document selection untouched while a previous doc is still loading', async () => {
     const { documents, session } = await loadFreshModules();
     const gateA = deferred<Uint8Array>();
     const gateB = deferred<Uint8Array>();
@@ -136,13 +129,11 @@ describe('editor session navigation behavior', () => {
     });
 
     const openA = session.openEditorSession('project-1', 'doc-a');
-    expect(documents.documentState.activeDocId).toBe('doc-a');
     await vi.waitFor(() => {
       expect(tauriApiMock.getDocBinary).toHaveBeenCalledWith('project-1', 'doc-a');
     });
 
     const openB = session.openEditorSession('project-1', 'doc-b');
-    expect(documents.documentState.activeDocId).toBe('doc-b');
 
     gateA.resolve(makeBinary('doc-a body'));
     gateB.resolve(makeBinary('doc-b body'));
@@ -152,11 +143,10 @@ describe('editor session navigation behavior', () => {
     expect(tauriApiMock.closeDoc).toHaveBeenCalledWith('project-1', 'doc-a');
     expect(session.editorSessionState.docId).toBe('doc-b');
     expect(session.editorSessionState.text).toBe('doc-b body');
-    expect(documents.documentState.activeDocId).toBe('doc-b');
   });
 
   it('lets a newer open proceed even if an older load is still hung', async () => {
-    const { documents, session } = await loadFreshModules();
+    const { session } = await loadFreshModules();
     const gateA = deferred<Uint8Array>();
     const gateB = deferred<Uint8Array>();
 
@@ -177,7 +167,6 @@ describe('editor session navigation behavior', () => {
 
     expect(session.editorSessionState.docId).toBe('doc-b');
     expect(session.editorSessionState.text).toBe('doc-b body');
-    expect(documents.documentState.activeDocId).toBe('doc-b');
     expect(tauriApiMock.closeDoc).toHaveBeenCalledWith('project-1', 'doc-a');
 
     gateA.resolve(makeBinary('doc-a body'));

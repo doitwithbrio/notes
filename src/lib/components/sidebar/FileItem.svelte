@@ -89,6 +89,8 @@
 {:else}
   <button
     class="file-item"
+    data-testid={`file-open-${doc.id}`}
+    data-note-title={doc.title}
     class:active={isActive && !editMode}
     class:collapsed
     class:drag-mode={editMode}

@@ -1,23 +1,20 @@
 <script lang="ts">
-  import { uiState } from '../../state/ui.svelte.js';
-  import { documentState, getActiveDoc } from '../../state/documents.svelte.js';
+  import { documentState } from '../../state/documents.svelte.js';
   import { todoState, addTodo, toggleTodo, removeTodo } from '../../state/todos.svelte.js';
   import { FileText, X } from 'lucide-svelte';
+  import { getSelectedDoc, getSelectedProjectId, getWorkspaceContextRoute, isLiveDocRoute } from '../../navigation/workspace-router.svelte.js';
 
   // Derive context
-  const activeDoc = $derived(getActiveDoc());
+  const activeDoc = $derived(getSelectedDoc());
 
-  const projectId = $derived(
-    uiState.activeProjectId
-      ?? activeDoc?.projectId
-      ?? null,
-  );
+  const projectId = $derived(getSelectedProjectId());
 
   // In editor view with an active doc: show file-specific todos only
   // In project overview: show all project todos
-  const isFileMode = $derived(
-    uiState.view === 'editor' && !!activeDoc,
-  );
+  const isFileMode = $derived.by(() => {
+    const route = getWorkspaceContextRoute();
+    return isLiveDocRoute(route) && !!activeDoc && route.docId === activeDoc.id;
+  });
 
   const todos = $derived.by(() => {
     if (!projectId) return [];

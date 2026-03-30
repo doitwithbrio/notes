@@ -1,14 +1,14 @@
 <script lang="ts">
   import { presenceState } from '../../state/presence.svelte.js';
-  import { uiState } from '../../state/ui.svelte.js';
   import { getProject } from '../../state/projects.svelte.js';
   import { openShareDialog, removePeer } from '../../state/invite.svelte.js';
   import PeerItem from './PeerItem.svelte';
+  import { getWorkspaceProjectId } from '../../navigation/workspace-router.svelte.js';
 
   const onlinePeers = $derived(presenceState.peers.filter((p) => p.online));
   const offlinePeers = $derived(presenceState.peers.filter((p) => !p.online));
 
-  const activeProject = $derived(getProject(uiState.activeProjectId));
+  const activeProject = $derived(getProject(getWorkspaceProjectId()));
   const isOwner = $derived(activeProject?.role === 'owner');
 
   function handleInvite() {
@@ -24,7 +24,7 @@
   }
 </script>
 
-<section class="section">
+<section class="section" data-testid="peers-section">
   <div class="section-header">
     <span class="section-title">peers</span>
     {#if presenceState.peers.length > 0}
@@ -43,12 +43,12 @@
       {/each}
 
       {#if presenceState.peers.length === 0}
-        <p class="empty-text">no peers connected</p>
+        <p class="empty-text" data-testid="peers-empty">no peers connected</p>
       {/if}
     </div>
 
     {#if isOwner}
-      <button class="invite-btn" onclick={handleInvite}>+ invite</button>
+      <button class="invite-btn" data-testid="peers-invite-trigger" onclick={handleInvite}>+ invite</button>
     {/if}
   </div>
 </section>

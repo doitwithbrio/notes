@@ -4,18 +4,18 @@
   import { initializeApp, appSessionState, teardownAppSession } from '../state/app-session.svelte.js';
   import { closeEditorSession, editorSessionState } from '../session/editor-session.svelte.js';
   import { teardownAppearance } from '../state/appearance.svelte.js';
-  import { uiState } from '../state/ui.svelte.js';
+  import { closeQuickOpen, toggleQuickOpen, uiState } from '../state/ui.svelte.js';
   import { projectState } from '../state/projects.svelte.js';
-  import { getActiveDoc } from '../state/documents.svelte.js';
   import { isMac } from '../utils/platform.js';
-  import { getWorkspaceRoute, isProjectRoute } from '../navigation/workspace-router.svelte.js';
+  import { getSelectedDoc, getWorkspaceRoute, isProjectRoute, reconcileMissingSelectedDoc } from '../navigation/workspace-router.svelte.js';
   import Sidebar from './sidebar/Sidebar.svelte';
   import ProjectOverview from './editor/ProjectOverview.svelte';
   import RightSidebar from './rightsidebar/RightSidebar.svelte';
   import UpdateBanner from './UpdateBanner.svelte';
   import { inviteState } from '../state/invite.svelte.js';
+  import { installE2EBridge, teardownE2EBridge } from '../e2e/bridge.js';
 
-  const activeDoc = $derived(getActiveDoc());
+  const activeDoc = $derived(getSelectedDoc());
   const route = $derived(getWorkspaceRoute());
   const activeProject = $derived(
     isProjectRoute(route)
@@ -36,8 +36,14 @@
   });
 
   $effect(() => {
-    if (uiState.view === 'settings' && !settingsPanePromise) {
+    if (route?.kind === 'settings' && !settingsPanePromise) {
       settingsPanePromise = import('./settings/SettingsPane.svelte');
+    }
+  });
+
+  $effect(() => {
+    if (route?.kind === 'doc' && !activeDoc && !editorSessionState.loading) {
+      reconcileMissingSelectedDoc();
     }
   });
 
@@ -58,6 +64,7 @@
 
   onMount(() => {
     void initializeApp();
+    void installE2EBridge();
 
     const handleBeforeUnload = () => {
       void closeEditorSession();
@@ -66,6 +73,7 @@
     window.addEventListener('beforeunload', handleBeforeUnload);
     return () => {
       window.removeEventListener('beforeunload', handleBeforeUnload);
+      teardownE2EBridge();
       teardownAppearance();
       teardownAppSession();
       void closeEditorSession();
@@ -76,10 +84,10 @@
     const mod = isMac ? e.metaKey : e.ctrlKey;
     if (mod && e.key === 'f') {
       e.preventDefault();
-      uiState.quickOpenVisible = !uiState.quickOpenVisible;
+      toggleQuickOpen();
     }
     if (e.key === 'Escape') {
-      uiState.quickOpenVisible = false;
+      closeQuickOpen();
     }
   }
 </script>

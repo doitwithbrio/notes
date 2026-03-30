@@ -1,7 +1,7 @@
 <script lang="ts">
   import { documentState } from '../../state/documents.svelte.js';
-  import { uiState } from '../../state/ui.svelte.js';
-  import { openEditorSession } from '../../session/editor-session.svelte.js';
+  import { closeQuickOpen } from '../../state/ui.svelte.js';
+  import { navigateToDoc } from '../../navigation/workspace-router.svelte.js';
 
   let query = $state('');
   let inputEl: HTMLInputElement;
@@ -29,9 +29,13 @@
   async function select(docId: string) {
     const doc = searchableDocs.find((entry) => entry.doc.id === docId)?.doc;
     if (!doc) return;
-    await openEditorSession(doc.projectId, doc.id);
-    uiState.quickOpenVisible = false;
-    query = '';
+    try {
+      await navigateToDoc(doc.projectId, doc.id);
+      closeQuickOpen();
+      query = '';
+    } catch (error) {
+      console.error('Failed to open note from quick open:', error);
+    }
   }
 
   function handleKeydown(e: KeyboardEvent) {
@@ -58,7 +62,7 @@
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="quick-open-backdrop" onclick={() => (uiState.quickOpenVisible = false)} onkeydown={handleKeydown}>
+<div class="quick-open-backdrop" onclick={closeQuickOpen}>
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <div class="quick-open" onclick={(e) => e.stopPropagation()}>
     <input

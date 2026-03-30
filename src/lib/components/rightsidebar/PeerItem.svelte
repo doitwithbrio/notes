@@ -15,7 +15,7 @@
   let confirmingRemove = $state(false);
 </script>
 
-<div class="peer-row" class:offline={!peer.online} title="{peer.alias} · {peer.online ? 'online' : 'offline'}{peer.role ? ` · ${peer.role}` : ''}">
+<div class="peer-row" data-testid={`peer-row-${peer.id}`} data-state={peer.online ? 'online' : 'offline'} class:offline={!peer.online} title="{peer.alias} · {peer.online ? 'online' : 'offline'}{peer.role ? ` · ${peer.role}` : ''}">
   <span class="peer-dot" class:offline-dot={!peer.online} style={peer.online ? `background: ${peer.cursorColor}` : ''}></span>
   <span class="peer-name">{peer.alias}</span>
   {#if peer.role}
@@ -23,10 +23,10 @@
   {/if}
   {#if isOwner && onremove && peer.role !== 'owner'}
     {#if confirmingRemove}
-      <button class="confirm-remove" onclick={() => { onremove(); confirmingRemove = false; }}>remove?</button>
-      <button class="cancel-remove" onclick={() => (confirmingRemove = false)}>no</button>
+      <button class="confirm-remove" data-testid={`peer-remove-confirm-${peer.id}`} onclick={() => { onremove(); confirmingRemove = false; }}>remove?</button>
+      <button class="cancel-remove" data-testid={`peer-remove-cancel-${peer.id}`} onclick={() => (confirmingRemove = false)}>no</button>
     {:else}
-      <button class="remove-btn" onclick={() => (confirmingRemove = true)} aria-label="remove peer">
+      <button class="remove-btn" data-testid={`peer-remove-trigger-${peer.id}`} onclick={() => (confirmingRemove = true)} aria-label="remove peer">
         <X size={11} strokeWidth={1.5} />
       </button>
     {/if}

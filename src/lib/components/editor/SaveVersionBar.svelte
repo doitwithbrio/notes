@@ -1,6 +1,7 @@
 <script lang="ts">
   import { editorSessionState } from '../../session/editor-session.svelte.js';
-  import { createVersion, hideSavePrompt, versionState } from '../../state/versions.svelte.js';
+  import { createVersion } from '../../state/versions.svelte.js';
+  import { hideSavePrompt, versionReviewState } from '../../state/version-review.svelte.js';
 
   let inputEl = $state<HTMLInputElement | null>(null);
   let saving = $state(false);
@@ -8,7 +9,7 @@
 
   // Auto-focus the input when visible
   $effect(() => {
-    if (versionState.savePromptVisible && inputEl) {
+    if (versionReviewState.savePromptVisible && inputEl) {
       // Small delay to ensure DOM is ready
       setTimeout(() => inputEl?.focus(), 50);
     }
@@ -57,7 +58,7 @@
   }
 </script>
 
-{#if versionState.savePromptVisible}
+{#if versionReviewState.savePromptVisible}
   <div class="save-bar">
     {#if savedName}
       <span class="saved-msg">saved as ★ {savedName}</span>

@@ -1,19 +1,23 @@
 <script lang="ts">
   import { ChevronLeft, ChevronRight } from 'lucide-svelte';
   import { editorSessionState } from '../../session/editor-session.svelte.js';
-  import {
-    versionState,
-    getSignificantVersions,
-    selectPrevVersion,
-    selectNextVersion,
-  } from '../../state/versions.svelte.js';
+  import { getSignificantVersions } from '../../state/versions.svelte.js';
+  import { versionReviewState } from '../../state/version-review.svelte.js';
   import { formatShortTime } from '../../utils/time.js';
-  import { getWorkspaceRoute, isHistoryRoute, navigateBackToLive, navigateToHistory } from '../../navigation/workspace-router.svelte.js';
+  import {
+    getHistoryVersionId,
+    getWorkspaceRoute,
+    isHistoryRoute,
+    navigateBackToLive,
+    navigateHistoryNewer,
+    navigateHistoryOlder,
+    navigateToHistory,
+  } from '../../navigation/workspace-router.svelte.js';
 
   const versions = $derived(getSignificantVersions());
   const hasVersions = $derived(versions.length > 0);
   const isReviewing = $derived.by(() => isHistoryRoute(getWorkspaceRoute()));
-  const selectedIdx = $derived(versionState.selectedVersionIndex);
+  const selectedIdx = $derived(versionReviewState.previewVersionIndex);
 
   // Are we at the oldest/newest version?
   const canGoPrev = $derived(selectedIdx < versions.length - 1);
@@ -38,7 +42,7 @@
       );
       return;
     }
-    selectPrevVersion(editorSessionState.projectId, editorSessionState.docId);
+    void navigateHistoryOlder(editorSessionState.projectId, editorSessionState.docId);
   }
 
   function handleNext() {
@@ -47,7 +51,7 @@
       navigateBackToLive();
       return;
     }
-    selectNextVersion(editorSessionState.projectId, editorSessionState.docId);
+    void navigateHistoryNewer(editorSessionState.projectId, editorSessionState.docId);
   }
 
   function handleBackToLive() {
@@ -61,7 +65,7 @@
   }
 
   const selectedVersion = $derived(
-    versions.find((v) => v.id === versionState.selectedVersionId),
+    versions.find((v) => v.id === getHistoryVersionId()),
   );
 </script>
 
@@ -83,7 +87,7 @@
         <button
           class="tick"
           class:named={version.type === 'named'}
-          class:active={version.id === versionState.selectedVersionId}
+          class:active={version.id === getHistoryVersionId()}
           style="left: {tickPosition(i, versions.length)}%"
           onclick={() => handleTickClick(version.id)}
           title="{version.name} · {version.createdAt > 0 ? formatShortTime(version.createdAt) : ''}{version.label ? ` · "${version.label}"` : ''}"

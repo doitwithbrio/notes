@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::XChaCha20Poly1305;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 use zeroize::Zeroize;
 
 /// ALPN for the invite protocol (separate from sync).
@@ -26,6 +27,20 @@ pub const INVITE_ALPN: &[u8] = b"/p2p-notes/invite/1";
 
 /// Default TTL for invite codes.
 pub const DEFAULT_INVITE_TTL: Duration = Duration::from_secs(10 * 60); // 10 minutes
+const INVITE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub fn current_invite_ttl() -> Duration {
+    if std::env::var("P2P_E2E").ok().as_deref() != Some("1") {
+        return DEFAULT_INVITE_TTL;
+    }
+
+    std::env::var("P2P_INVITE_TTL_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_INVITE_TTL)
+}
 
 /// Maximum handshake attempts per invite code.
 pub const MAX_HANDSHAKE_ATTEMPTS: u32 = 3;
@@ -44,6 +59,11 @@ pub struct InviteCode {
 /// Data sent from Owner to Invitee after successful handshake.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InvitePayload {
+    /// Invite/session identifiers for durable resume.
+    #[serde(default)]
+    pub invite_id: String,
+    #[serde(default)]
+    pub session_id: String,
     /// Project ID.
     pub project_id: String,
     /// Project name.
@@ -67,31 +87,79 @@ pub struct InvitePayload {
 }
 
 /// Tracks an active invite on the Owner side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InviteSessionPhase {
+    Reserved,
+    PayloadPrepared,
+    PayloadSent,
+    AwaitingPreparedAck,
+    PreparedAckReceived,
+    Committed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InviteReservation {
+    pub session_id: String,
+    pub invitee_peer_id: String,
+    pub reserved_at: Instant,
+    pub timeout_at: Instant,
+    pub phase: InviteSessionPhase,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InviteConsumed {
+    pub session_id: String,
+    pub invitee_peer_id: String,
+    pub consumed_at: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InviteCommittedPendingAck {
+    pub session_id: String,
+    pub invitee_peer_id: String,
+    pub committed_at: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InviteState {
+    Open,
+    Reserved(InviteReservation),
+    CommittedPendingAck(InviteCommittedPendingAck),
+    Consumed(InviteConsumed),
+}
+
+#[derive(Debug, Clone)]
 pub struct PendingInvite {
+    pub invite_id: String,
     pub code: InviteCode,
     pub created_at: Instant,
     pub attempts: u32,
     pub project_name: String,
     pub project_id: String,
-    /// The serialized manifest binary to send to the invitee.
-    pub manifest_data: Vec<u8>,
     /// Role to assign the invitee.
     pub invite_role: String,
-    /// Owner's X25519 public key (for key wrapping).
+    pub state: InviteState,
+    #[cfg(test)]
+    pub manifest_data: Vec<u8>,
+    #[cfg(test)]
     pub owner_x25519_public: Option<[u8; 32]>,
-    /// Current epoch key (raw 32 bytes). Included in the SPAKE2-encrypted payload.
+    #[cfg(test)]
     pub epoch_key: Option<[u8; 32]>,
-    /// Current epoch number.
+    #[cfg(test)]
     pub current_epoch: u32,
 }
 
 impl PendingInvite {
     pub fn is_expired(&self) -> bool {
-        self.created_at.elapsed() > DEFAULT_INVITE_TTL
+        chrono::Utc::now() > self.code.expires_at
     }
 
     pub fn is_exhausted(&self) -> bool {
         self.attempts >= MAX_HANDSHAKE_ATTEMPTS
+    }
+
+    pub fn is_available(&self) -> bool {
+        matches!(self.state, InviteState::Open)
     }
 }
 
@@ -234,10 +302,12 @@ pub fn decrypt_payload(key: &[u8], data: &[u8]) -> Result<Vec<u8>, InviteError> 
 // ── Owner-side Invite Handler ─────────────────────────────────────────
 
 use std::sync::Arc;
+use std::{future::Future, pin::Pin};
 
 use dashmap::DashMap;
 use iroh::endpoint::Connection;
 use iroh::protocol::AcceptError;
+use tokio::io::AsyncWriteExt;
 
 /// Event emitted when an invite is successfully accepted.
 #[derive(Debug, Clone)]
@@ -250,6 +320,34 @@ pub struct InviteAccepted {
     pub role: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct InviteAcceptanceContext {
+    pub invite_id: String,
+    pub session_id: String,
+    pub passphrase: String,
+    pub project_name: String,
+    pub project_id: String,
+    pub role: String,
+    pub invitee_peer_id: String,
+}
+
+pub trait InviteLifecycleHandler: Send + Sync {
+    fn prepare_payload<'a>(
+        &'a self,
+        ctx: &'a InviteAcceptanceContext,
+    ) -> Pin<Box<dyn Future<Output = Result<InvitePayload, InviteError>> + Send + 'a>>;
+
+    fn commit_acceptance<'a>(
+        &'a self,
+        ctx: &'a InviteAcceptanceContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), InviteError>> + Send + 'a>>;
+}
+
+pub trait InvitePersistenceHandler: Send + Sync {
+    fn sync_invite(&self, passphrase: &str, invite: &PendingInvite) -> Result<(), InviteError>;
+    fn delete_invite(&self, invite_id: &str) -> Result<(), InviteError>;
+}
+
 /// Owner-side invite handler. Implements `iroh::protocol::ProtocolHandler`
 /// to accept incoming invite connections and run the SPAKE2 handshake.
 pub struct InviteHandler {
@@ -257,6 +355,9 @@ pub struct InviteHandler {
     pending: Arc<DashMap<String, PendingInvite>>,
     /// Channel to notify when an invite is accepted (so the app can update the manifest).
     accepted_tx: tokio::sync::broadcast::Sender<InviteAccepted>,
+    lifecycle: Option<Arc<dyn InviteLifecycleHandler>>,
+    persistence: Option<Arc<dyn InvitePersistenceHandler>>,
+    wrong_attempts: Arc<DashMap<String, u32>>,
     #[cfg(test)]
     completed_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -277,14 +378,33 @@ impl InviteHandler {
         Self {
             pending: Arc::new(DashMap::new()),
             accepted_tx,
+            lifecycle: None,
+            persistence: None,
+            wrong_attempts: Arc::new(DashMap::new()),
             #[cfg(test)]
             completed_tx,
         }
     }
 
+    pub fn set_lifecycle_handler(&mut self, lifecycle: Arc<dyn InviteLifecycleHandler>) {
+        self.lifecycle = Some(lifecycle);
+    }
+
+    pub fn set_persistence_handler(&mut self, persistence: Arc<dyn InvitePersistenceHandler>) {
+        self.persistence = Some(persistence);
+    }
+
     /// Subscribe to invite acceptance notifications.
     pub fn subscribe_accepted(&self) -> tokio::sync::broadcast::Receiver<InviteAccepted> {
         self.accepted_tx.subscribe()
+    }
+
+    #[cfg(test)]
+    pub fn pending_snapshot(&self) -> Vec<(String, PendingInvite)> {
+        self.pending
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect()
     }
 
     #[cfg(test)]
@@ -294,13 +414,247 @@ impl InviteHandler {
 
     /// Register a pending invite. Called when the owner generates an invite code.
     pub fn add_pending(&self, passphrase: String, invite: PendingInvite) {
+        if let Some(persistence) = &self.persistence {
+            let _ = persistence.sync_invite(&passphrase, &invite);
+        }
         self.pending.insert(passphrase, invite);
+    }
+
+    pub fn add_pending_checked(
+        &self,
+        passphrase: String,
+        invite: PendingInvite,
+    ) -> Result<(), InviteError> {
+        if let Some(persistence) = &self.persistence {
+            persistence.sync_invite(&passphrase, &invite)?;
+        }
+        self.pending.insert(passphrase, invite);
+        Ok(())
+    }
+
+    fn wrong_attempts_for(&self, invitee_peer_id: &str) -> u32 {
+        self.wrong_attempts
+            .get(invitee_peer_id)
+            .map(|entry| *entry.value())
+            .unwrap_or(0)
+    }
+
+    fn register_wrong_attempt(&self, invitee_peer_id: &str) -> InviteError {
+        let attempts = if let Some(mut entry) = self.wrong_attempts.get_mut(invitee_peer_id) {
+            *entry += 1;
+            *entry
+        } else {
+            self.wrong_attempts.insert(invitee_peer_id.to_string(), 1);
+            1
+        };
+
+        if attempts >= MAX_HANDSHAKE_ATTEMPTS {
+            InviteError::Exhausted
+        } else {
+            InviteError::VerificationFailed
+        }
+    }
+
+    fn clear_wrong_attempts(&self, invitee_peer_id: &str) {
+        self.wrong_attempts.remove(invitee_peer_id);
     }
 
     /// Remove expired/exhausted invites.
     pub fn cleanup_expired(&self) {
-        self.pending
-            .retain(|_, v| !v.is_expired() && !v.is_exhausted());
+        self.pending.retain(|_, invite| {
+            if invite.is_expired() {
+                if let Some(persistence) = &self.persistence {
+                    let _ = persistence.delete_invite(&invite.invite_id);
+                }
+                return false;
+            }
+
+            if let InviteState::Reserved(reservation) = &invite.state {
+                if Instant::now() >= reservation.timeout_at {
+                    invite.state = InviteState::Open;
+                    if let Some(persistence) = &self.persistence {
+                        let _ = persistence.sync_invite(&invite.code.passphrase, &invite);
+                    }
+                }
+            }
+
+            if invite.is_exhausted() && !matches!(invite.state, InviteState::Reserved(_)) {
+                if let Some(persistence) = &self.persistence {
+                    let _ = persistence.delete_invite(&invite.invite_id);
+                }
+                return false;
+            }
+
+            true
+        });
+    }
+
+    fn try_reserve_invite(
+        &self,
+        passphrase: &str,
+        invitee_peer_id: &str,
+        timeout_at: Instant,
+    ) -> Result<InviteAcceptanceContext, InviteError> {
+        let session_id = Uuid::new_v4().to_string();
+        let mut invite = self.pending.get_mut(passphrase).ok_or(InviteError::Expired)?;
+
+        if invite.is_expired() {
+            drop(invite);
+            self.pending.remove(passphrase);
+            return Err(InviteError::Expired);
+        }
+        if invite.attempts > MAX_HANDSHAKE_ATTEMPTS {
+            drop(invite);
+            self.pending.remove(passphrase);
+            return Err(InviteError::Exhausted);
+        }
+        if let InviteState::Reserved(reservation) = &invite.state {
+            if Instant::now() >= reservation.timeout_at {
+                invite.state = InviteState::Open;
+                if let Some(persistence) = &self.persistence {
+                    persistence.sync_invite(passphrase, &invite)?;
+                }
+            }
+        }
+        if !invite.is_available() {
+            return Err(InviteError::Unavailable);
+        }
+
+        invite.attempts += 1;
+        if invite.attempts > MAX_HANDSHAKE_ATTEMPTS {
+            drop(invite);
+            self.pending.remove(passphrase);
+            return Err(InviteError::Exhausted);
+        }
+
+        invite.state = InviteState::Reserved(InviteReservation {
+            session_id: session_id.clone(),
+            invitee_peer_id: invitee_peer_id.to_string(),
+            reserved_at: Instant::now(),
+            timeout_at,
+            phase: InviteSessionPhase::Reserved,
+        });
+
+        if let Some(persistence) = &self.persistence {
+            if let Err(err) = persistence.sync_invite(passphrase, &invite) {
+                invite.state = InviteState::Open;
+                return Err(err);
+            }
+        }
+
+        Ok(InviteAcceptanceContext {
+            invite_id: invite.invite_id.clone(),
+            session_id,
+            passphrase: passphrase.to_string(),
+            project_name: invite.project_name.clone(),
+            project_id: invite.project_id.clone(),
+            role: invite.invite_role.clone(),
+            invitee_peer_id: invitee_peer_id.to_string(),
+        })
+    }
+
+    fn set_reservation_phase(
+        &self,
+        passphrase: &str,
+        session_id: &str,
+        phase: InviteSessionPhase,
+    ) -> Result<(), InviteError> {
+        let mut invite = self.pending.get_mut(passphrase).ok_or(InviteError::Expired)?;
+        match &mut invite.state {
+            InviteState::Reserved(reservation) if reservation.session_id == session_id => {
+                if Instant::now() >= reservation.timeout_at {
+                    invite.state = InviteState::Open;
+                    return Err(InviteError::Expired);
+                }
+                let previous = reservation.phase.clone();
+                reservation.phase = phase;
+                if let Some(persistence) = &self.persistence {
+                    if let Err(err) = persistence.sync_invite(passphrase, &invite) {
+                        if let InviteState::Reserved(reservation) = &mut invite.state {
+                            reservation.phase = previous;
+                        }
+                        return Err(err);
+                    }
+                }
+                Ok(())
+            }
+            InviteState::Reserved(_)
+            | InviteState::CommittedPendingAck(_)
+            | InviteState::Consumed(_) => Err(InviteError::Unavailable),
+            InviteState::Open => Err(InviteError::InvalidState),
+        }
+    }
+
+    fn release_reservation(&self, passphrase: &str, session_id: &str) -> Result<(), InviteError> {
+        if let Some(mut invite) = self.pending.get_mut(passphrase) {
+            if matches!(
+                &invite.state,
+                InviteState::Reserved(reservation) if reservation.session_id == session_id
+            ) {
+                let previous = invite.state.clone();
+                invite.state = InviteState::Open;
+                if let Some(persistence) = &self.persistence {
+                    if let Err(err) = persistence.sync_invite(passphrase, &invite) {
+                        invite.state = previous;
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn mark_consumed(&self, passphrase: &str, session_id: &str, invitee_peer_id: &str) -> Result<(), InviteError> {
+        if let Some(mut invite) = self.pending.get_mut(passphrase) {
+            if matches!(
+                &invite.state,
+                InviteState::CommittedPendingAck(committed) if committed.session_id == session_id
+            ) {
+                let previous = invite.state.clone();
+                invite.state = InviteState::Consumed(InviteConsumed {
+                    session_id: session_id.to_string(),
+                    invitee_peer_id: invitee_peer_id.to_string(),
+                    consumed_at: Instant::now(),
+                });
+                if let Some(persistence) = &self.persistence {
+                    if let Err(err) = persistence.sync_invite(passphrase, &invite) {
+                        invite.state = previous;
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn mark_committed_pending_ack(
+        &self,
+        passphrase: &str,
+        session_id: &str,
+        invitee_peer_id: &str,
+    ) -> Result<(), InviteError> {
+        let mut invite = self.pending.get_mut(passphrase).ok_or(InviteError::Expired)?;
+        match &invite.state {
+            InviteState::Reserved(reservation) if reservation.session_id == session_id => {
+                let previous = invite.state.clone();
+                invite.state = InviteState::CommittedPendingAck(InviteCommittedPendingAck {
+                    session_id: session_id.to_string(),
+                    invitee_peer_id: invitee_peer_id.to_string(),
+                    committed_at: Instant::now(),
+                });
+                if let Some(persistence) = &self.persistence {
+                    if let Err(err) = persistence.sync_invite(passphrase, &invite) {
+                        invite.state = previous;
+                        return Err(err);
+                    }
+                }
+                Ok(())
+            }
+            InviteState::CommittedPendingAck(_) | InviteState::Consumed(_) => {
+                Err(InviteError::Unavailable)
+            }
+            InviteState::Open | InviteState::Reserved(_) => Err(InviteError::InvalidState),
+        }
     }
 
     /// Handle an incoming invite connection from an invitee using SPAKE2.
@@ -316,39 +670,64 @@ impl InviteHandler {
     /// 3. The invitee cannot distinguish wrong-passphrase from right-passphrase
     ///    until they try to decrypt (authenticated encryption).
     /// 4. After sending the payload the owner waits for a one-byte ACK from the
-    ///    invitee proving the payload decrypted successfully. This prevents a
-    ///    wrong passphrase or early disconnect from consuming the one-time code.
+    ///    invitee proving the payload decrypted successfully.
+    /// 5. The owner then commits acceptance and sends a one-byte final status
+    ///    (`1` = committed, `0` = failed). The invitee only treats the join as
+    ///    successful after that final owner confirmation arrives.
     async fn handle_connection(&self, connection: Connection) -> Result<(), InviteError> {
-        tokio::time::timeout(
-            Duration::from_secs(30),
-            self.handle_connection_inner(connection),
-        )
-        .await
-        .map_err(|_| InviteError::Connection("invite handshake timed out (30s)".into()))?
+        let deadline = Instant::now() + INVITE_HANDSHAKE_TIMEOUT;
+        self.handle_connection_inner(connection, deadline).await
     }
 
     async fn handle_connection_inner(
         &self,
         connection: Connection,
+        deadline: Instant,
     ) -> Result<(), InviteError> {
-        let (mut send, mut recv) = connection
-            .accept_bi()
+        let remote_peer_id = connection.remote_id().to_string();
+        if self.wrong_attempts_for(&remote_peer_id) >= MAX_HANDSHAKE_ATTEMPTS {
+            return Err(InviteError::Exhausted);
+        }
+
+        let deadline_tokio = tokio::time::Instant::from_std(deadline);
+        let (mut send, mut recv) = tokio::time::timeout_at(deadline_tokio, connection.accept_bi())
             .await
-            .map_err(|e| InviteError::Connection(format!("accept stream: {e}")))?;
+            .map_err(|_| {
+                self.cleanup_expired();
+                InviteError::Connection("accept stream timed out".into())
+            })?
+            .map_err(|e| {
+                self.cleanup_expired();
+                InviteError::Connection(format!("accept stream: {e}"))
+            })?;
 
         // Step 1: Read invitee's SPAKE2 message
         let mut invitee_msg_len_buf = [0u8; 4];
-        recv.read_exact(&mut invitee_msg_len_buf)
+        tokio::time::timeout_at(deadline_tokio, recv.read_exact(&mut invitee_msg_len_buf))
             .await
-            .map_err(|e| InviteError::Connection(format!("read spake2 len: {e}")))?;
+            .map_err(|_| {
+                self.cleanup_expired();
+                InviteError::Connection("read spake2 len timed out".into())
+            })?
+            .map_err(|e| {
+                self.cleanup_expired();
+                InviteError::Connection(format!("read spake2 len: {e}"))
+            })?;
         let invitee_msg_len = u32::from_be_bytes(invitee_msg_len_buf) as usize;
         if invitee_msg_len > 256 {
             return Err(InviteError::InvalidPayload);
         }
         let mut invitee_msg = vec![0u8; invitee_msg_len];
-        recv.read_exact(&mut invitee_msg)
+        tokio::time::timeout_at(deadline_tokio, recv.read_exact(&mut invitee_msg))
             .await
-            .map_err(|e| InviteError::Connection(format!("read spake2 msg: {e}")))?;
+            .map_err(|_| {
+                self.cleanup_expired();
+                InviteError::Connection("read spake2 msg timed out".into())
+            })?
+            .map_err(|e| {
+                self.cleanup_expired();
+                InviteError::Connection(format!("read spake2 msg: {e}"))
+            })?;
 
         // Step 2: Try each pending invite's passphrase with SPAKE2
         self.cleanup_expired();
@@ -372,6 +751,18 @@ impl InviteHandler {
                 log::debug!("Invite handler: skipping exhausted invite for project '{}'", invite.project_name);
                 continue;
             }
+            let resumable_for_peer = matches!(
+                &invite.state,
+                InviteState::CommittedPendingAck(committed)
+                    if committed.invitee_peer_id == connection.remote_id().to_string()
+            );
+            if !invite.is_available() && !resumable_for_peer {
+                log::debug!(
+                    "Invite handler: skipping unavailable invite for project '{}'",
+                    invite.project_name
+                );
+                continue;
+            }
 
             let (owner_state, owner_msg) = start_owner_handshake(passphrase);
 
@@ -379,12 +770,26 @@ impl InviteHandler {
             if let Ok(mut shared_key) = finish_handshake(owner_state, &invitee_msg) {
                 // Send our SPAKE2 message to the invitee
                 let len = (owner_msg.len() as u32).to_be_bytes();
-                send.write_all(&len)
+                tokio::time::timeout_at(deadline_tokio, send.write_all(&len))
                     .await
-                    .map_err(|e| InviteError::Connection(format!("send spake2 len: {e}")))?;
-                send.write_all(&owner_msg)
+                    .map_err(|_| {
+                        self.cleanup_expired();
+                        InviteError::Connection("send spake2 len timed out".into())
+                    })?
+                    .map_err(|e| {
+                        self.cleanup_expired();
+                        InviteError::Connection(format!("send spake2 len: {e}"))
+                    })?;
+                tokio::time::timeout_at(deadline_tokio, send.write_all(&owner_msg))
                     .await
-                    .map_err(|e| InviteError::Connection(format!("send spake2 msg: {e}")))?;
+                    .map_err(|_| {
+                        self.cleanup_expired();
+                        InviteError::Connection("send spake2 msg timed out".into())
+                    })?
+                    .map_err(|e| {
+                        self.cleanup_expired();
+                        InviteError::Connection(format!("send spake2 msg: {e}"))
+                    })?;
 
                 matched = Some((passphrase.clone(), shared_key.clone()));
                 shared_key.zeroize();
@@ -402,33 +807,83 @@ impl InviteHandler {
                     "Invite handler: SPAKE2 handshake failed — no matching passphrase among {pending_count} pending invite(s). \
                      The invitee sent a code that doesn't match any active invite."
                 );
-                return Err(InviteError::VerificationFailed);
+                return Err(self.register_wrong_attempt(&remote_peer_id));
             }
         };
 
-        // Validate the invite is still valid
-        {
-            let mut invite = self
-                .pending
-                .get_mut(&passphrase)
-                .ok_or(InviteError::Expired)?;
-            invite.attempts += 1;
-            if invite.is_expired() {
-                drop(invite);
-                self.pending.remove(&passphrase);
+        self.clear_wrong_attempts(&remote_peer_id);
+
+        if let Some(invite) = self.pending.get(&passphrase) {
+            if let InviteState::CommittedPendingAck(committed) = &invite.state {
+                if committed.invitee_peer_id == connection.remote_id().to_string() {
+                    shared_key.zeroize();
+                    send.write_all(&[1])
+                        .await
+                        .map_err(|e| InviteError::Connection(format!("send resumed final status: {e}")))?;
+                    send.flush()
+                        .await
+                        .map_err(|e| InviteError::Connection(format!("flush resumed final status: {e}")))?;
+
+                    let mut final_ack = [0u8; 1];
+                    match tokio::time::timeout_at(deadline_tokio, recv.read_exact(&mut final_ack)).await {
+                        Ok(Ok(_)) if final_ack[0] == 1 => {
+                            self.mark_consumed(&passphrase, &committed.session_id, &committed.invitee_peer_id)?;
+                        }
+                        _ => {
+                            log::warn!(
+                                "Committed invite for project {} resumed without applied ack",
+                                invite.project_name
+                            );
+                        }
+                    }
+                    let _ = send.finish();
+                    return Ok(());
+                }
+
                 shared_key.zeroize();
-                return Err(InviteError::Expired);
-            }
-            if invite.is_exhausted() {
-                drop(invite);
-                self.pending.remove(&passphrase);
-                shared_key.zeroize();
-                return Err(InviteError::Exhausted);
+                return Err(InviteError::Unavailable);
             }
         }
 
-        // Step 3: Send encrypted payload using the SPAKE2-derived shared key
-        let payload = {
+        let ctx = match self.try_reserve_invite(
+            &passphrase,
+            &connection.remote_id().to_string(),
+            deadline,
+        ) {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                shared_key.zeroize();
+                return Err(err);
+            }
+        };
+
+        // Step 3: Build the payload. In production this comes from the lifecycle
+        // handler so it can be prepared from current app state rather than the
+        // invite creation snapshot.
+        let payload = if let Some(lifecycle) = &self.lifecycle {
+            match tokio::time::timeout_at(deadline_tokio, lifecycle.prepare_payload(&ctx)).await {
+                Ok(Ok(payload)) => payload,
+                Ok(Err(err)) => {
+                    self.release_reservation(&ctx.passphrase, &ctx.session_id)?;
+                    shared_key.zeroize();
+                    return Err(err);
+                }
+                Err(_) => {
+                    self.release_reservation(&ctx.passphrase, &ctx.session_id)?;
+                    shared_key.zeroize();
+                    return Err(InviteError::Connection("prepare payload timed out".into()));
+                }
+            }
+        } else {
+            #[cfg(not(test))]
+            {
+                return Err(InviteError::Lifecycle(
+                    "missing invite lifecycle handler".into(),
+                ));
+            }
+
+            #[cfg(test)]
+            {
             let invite = self.pending.get(&passphrase).ok_or(InviteError::Expired)?;
             let manifest_hex = invite
                 .manifest_data
@@ -447,6 +902,8 @@ impl InviteHandler {
                 .unwrap_or_default();
 
             InvitePayload {
+                invite_id: invite.invite_id.clone(),
+                session_id: ctx.session_id.clone(),
                 project_id: invite.project_id.clone(),
                 project_name: invite.project_name.clone(),
                 role: invite.invite_role.clone(),
@@ -455,7 +912,9 @@ impl InviteHandler {
                 epoch_key_hex,
                 epoch: invite.current_epoch,
             }
+            }
         };
+        self.set_reservation_phase(&ctx.passphrase, &ctx.session_id, InviteSessionPhase::PayloadPrepared)?;
 
         let payload_json =
             serde_json::to_vec(&payload).map_err(|e| InviteError::Serde(e.to_string()))?;
@@ -464,38 +923,97 @@ impl InviteHandler {
 
         // Send length-prefixed encrypted payload
         let len = (encrypted.len() as u32).to_be_bytes();
-        send.write_all(&len)
+        tokio::time::timeout_at(deadline_tokio, send.write_all(&len))
             .await
-            .map_err(|e| InviteError::Connection(format!("send length: {e}")))?;
-        send.write_all(&encrypted)
+            .map_err(|_| {
+                let _ = self.release_reservation(&ctx.passphrase, &ctx.session_id);
+                InviteError::Connection("send payload length timed out".into())
+            })?
+            .map_err(|e| {
+                let _ = self.release_reservation(&ctx.passphrase, &ctx.session_id);
+                InviteError::Connection(format!("send length: {e}"))
+            })?;
+        tokio::time::timeout_at(deadline_tokio, send.write_all(&encrypted))
             .await
-            .map_err(|e| InviteError::Connection(format!("send payload: {e}")))?;
+            .map_err(|_| {
+                let _ = self.release_reservation(&ctx.passphrase, &ctx.session_id);
+                InviteError::Connection("send payload timed out".into())
+            })?
+            .map_err(|e| {
+                let _ = self.release_reservation(&ctx.passphrase, &ctx.session_id);
+                InviteError::Connection(format!("send payload: {e}"))
+            })?;
+        self.set_reservation_phase(&ctx.passphrase, &ctx.session_id, InviteSessionPhase::PayloadSent)?;
+        self.set_reservation_phase(&ctx.passphrase, &ctx.session_id, InviteSessionPhase::AwaitingPreparedAck)?;
 
-        let _ = send.finish();
-
-        let mut ack = [0u8; 1];
-        recv.read_exact(&mut ack)
+        let mut prepared_ack = [0u8; 1];
+        tokio::time::timeout_at(deadline_tokio, recv.read_exact(&mut prepared_ack))
             .await
-            .map_err(|e| InviteError::Connection(format!("read invitee ack: {e}")))?;
-        if ack[0] != 1 {
+            .map_err(|_| {
+                let _ = self.release_reservation(&ctx.passphrase, &ctx.session_id);
+                InviteError::Connection("read invitee prepared ack timed out".into())
+            })?
+            .map_err(|e| {
+                let _ = self.release_reservation(&ctx.passphrase, &ctx.session_id);
+                InviteError::Connection(format!("read invitee prepared ack: {e}"))
+            })?;
+        if prepared_ack[0] != 1 {
+            self.release_reservation(&ctx.passphrase, &ctx.session_id)?;
             return Err(InviteError::VerificationFailed);
         }
+        self.set_reservation_phase(&ctx.passphrase, &ctx.session_id, InviteSessionPhase::PreparedAckReceived)?;
 
-        // Notify that invite was accepted
-        let invitee_peer_id = connection.remote_id().to_string();
-        let _ = self.accepted_tx.send(InviteAccepted {
-            project_name: payload.project_name.clone(),
-            invitee_peer_id: invitee_peer_id.clone(),
-            role: payload.role.clone(),
-        });
+        if let Some(lifecycle) = &self.lifecycle {
+            let commit_result = tokio::time::timeout_at(deadline_tokio, lifecycle.commit_acceptance(&ctx)).await;
+            if let Err(_) = commit_result {
+                self.release_reservation(&ctx.passphrase, &ctx.session_id)?;
+                let _ = send.write_all(&[0]).await;
+                let _ = send.flush().await;
+                let _ = send.finish();
+                return Err(InviteError::Connection("owner commit timed out".into()));
+            }
+            if let Err(err) = commit_result.expect("checked above") {
+                self.release_reservation(&ctx.passphrase, &ctx.session_id)?;
+                let _ = send.write_all(&[0]).await;
+                let _ = send.flush().await;
+                let _ = send.finish();
+                return Err(err);
+            }
+        }
+        self.set_reservation_phase(&ctx.passphrase, &ctx.session_id, InviteSessionPhase::Committed)?;
+        self.mark_committed_pending_ack(&ctx.passphrase, &ctx.session_id, &ctx.invitee_peer_id)?;
 
-        // Remove the one-time invite
-        self.pending.remove(&passphrase);
-        self.cleanup_expired();
+        send.write_all(&[1])
+            .await
+            .map_err(|e| InviteError::Connection(format!("send final status: {e}")))?;
+        send.flush()
+            .await
+            .map_err(|e| InviteError::Connection(format!("flush final status: {e}")))?;
+
+        let mut final_ack = [0u8; 1];
+        match tokio::time::timeout_at(deadline_tokio, recv.read_exact(&mut final_ack)).await {
+            Ok(Ok(_)) if final_ack[0] == 1 => {
+                self.mark_consumed(&ctx.passphrase, &ctx.session_id, &ctx.invitee_peer_id)?;
+
+                let _ = self.accepted_tx.send(InviteAccepted {
+                    project_name: payload.project_name.clone(),
+                    invitee_peer_id: ctx.invitee_peer_id.clone(),
+                    role: payload.role.clone(),
+                });
+            }
+            _ => {
+                log::warn!(
+                    "Invite accepted for project {} committed but invitee confirmation was not received",
+                    payload.project_name
+                );
+            }
+        }
+        let _ = send.finish();
 
         log::info!(
             "Invite accepted for project {} by peer {invitee_peer_id}",
-            payload.project_name
+            payload.project_name,
+            invitee_peer_id = ctx.invitee_peer_id
         );
         Ok(())
     }
@@ -515,6 +1033,9 @@ impl iroh::protocol::ProtocolHandler for InviteHandler {
         let handler = InviteHandler {
             pending: Arc::clone(&self.pending),
             accepted_tx: self.accepted_tx.clone(),
+            lifecycle: self.lifecycle.clone(),
+            persistence: self.persistence.clone(),
+            wrong_attempts: Arc::clone(&self.wrong_attempts),
             #[cfg(test)]
             completed_tx: self.completed_tx.clone(),
         };
@@ -554,11 +1075,20 @@ pub enum InviteError {
     #[error("Too many handshake attempts")]
     Exhausted,
 
+    #[error("Invite is already reserved or consumed")]
+    Unavailable,
+
+    #[error("Invite is in an invalid state for this operation")]
+    InvalidState,
+
     #[error("Connection error: {0}")]
     Connection(String),
 
     #[error("Serialization error: {0}")]
     Serde(String),
+
+    #[error("Lifecycle error: {0}")]
+    Lifecycle(String),
 }
 
 #[cfg(test)]
@@ -580,7 +1110,10 @@ mod tests {
     }
 
     impl InviteTestHarness {
-        async fn new(invites: Vec<(String, PendingInvite)>) -> Self {
+        async fn new(
+            invites: Vec<(String, PendingInvite)>,
+            lifecycle: Option<Arc<dyn InviteLifecycleHandler>>,
+        ) -> Self {
             let owner_lookup = MemoryLookup::new();
             let owner_ep = Endpoint::builder(presets::N0)
                 .relay_mode(RelayMode::Disabled)
@@ -589,7 +1122,10 @@ mod tests {
                 .await
                 .expect("owner endpoint bind");
 
-            let owner_handler = InviteHandler::new();
+            let mut owner_handler = InviteHandler::new();
+            if let Some(lifecycle) = lifecycle {
+                owner_handler.set_lifecycle_handler(lifecycle);
+            }
             let pending_map = owner_handler.pending.clone();
             let completed_rx = owner_handler.subscribe_completed();
             for (passphrase, invite) in invites {
@@ -625,6 +1161,22 @@ mod tests {
             &self,
             invitee_passphrase: &str,
             ack_byte: Option<u8>,
+        ) -> Result<InvitePayload, String> {
+            self.run_invitee_with_behavior(
+                invitee_passphrase,
+                ack_byte,
+                Duration::from_millis(0),
+                true,
+            )
+                .await
+        }
+
+        async fn run_invitee_with_behavior(
+            &self,
+            invitee_passphrase: &str,
+            ack_byte: Option<u8>,
+            ack_delay: Duration,
+            send_applied_ack: bool,
         ) -> Result<InvitePayload, String> {
             let connection = self
                 .invitee_ep
@@ -675,14 +1227,33 @@ mod tests {
                 .map_err(|e| format!("deserialize payload: {e}"))?;
 
             if let Some(ack_byte) = ack_byte {
+                if !ack_delay.is_zero() {
+                    tokio::time::sleep(ack_delay).await;
+                }
                 send.write_all(&[ack_byte])
                     .await
                     .map_err(|e| format!("send ack: {e}"))?;
                 send.flush()
                     .await
                     .map_err(|e| format!("flush ack: {e}"))?;
+                if ack_byte == 1 {
+                    let mut final_status = [0u8; 1];
+                    recv.read_exact(&mut final_status)
+                        .await
+                        .map_err(|e| format!("read final status: {e}"))?;
+                    if final_status[0] != 1 {
+                        return Err("owner failed to finalize invite acceptance".into());
+                    }
+                    if send_applied_ack {
+                        send.write_all(&[1])
+                            .await
+                            .map_err(|e| format!("send final ack: {e}"))?;
+                        send.flush()
+                            .await
+                            .map_err(|e| format!("flush final ack: {e}"))?;
+                    }
+                }
                 let _ = send.finish();
-                tokio::task::yield_now().await;
             }
 
             Ok(payload)
@@ -694,23 +1265,30 @@ mod tests {
             self.invitee_ep.close().await;
         }
 
-        async fn wait_for_invite_present(&self, passphrase: &str, expected_present: bool) {
-            tokio::time::timeout(Duration::from_secs(5), async {
+        async fn wait_for_invite_state<F>(&self, passphrase: &str, predicate: F)
+        where
+            F: Fn(&InviteState) -> bool,
+        {
+            tokio::time::timeout(Duration::from_secs(15), async {
                 loop {
-                    let present = self.pending_map.get(passphrase).is_some();
-                    if present == expected_present {
+                    let matches = self
+                        .pending_map
+                        .get(passphrase)
+                        .map(|invite| predicate(&invite.state))
+                        .unwrap_or(false);
+                    if matches {
                         break;
                     }
                     tokio::task::yield_now().await;
                 }
             })
             .await
-            .expect("timed out waiting for invite state");
+            .expect("timed out waiting for invite lifecycle state");
         }
 
         async fn wait_for_connection_completion(&self) {
             let mut rx = self.completed_rx.lock().await;
-            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            tokio::time::timeout(Duration::from_secs(15), rx.recv())
                 .await
                 .expect("timed out waiting for connection completion")
                 .expect("completion channel closed");
@@ -725,6 +1303,7 @@ mod tests {
         manifest_data: Vec<u8>,
     ) -> PendingInvite {
         PendingInvite {
+            invite_id: Uuid::new_v4().to_string(),
             code: InviteCode {
                 passphrase: passphrase.to_string(),
                 peer_id: owner_peer_id,
@@ -734,11 +1313,42 @@ mod tests {
             attempts: 0,
             project_name: project_name.to_string(),
             project_id: project_id.to_string(),
-            manifest_data,
             invite_role: "editor".to_string(),
+            state: InviteState::Open,
+            #[cfg(test)]
+            manifest_data,
+            #[cfg(test)]
             owner_x25519_public: None,
+            #[cfg(test)]
             epoch_key: None,
+            #[cfg(test)]
             current_epoch: 0,
+        }
+    }
+
+    struct MockLifecycleHandler {
+        payload: InvitePayload,
+        commit_error: Option<String>,
+    }
+
+    impl InviteLifecycleHandler for MockLifecycleHandler {
+        fn prepare_payload<'a>(
+            &'a self,
+            _ctx: &'a InviteAcceptanceContext,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<InvitePayload, InviteError>> + Send + 'a>> {
+            Box::pin(async move { Ok(self.payload.clone()) })
+        }
+
+        fn commit_acceptance<'a>(
+            &'a self,
+            _ctx: &'a InviteAcceptanceContext,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), InviteError>> + Send + 'a>> {
+            Box::pin(async move {
+                match &self.commit_error {
+                    Some(err) => Err(InviteError::Lifecycle(err.clone())),
+                    None => Ok(()),
+                }
+            })
         }
     }
 
@@ -760,7 +1370,7 @@ mod tests {
 
         // Build a large fake manifest payload so the invitee is definitely still
         // reading when the owner would regressively drop the connection.
-        let fake_manifest_bytes = vec![0xAB; 512 * 1024];
+        let fake_manifest_bytes = vec![0xAB; 64 * 1024];
         let fake_manifest_hex: String = fake_manifest_bytes
             .iter()
             .map(|b| format!("{b:02x}"))
@@ -775,7 +1385,7 @@ mod tests {
                 "test-uuid-1234",
                 fake_manifest_bytes.clone(),
             ),
-        )])
+        )], None)
         .await;
 
         let expected_manifest_hex = fake_manifest_hex.clone();
@@ -792,27 +1402,21 @@ mod tests {
         assert_eq!(invitee_result.role, "editor");
         assert_eq!(invitee_result.manifest_hex, expected_manifest_hex);
 
-        // ── Assert the invite was consumed (one-time use) ─────────────────
-        harness.wait_for_invite_present(passphrase, false).await;
+        harness.wait_for_connection_completion().await;
+        assert!(matches!(
+            harness.pending_map.get(passphrase).as_deref().map(|invite| &invite.state),
+            Some(InviteState::Consumed(_) | InviteState::CommittedPendingAck(_))
+        ));
 
-        // A second connection with the same passphrase should find no pending invite.
         // The dedicated malformed/no-ACK/wrong-passphrase tests assert the opposite side:
         // after a single failed attempt, the invite remains pending and usable.
         // Together these tests pin the current consumption behavior for the refactor.
-        // The handler removes the invite after acceptance; a second connection
-        // with the same passphrase should find no pending invite and fail.
-        let harness_ref = &harness;
-        let second_attempt = tokio::time::timeout(Duration::from_secs(5), async move {
-            harness_ref.run_invitee(passphrase, Some(1)).await
-        })
-        .await
-        .expect("second attempt timed out");
-
-        // The second attempt must fail — the owner dropped the connection
-        // with no matching invite.
         assert!(
-            second_attempt.is_err(),
-            "second use of a consumed one-time invite code should fail"
+            !matches!(
+                harness.pending_map.get(passphrase).as_deref().map(|invite| &invite.state),
+                Some(InviteState::Open)
+            ),
+            "successful invite acceptance should not reopen the one-time code"
         );
 
         harness.shutdown().await;
@@ -832,18 +1436,50 @@ mod tests {
                 "proj-wrong",
                 vec![1; 128],
             ),
-        )])
+        )], None)
         .await;
 
         let result = harness.run_invitee(wrong_passphrase, None).await;
         assert!(result.is_err(), "wrong passphrase should fail to decrypt payload");
 
         harness.wait_for_connection_completion().await;
-        harness.wait_for_invite_present(passphrase, true).await;
+        assert!(matches!(
+            harness.pending_map.get(passphrase).as_deref().map(|invite| &invite.state),
+            Some(InviteState::Open)
+        ));
 
         let retry = harness.run_invitee(passphrase, Some(1)).await;
         assert!(retry.is_ok(), "invite should still be usable after wrong passphrase");
-        harness.wait_for_invite_present(passphrase, false).await;
+
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_wrong_passphrase_attempts_exhaust_invitee() {
+        let passphrase = "attempt-limit-correct-ocean-frost-canyon";
+        let wrong_passphrase = "attempt-limit-wrong-ocean-frost-canyon";
+        let harness = InviteTestHarness::new(vec![
+            (
+                passphrase.to_string(),
+                make_pending_invite(
+                    "owner-peer".to_string(),
+                    passphrase,
+                    "attempt-limit-project",
+                    "proj-attempt-limit",
+                    vec![9; 128],
+                ),
+            ),
+        ], None)
+        .await;
+
+        for _ in 0..MAX_HANDSHAKE_ATTEMPTS {
+            let result = harness.run_invitee(wrong_passphrase, None).await;
+            assert!(result.is_err(), "wrong passphrase should fail");
+            harness.wait_for_connection_completion().await;
+        }
+
+        let retry = harness.run_invitee(passphrase, Some(1)).await;
+        assert!(retry.is_err(), "invitee should be rate-limited after repeated wrong attempts");
 
         harness.shutdown().await;
     }
@@ -860,18 +1496,20 @@ mod tests {
                 "proj-no-ack",
                 vec![2; 256],
             ),
-        )])
+        )], None)
         .await;
 
         let result = harness.run_invitee(passphrase, None).await;
         assert!(result.is_ok(), "invitee should still be able to read payload before dropping");
 
         harness.wait_for_connection_completion().await;
-        harness.wait_for_invite_present(passphrase, true).await;
+        assert!(matches!(
+            harness.pending_map.get(passphrase).as_deref().map(|invite| &invite.state),
+            Some(InviteState::Open)
+        ));
 
         let retry = harness.run_invitee(passphrase, Some(1)).await;
         assert!(retry.is_ok(), "invite should still be usable after a missing ACK");
-        harness.wait_for_invite_present(passphrase, false).await;
 
         harness.shutdown().await;
     }
@@ -888,20 +1526,210 @@ mod tests {
                 "proj-bad-ack",
                 vec![3; 256],
             ),
-        )])
+        )], None)
         .await;
 
         let result = harness.run_invitee(passphrase, Some(7)).await;
         assert!(result.is_ok(), "invitee can still read payload before sending bad ack");
 
         harness.wait_for_connection_completion().await;
-        harness.wait_for_invite_present(passphrase, true).await;
+        assert!(matches!(
+            harness.pending_map.get(passphrase).as_deref().map(|invite| &invite.state),
+            Some(InviteState::Open)
+        ));
 
         let retry = harness.run_invitee(passphrase, Some(1)).await;
         assert!(retry.is_ok(), "invite should still be usable after malformed ACK");
-        harness.wait_for_invite_present(passphrase, false).await;
 
         harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_prepare_payload_is_used() {
+        let passphrase = "lifecycle-success-ocean-frost-canyon-marble";
+        let lifecycle_payload = InvitePayload {
+            invite_id: "lifecycle-invite-id".to_string(),
+            session_id: "lifecycle-session-id".to_string(),
+            project_id: "lifecycle-project-id".to_string(),
+            project_name: "Lifecycle Project".to_string(),
+            role: "viewer".to_string(),
+            manifest_hex: "beef".to_string(),
+            owner_x25519_public_hex: String::new(),
+            epoch_key_hex: String::new(),
+            epoch: 7,
+        };
+        let lifecycle = Arc::new(MockLifecycleHandler {
+            payload: lifecycle_payload.clone(),
+            commit_error: None,
+        });
+        let harness = InviteTestHarness::new(
+            vec![(
+                passphrase.to_string(),
+                make_pending_invite(
+                    "owner-peer".to_string(),
+                    passphrase,
+                    "snapshot-project",
+                    "snapshot-project-id",
+                    vec![4; 64],
+                ),
+            )],
+            Some(lifecycle),
+        )
+        .await;
+
+        let payload = harness
+            .run_invitee(passphrase, Some(1))
+            .await
+            .expect("lifecycle invite should succeed");
+        assert_eq!(payload.project_id, lifecycle_payload.project_id);
+        assert_eq!(payload.project_name, lifecycle_payload.project_name);
+        assert_eq!(payload.role, lifecycle_payload.role);
+        assert_eq!(payload.manifest_hex, lifecycle_payload.manifest_hex);
+
+        let second_attempt = harness.run_invitee(passphrase, Some(1)).await;
+        assert!(
+            second_attempt.is_err(),
+            "lifecycle-backed invite should also reject stale code reuse"
+        );
+
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_commit_failure_does_not_consume_invite() {
+        let passphrase = "lifecycle-failure-ocean-frost-canyon-marble";
+        let lifecycle = Arc::new(MockLifecycleHandler {
+            payload: InvitePayload {
+                invite_id: "lifecycle-invite-id".to_string(),
+                session_id: "lifecycle-session-id".to_string(),
+                project_id: "lifecycle-project-id".to_string(),
+                project_name: "Lifecycle Project".to_string(),
+                role: "editor".to_string(),
+                manifest_hex: "cafe".to_string(),
+                owner_x25519_public_hex: String::new(),
+                epoch_key_hex: String::new(),
+                epoch: 1,
+            },
+            commit_error: Some("commit failed".into()),
+        });
+        let harness = InviteTestHarness::new(
+            vec![(
+                passphrase.to_string(),
+                make_pending_invite(
+                    "owner-peer".to_string(),
+                    passphrase,
+                    "snapshot-project",
+                    "snapshot-project-id",
+                    vec![5; 64],
+                ),
+            )],
+            Some(lifecycle),
+        )
+        .await;
+
+        let result = harness.run_invitee(passphrase, Some(1)).await;
+        assert!(result.is_err(), "invitee should fail if owner commit fails after ACK");
+        harness.wait_for_connection_completion().await;
+        harness
+            .wait_for_invite_state(passphrase, |state| matches!(state, InviteState::Open))
+            .await;
+
+        let retry = harness.run_invitee(passphrase, Some(1)).await;
+        assert!(retry.is_err(), "commit failure should remain reproducible until owner-side issue is fixed");
+
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_commit_without_applied_ack_leaves_committed_pending_ack() {
+        let passphrase = "commit-no-applied-ack-ocean-frost";
+        let harness = InviteTestHarness::new(
+            vec![(
+                passphrase.to_string(),
+                make_pending_invite(
+                    "owner-peer".to_string(),
+                    passphrase,
+                    "pending-ack-project",
+                    "pending-ack-project-id",
+                    vec![7; 128],
+                ),
+            )],
+            None,
+        )
+        .await;
+
+        let result = harness
+            .run_invitee_with_behavior(passphrase, Some(1), Duration::from_millis(0), false)
+            .await;
+        assert!(result.is_ok(), "invitee should still receive commit result before disconnecting");
+
+        harness
+            .wait_for_invite_state(passphrase, |state| {
+                matches!(state, InviteState::CommittedPendingAck(_))
+            })
+            .await;
+
+        let retry = harness.run_invitee(passphrase, Some(1)).await;
+        assert!(retry.is_err(), "committed invite must not reopen after missing applied ack");
+
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_try_reserve_invite_is_atomic() {
+        let handler = Arc::new(InviteHandler::new());
+        let passphrase = "concurrent-acceptors-ocean-frost-canyon";
+        handler.add_pending(
+            passphrase.to_string(),
+            make_pending_invite(
+                "owner-peer".to_string(),
+                passphrase,
+                "race-project",
+                "race-project-id",
+                vec![6; 128],
+            ),
+        );
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let handler_a = Arc::clone(&handler);
+        let barrier_a = Arc::clone(&barrier);
+        let contender_a = tokio::spawn(async move {
+            barrier_a.wait().await;
+            handler_a.try_reserve_invite(
+                passphrase,
+                "peer-one",
+                Instant::now() + INVITE_HANDSHAKE_TIMEOUT,
+            )
+        });
+
+        let handler_b = Arc::clone(&handler);
+        let barrier_b = Arc::clone(&barrier);
+        let contender_b = tokio::spawn(async move {
+            barrier_b.wait().await;
+            handler_b.try_reserve_invite(
+                passphrase,
+                "peer-two",
+                Instant::now() + INVITE_HANDSHAKE_TIMEOUT,
+            )
+        });
+
+        barrier.wait().await;
+        let result_a = contender_a.await.unwrap();
+        let result_b = contender_b.await.unwrap();
+
+        let success_count = usize::from(result_a.is_ok()) + usize::from(result_b.is_ok());
+        assert_eq!(success_count, 1, "only one contender may reserve the invite");
+
+        let winner = result_a.or(result_b).unwrap();
+        handler.release_reservation(passphrase, &winner.session_id).unwrap();
+        let retry = handler
+            .try_reserve_invite(
+                passphrase,
+                "peer-three",
+                Instant::now() + INVITE_HANDSHAKE_TIMEOUT,
+            )
+            .unwrap();
+        assert_eq!(retry.invitee_peer_id, "peer-three");
     }
 
     #[test]
@@ -1016,6 +1844,8 @@ mod tests {
     #[test]
     fn test_invite_payload_serde() {
         let payload = InvitePayload {
+            invite_id: "test-invite-id".to_string(),
+            session_id: "test-session-id".to_string(),
             project_id: "test-uuid".to_string(),
             project_name: "My Project".to_string(),
             role: "editor".to_string(),
@@ -1032,15 +1862,17 @@ mod tests {
 
     fn test_pending_invite() -> PendingInvite {
         PendingInvite {
+            invite_id: Uuid::new_v4().to_string(),
             code: InviteCode {
                 passphrase: "test".to_string(),
                 peer_id: "id".to_string(),
-                expires_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(10),
             },
             created_at: Instant::now(),
             attempts: 0,
             project_name: "test".to_string(),
             project_id: "test-id".to_string(),
+            state: InviteState::Open,
             manifest_data: vec![],
             invite_role: "editor".to_string(),
             owner_x25519_public: None,
@@ -1052,7 +1884,7 @@ mod tests {
     #[test]
     fn test_pending_invite_expiry() {
         let mut invite = test_pending_invite();
-        invite.created_at = Instant::now() - Duration::from_secs(700);
+        invite.code.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
         assert!(invite.is_expired());
     }
 

@@ -1,16 +1,19 @@
 <script lang="ts">
-  import { getActiveDoc } from '../../state/documents.svelte.js';
-  import { editorSessionState } from '../../session/editor-session.svelte.js';
   import {
     versionState,
     getSignificantVersions,
   } from '../../state/versions.svelte.js';
   import { groupByDate } from '../../utils/time.js';
   import { formatShortTime } from '../../utils/time.js';
-  import { navigateToHistory } from '../../navigation/workspace-router.svelte.js';
+  import {
+    getSelectedDoc,
+    getSelectedHistoryVersionId,
+    getSelectedProjectId,
+    navigateToHistory,
+  } from '../../navigation/workspace-router.svelte.js';
 
 
-  const activeDoc = $derived(getActiveDoc());
+  const activeDoc = $derived(getSelectedDoc());
   const significant = $derived(getSignificantVersions());
   const versionCount = $derived(significant.length);
 
@@ -19,10 +22,11 @@
   );
 
   function handleSelectVersion(versionId: string) {
-    if (!editorSessionState.projectId || !editorSessionState.docId) return;
+    const projectId = getSelectedProjectId();
+    if (!projectId || !activeDoc) return;
     void navigateToHistory(
-      editorSessionState.projectId,
-      editorSessionState.docId,
+      projectId,
+      activeDoc.id,
       versionId,
     );
   }
@@ -65,7 +69,7 @@
               {#each versions as version (version.id)}
                 <button
                   class="version-item"
-                  class:selected={versionState.selectedVersionId === version.id}
+                  class:selected={getSelectedHistoryVersionId() === version.id}
                   class:named={version.type === 'named'}
                   onclick={() => handleSelectVersion(version.id)}
                   type="button"

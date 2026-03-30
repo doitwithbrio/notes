@@ -1,10 +1,10 @@
 <script lang="ts">
   import { isMac } from '../utils/platform.js';
-  import { getActiveDoc } from '../state/documents.svelte.js';
   import { presenceState } from '../state/presence.svelte.js';
   import { syncState } from '../state/sync.svelte.js';
+  import { getSelectedDoc } from '../navigation/workspace-router.svelte.js';
 
-  const activeDoc = $derived(getActiveDoc());
+  const activeDoc = $derived(getSelectedDoc());
 
   const peersInDoc = $derived(
     activeDoc

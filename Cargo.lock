@@ -3788,6 +3788,7 @@ dependencies = [
  "tauri-plugin-log",
  "tauri-plugin-process",
  "tauri-plugin-updater",
+ "tempfile",
  "tokio",
  "uuid",
  "zeroize",

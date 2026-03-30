@@ -4,6 +4,7 @@
 //! and provides methods for syncing docs with peers.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -31,6 +32,9 @@ pub struct PeerManager {
 
     /// Broadcast channel for peer status changes (connect/disconnect).
     status_tx: tokio::sync::broadcast::Sender<PeerStatusEvent>,
+
+    /// Test-only network gate used by E2E to simulate offline peers.
+    network_blocked: AtomicBool,
 }
 
 impl PeerManager {
@@ -43,6 +47,7 @@ impl PeerManager {
             project_peers: DashMap::new(),
             cancel: CancellationToken::new(),
             status_tx,
+            network_blocked: AtomicBool::new(false),
         }
     }
 
@@ -85,6 +90,10 @@ impl PeerManager {
         &self,
         peer_id: EndpointId,
     ) -> Result<Connection, PeerError> {
+        if self.network_blocked.load(Ordering::Relaxed) {
+            return Err(PeerError::NetworkBlocked);
+        }
+
         // Check for existing live connection
         if let Some(entry) = self.connections.get(&peer_id) {
             // close_reason() returns Some if closed, None if alive
@@ -154,6 +163,19 @@ impl PeerManager {
             .get(project)
             .map(|entry| entry.value().clone())
             .unwrap_or_default()
+    }
+
+    pub fn get_projects_for_peer(&self, peer_id: &EndpointId) -> Vec<String> {
+        self.project_peers
+            .iter()
+            .filter_map(|entry| {
+                if entry.value().contains(peer_id) {
+                    Some(entry.key().clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Get connection status for a peer.
@@ -250,6 +272,37 @@ impl PeerManager {
         log::info!("PeerManager shutdown: closed {} connections", keys.len());
     }
 
+    /// Test-only helper to simulate a network partition by forcing all active
+    /// connections closed and refusing new outgoing connections while blocked.
+    pub fn set_network_blocked(&self, blocked: bool) {
+        self.network_blocked.store(blocked, Ordering::Relaxed);
+
+        if !blocked {
+            return;
+        }
+
+        let keys: Vec<EndpointId> = self
+            .connections
+            .iter()
+            .map(|entry| *entry.key())
+            .collect();
+
+        for peer_id in keys {
+            if let Some((_, conn)) = self.connections.remove(&peer_id) {
+                conn.close(0u32.into(), b"e2e-network-blocked");
+            }
+            let _ = self.status_tx.send(PeerStatusEvent {
+                peer_id: peer_id.to_string(),
+                state: PeerConnectionState::Disconnected,
+                alias: None,
+            });
+        }
+    }
+
+    pub fn is_network_blocked(&self) -> bool {
+        self.network_blocked.load(Ordering::Relaxed)
+    }
+
     /// Get the cancellation token (for coordinating with external tasks).
     pub fn cancel_token(&self) -> &CancellationToken {
         &self.cancel
@@ -269,6 +322,9 @@ pub enum PeerError {
 
     #[error("Sync failed: {0}")]
     Sync(String),
+
+    #[error("Network blocked")]
+    NetworkBlocked,
 }
 
 #[cfg(test)]

@@ -2,9 +2,9 @@ import * as Automerge from '@automerge/automerge';
 
 import { tauriApi } from '../api/tauri.js';
 import { TauriRuntimeUnavailableError } from '../runtime/tauri.js';
-import { getDocById, markDocUnread, setActiveDoc, setDocWordCount } from '../state/documents.svelte.js';
-import { createVersion, leaveHistoryReview, loadVersions, versionState } from '../state/versions.svelte.js';
-import { uiState } from '../state/ui.svelte.js';
+import { getDocById, markDocUnread, setDocWordCount } from '../state/documents.svelte.js';
+import { createVersion, loadVersions, versionState } from '../state/versions.svelte.js';
+import { clearVersionPreview } from '../state/version-review.svelte.js';
 
 type NotesDoc = {
   schemaVersion?: number;
@@ -159,7 +159,7 @@ async function raceWithSuperseded<T>(intentId: number, promise: Promise<T>) {
 }
 
 async function closeSessionInternal(intentId: number, options?: { preserveLoading?: boolean }) {
-  leaveHistoryReview();
+  clearVersionPreview();
 
   flushWordCount();
   clearTimers();
@@ -210,9 +210,7 @@ export async function openEditorSession(projectId: string, docId: string) {
   const intentId = bumpSessionIntent();
   editorSessionState.loading = true;
   editorSessionState.lastError = null;
-  leaveHistoryReview();
-  setActiveDoc(docId);
-  uiState.activeProjectId = projectId;
+  clearVersionPreview();
 
   return queueSessionTransition(async () => {
     if (intentId !== sessionIntentId) return;
@@ -223,8 +221,7 @@ export async function openEditorSession(projectId: string, docId: string) {
       && currentDoc !== null;
 
     if (sameDocAlreadyOpen) {
-      leaveHistoryReview();
-      setActiveDoc(docId);
+      clearVersionPreview();
       editorSessionState.loading = false;
       return;
     }
@@ -271,7 +268,6 @@ export async function openEditorSession(projectId: string, docId: string) {
       setDocWordCount(docId, loaded.text);
       editorSessionState.projectId = projectId;
       editorSessionState.docId = docId;
-      setActiveDoc(docId);
       markDocUnread(docId, false);
       await loadVersions(docId);
     } catch (error) {

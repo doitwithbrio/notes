@@ -13,14 +13,23 @@
     hasHydratedProject,
     isProjectLoading,
     setDocPath,
-    clearActiveDocSelection,
   } from '../../state/documents.svelte.js';
   import { createProject, projectState, reorderProject, removeProject } from '../../state/projects.svelte.js';
-  import { uiState, openProjectOverview, toggleSidebar } from '../../state/ui.svelte.js';
-  import { openEditorSession, closeEditorSession, editorSessionState } from '../../session/editor-session.svelte.js';
+  import { openQuickOpen, uiState, toggleSidebar } from '../../state/ui.svelte.js';
+  import { closeEditorSession, editorSessionState } from '../../session/editor-session.svelte.js';
   import { tauriApi } from '../../api/tauri.js';
   import { openJoinDialog } from '../../state/invite.svelte.js';
-  import { navigateToDoc, navigateToProject } from '../../navigation/workspace-router.svelte.js';
+  import {
+    getWorkspaceRoute,
+    beginMovedDoc,
+    clearMovedDoc,
+    getWorkspaceProjectId,
+    handleDeletedDoc,
+    handleDeletedProject,
+    handleMovedDoc,
+    navigateToDoc,
+    navigateToProject,
+  } from '../../navigation/workspace-router.svelte.js';
   import ProjectGroup from './ProjectGroup.svelte';
   import ContextMenu from './ContextMenu.svelte';
   import type { MenuItem } from './ContextMenu.svelte';
@@ -120,6 +129,7 @@
 
       // Remove project from frontend state
       removeProject(projectId);
+      handleDeletedProject(projectId);
     } catch (err) {
       console.error('Failed to delete project:', err);
     }
@@ -132,6 +142,7 @@
         await closeEditorSession();
       }
       await deleteDoc(projectId, docId);
+      handleDeletedDoc(projectId, docId);
     } catch (err) {
       console.error('Failed to delete doc:', err);
     }
@@ -160,9 +171,11 @@
     try {
       const doc = getDocById(docId);
       if (!doc) return;
+      const currentRoute = getWorkspaceRoute();
+      const shouldOpenMovedDoc = currentRoute?.kind === 'doc' && currentRoute.docId === docId;
 
       // Close editor session if this doc is active
-      if (editorSessionState.docId === docId) {
+      if (shouldOpenMovedDoc) {
         await closeEditorSession();
       }
 
@@ -185,12 +198,29 @@
       }
 
       // Delete from source
+      beginMovedDoc({
+        fromProjectId: sourceProjectId,
+        fromDocId: docId,
+        toProjectId: targetProjectId,
+        toDocId: newDocId,
+      });
       await deleteDoc(sourceProjectId, docId);
 
       // Reload both projects
       await loadProjectDocs(sourceProjectId, { force: true });
       await loadProjectDocs(targetProjectId, { force: true });
+      handleMovedDoc({
+        fromProjectId: sourceProjectId,
+        fromDocId: docId,
+        toProjectId: targetProjectId,
+        toDocId: newDocId,
+      });
+
+      if (shouldOpenMovedDoc) {
+        await navigateToDoc(targetProjectId, newDocId);
+      }
     } catch (err) {
+      clearMovedDoc({ fromProjectId: sourceProjectId, fromDocId: docId });
       console.error('Failed to move doc:', err);
     }
   }
@@ -242,7 +272,7 @@
       const leaf = trimmed.endsWith('.md') ? trimmed : `${trimmed}.md`;
       const docId = await tauriApi.createNote(projectId, leaf);
       await loadProjectDocs(projectId, { force: true, connectPeers: true });
-      await openEditorSession(projectId, docId);
+      await navigateToDoc(projectId, docId);
     } catch (err) {
       console.error('Failed to create note:', err);
     } finally {
@@ -286,7 +316,7 @@
       e.preventDefault();
       // New file in the active project, or the first project if none active
       const projectId =
-        uiState.activeProjectId
+        getWorkspaceProjectId()
         ?? projectState.projects[0]?.id
         ?? null;
       if (projectId) {
@@ -310,7 +340,7 @@
 
 <svelte:window onclick={handleWindowClick} onkeydown={handleKeydown} />
 
-<aside class="sidebar" class:collapsed={!uiState.sidebarOpen}>
+<aside class="sidebar" class:collapsed={!uiState.sidebarOpen} data-testid="sidebar">
   <div class="sidebar-header" data-tauri-drag-region>
     {#if uiState.sidebarOpen}
       <span class="app-name" style="-webkit-app-region: no-drag">notes</span>
@@ -330,7 +360,7 @@
   </div>
 
   {#if uiState.sidebarOpen}
-    <button class="search-trigger" onclick={() => (uiState.quickOpenVisible = true)}>
+    <button class="search-trigger" data-testid="quick-open-trigger" onclick={openQuickOpen}>
       <span class="search-label">search...</span>
       <span class="search-hint">{modKey}+F</span>
     </button>
@@ -454,8 +484,8 @@
           <span class="edit-mode-label">drag to reorder</span>
           <button class="footer-done-btn" onclick={() => (editMode = false)}>done</button>
         {:else}
-          <button class="footer-new-project" onclick={startNewProject}>+ new</button>
-          <button class="footer-join" onclick={openJoinDialog}>
+          <button class="footer-new-project" data-testid="create-project-trigger" onclick={startNewProject}>+ new</button>
+          <button class="footer-join" data-testid="join-project-trigger" onclick={openJoinDialog}>
             <UserPlus size={13} strokeWidth={1.5} />
             <span>join</span>
           </button>

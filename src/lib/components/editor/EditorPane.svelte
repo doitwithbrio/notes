@@ -2,13 +2,13 @@
   import { untrack } from 'svelte';
   import type { Editor } from '@tiptap/core';
   import { createEditor, editorToPlainText, textToEditorHtml } from '../../editor/setup.js';
-  import { getActiveDoc } from '../../state/documents.svelte.js';
   import { presenceState } from '../../state/presence.svelte.js';
   import { syncState } from '../../state/sync.svelte.js';
   import { editorSessionState, updateEditorText, reloadActiveSession } from '../../session/editor-session.svelte.js';
-  import { versionState, leaveHistoryReview, showSavePrompt } from '../../state/versions.svelte.js';
+  import { versionState } from '../../state/versions.svelte.js';
+  import { showSavePrompt, versionReviewState } from '../../state/version-review.svelte.js';
   import { computeBlockDiff } from '../../utils/diff.js';
-  import { getWorkspaceRoute, isHistoryRoute } from '../../navigation/workspace-router.svelte.js';
+  import { getSelectedDoc, getWorkspaceRoute, isHistoryRoute, navigateBackToLive } from '../../navigation/workspace-router.svelte.js';
   import TimelineScrubber from './TimelineScrubber.svelte';
   import SaveVersionBar from './SaveVersionBar.svelte';
   import ChangeMinibar from './ChangeMinibar.svelte';
@@ -18,7 +18,7 @@
   let editor = $state<Editor | null>(null);
   let applyingRemoteText = false;
 
-  const activeDoc = $derived(getActiveDoc());
+  const activeDoc = $derived(getSelectedDoc());
   const isHistoryReview = $derived.by(() => isHistoryRoute(getWorkspaceRoute()));
   const peersInDoc = $derived(
     activeDoc
@@ -39,9 +39,9 @@
   // Use untrack on editorSessionState.text to avoid reactive feedback loops —
   // the user can't type during history review, so the text is static.
   const diffBlocks = $derived.by(() => {
-    if (isHistoryReview && versionState.previewText != null) {
+    if (isHistoryReview && versionReviewState.previewText != null) {
       const currentText = untrack(() => editorSessionState.text);
-      return computeBlockDiff(versionState.previewText, currentText);
+      return computeBlockDiff(versionReviewState.previewText, currentText);
     }
     return [];
   });
@@ -104,11 +104,11 @@
 
   // When version preview text loads, show it in the editor
   $effect(() => {
-    if (isHistoryReview && versionState.previewText != null) {
+    if (isHistoryReview && versionReviewState.previewText != null) {
       const ed = untrack(() => editor);
       if (!ed) return;
       applyingRemoteText = true;
-      ed.commands.setContent(textToEditorHtml(versionState.previewText), { emitUpdate: false });
+      ed.commands.setContent(textToEditorHtml(versionReviewState.previewText), { emitUpdate: false });
       applyingRemoteText = false;
     }
   });
@@ -119,7 +119,7 @@
     const docId = editorSessionState.docId;
     if (prevDocId !== null && docId !== prevDocId) {
       if (untrack(() => isHistoryReview)) {
-        leaveHistoryReview();
+        navigateBackToLive();
       }
     }
     prevDocId = docId;
@@ -129,7 +129,7 @@
   function handleGlobalKeydown(e: KeyboardEvent) {
     if (e.key === 'Escape' && isHistoryReview) {
       e.preventDefault();
-      leaveHistoryReview();
+      navigateBackToLive();
       return;
     }
     if ((e.metaKey || e.ctrlKey) && e.key === 's') {
@@ -148,7 +148,7 @@
 
 <svelte:window onkeydown={handleGlobalKeydown} />
 
-<div class="editor-pane">
+<div class="editor-pane" data-testid="editor-pane">
   <div class="editor-drag" data-tauri-drag-region>
     <div class="drag-spacer" data-tauri-drag-region></div>
     <div class="drag-right" style="-webkit-app-region: no-drag">
@@ -189,7 +189,7 @@
             </div>
           </div>
         </div>
-      {:else if isHistoryReview && !versionState.previewLoading && !versionState.previewError && versionState.previewText != null}
+      {:else if isHistoryReview && !versionReviewState.previewLoading && !versionReviewState.previewError && versionReviewState.previewText != null}
         <div class="diff-overlay">
           <div class="editor-content-wrap">
             <h1 class="doc-title">{activeDoc.title}</h1>
@@ -198,29 +198,29 @@
             </div>
           </div>
         </div>
-      {:else if isHistoryReview && versionState.previewLoading}
+      {:else if isHistoryReview && versionReviewState.previewLoading}
         <div class="diff-overlay">
           <div class="editor-content-wrap">
             <h1 class="doc-title">{activeDoc.title}</h1>
             <p class="history-loading">loading version...</p>
           </div>
         </div>
-      {:else if isHistoryReview && versionState.previewError}
+      {:else if isHistoryReview && versionReviewState.previewError}
         <div class="diff-overlay">
           <div class="editor-content-wrap">
             <h1 class="doc-title">{activeDoc.title}</h1>
-            <p class="editor-error">{versionState.previewError}</p>
+            <p class="editor-error">{versionReviewState.previewError}</p>
           </div>
         </div>
       {/if}
 
       <!-- Editor (always mounted, never moves) -->
       <div class="editor-content-wrap" class:editor-hidden={isHistoryReview}>
-        <h1 class="doc-title">{activeDoc.title}</h1>
+        <h1 class="doc-title" data-testid="editor-doc-title">{activeDoc.title}</h1>
         {#if editorSessionState.lastError && !isHistoryReview}
           <p class="editor-error">{editorSessionState.lastError}</p>
         {/if}
-        <div class="editor-mount" bind:this={editorElement}></div>
+        <div class="editor-mount" data-testid="editor-mount" bind:this={editorElement}></div>
       </div>
     </div>
 
@@ -230,10 +230,10 @@
       {:else}
         <span class="md-hints">**bold  _italic_  # heading  - list  [] task  > quote  `code`</span>
       {/if}
-      <span class="connection-status" class:connected={syncState.connection === 'connected'} class:slow={syncState.connection === 'slow'} class:offline={syncState.connection === 'offline'} class:local={syncState.connection === 'local'}>{connectionLabel}</span>
+      <span class="connection-status" data-testid="connection-status" data-state={syncState.connection} class:connected={syncState.connection === 'connected'} class:slow={syncState.connection === 'slow'} class:offline={syncState.connection === 'offline'} class:local={syncState.connection === 'local'}>{connectionLabel}</span>
     </div>
   {:else}
-    <div class="empty-state">
+    <div class="empty-state" data-testid="editor-empty-state">
       <p class="empty-title">no document selected</p>
       <p class="empty-hint">pick a note from the sidebar, or create a new one</p>
     </div>

@@ -163,7 +163,7 @@
   }
 
   function goBack() {
-    navigateBackFromSettings();
+    void navigateBackFromSettings();
   }
 </script>
 
@@ -173,12 +173,27 @@
   </div>
 
   {#if settingsState.loading}
-    <div class="settings-loading">loading settings...</div>
+    <div class="settings-scroll">
+      <div class="settings-content">
+        <div class="settings-header">
+          <h1 class="settings-title">settings</h1>
+          <button class="settings-close" type="button" onclick={goBack} aria-label="close settings">
+            <X size={14} strokeWidth={1.8} />
+          </button>
+        </div>
+        <div class="settings-loading">loading settings...</div>
+      </div>
+    </div>
   {:else if settingsState.settings}
     {@const s = settingsState.settings}
     <div class="settings-scroll">
       <div class="settings-content">
-        <h1 class="settings-title">settings</h1>
+        <div class="settings-header">
+          <h1 class="settings-title">settings</h1>
+          <button class="settings-close" type="button" onclick={goBack} aria-label="close settings">
+            <X size={14} strokeWidth={1.8} />
+          </button>
+        </div>
 
         {#if settingsState.error}
           <div class="settings-error" role="status">{settingsState.error}</div>
@@ -429,7 +444,17 @@
       </div>
     </div>
   {:else if settingsState.error}
-    <div class="settings-loading">{settingsState.error}</div>
+    <div class="settings-scroll">
+      <div class="settings-content">
+        <div class="settings-header">
+          <h1 class="settings-title">settings</h1>
+          <button class="settings-close" type="button" onclick={goBack} aria-label="close settings">
+            <X size={14} strokeWidth={1.8} />
+          </button>
+        </div>
+        <div class="settings-loading">{settingsState.error}</div>
+      </div>
+    </div>
   {/if}
 </div>
 
@@ -474,14 +499,42 @@
     margin: 0 auto;
   }
 
+  .settings-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 40px;
+  }
+
   .settings-title {
     font-family: var(--font-body);
     font-size: 34px;
     font-weight: 700;
     letter-spacing: -0.02em;
     color: var(--text-primary);
-    margin-bottom: 40px;
+    margin-bottom: 0;
     line-height: 1.15;
+  }
+
+  .settings-close {
+    width: 32px;
+    height: 32px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 999px;
+    color: var(--text-tertiary);
+    background: var(--surface);
+    border: 1px solid var(--border-subtle);
+    transition: color var(--transition-fast), background var(--transition-fast), border-color var(--transition-fast);
+    flex-shrink: 0;
+  }
+
+  .settings-close:hover {
+    color: var(--text-primary);
+    background: var(--surface-hover);
+    border-color: var(--border-default);
   }
 
   .settings-error {

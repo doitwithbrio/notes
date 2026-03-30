@@ -92,6 +92,8 @@ export const tauriApi = {
     guardedInvoke<void>('mark_doc_seen', { project, docId }),
   getSettings: () => guardedInvoke<AppSettings>('get_settings'),
   updateSettings: (settings: AppSettings) => guardedInvoke<void>('update_settings', { settings }),
+  e2eIsEnabled: () => guardedInvoke<boolean>('e2e_is_enabled'),
+  e2eSetNetworkBlocked: (blocked: boolean) => guardedInvoke<void>('e2e_set_network_blocked', { blocked }),
   onRemoteChange: (handler: (payload: BackendRemoteChangeEvent) => void): Promise<UnlistenFn> =>
     guardedListen<BackendRemoteChangeEvent>('p2p:remote-change', handler),
   onSyncStatus: (handler: (payload: BackendSyncStatusEvent) => void): Promise<UnlistenFn> =>
