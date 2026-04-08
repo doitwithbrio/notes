@@ -1,6 +1,6 @@
 [package]
 name = "notes"
-version = "0.1.6"
+version = "0.2.0"
 description = "A local-first, peer-to-peer, end-to-end encrypted markdown notes app"
 authors = ["you"]
 license = "MIT"
@@ -36,6 +36,7 @@ chrono = "0.4"
 hkdf = "0.12"
 sha2 = "0.10"
 zeroize = "1.8"
+iroh-gossip = "0.97"
 
 [dev-dependencies]
 tempfile = "3"

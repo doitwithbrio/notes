@@ -29,25 +29,19 @@ impl SyncStateStore {
     }
 
     /// Load a persisted sync state, or return a fresh one.
-    pub async fn load_or_create(
-        &self,
-        peer_id: &EndpointId,
-        doc_id: &Uuid,
-    ) -> SyncState {
+    pub async fn load_or_create(&self, peer_id: &EndpointId, doc_id: &Uuid) -> SyncState {
         let path = self.state_path(peer_id, doc_id);
         match tokio::fs::read(&path).await {
-            Ok(data) => {
-                match SyncState::decode(&data) {
-                    Ok(state) => {
-                        log::debug!("Loaded sync state for peer {peer_id} doc {doc_id}");
-                        state
-                    }
-                    Err(e) => {
-                        log::warn!("Corrupt sync state for {peer_id}/{doc_id}: {e}");
-                        SyncState::new()
-                    }
+            Ok(data) => match SyncState::decode(&data) {
+                Ok(state) => {
+                    log::debug!("Loaded sync state for peer {peer_id} doc {doc_id}");
+                    state
                 }
-            }
+                Err(e) => {
+                    log::warn!("Corrupt sync state for {peer_id}/{doc_id}: {e}");
+                    SyncState::new()
+                }
+            },
             Err(_) => SyncState::new(),
         }
     }
@@ -70,11 +64,7 @@ impl SyncStateStore {
     }
 
     /// Delete a sync state (e.g., after compaction invalidates it).
-    pub async fn delete(
-        &self,
-        peer_id: &EndpointId,
-        doc_id: &Uuid,
-    ) -> Result<(), std::io::Error> {
+    pub async fn delete(&self, peer_id: &EndpointId, doc_id: &Uuid) -> Result<(), std::io::Error> {
         let path = self.state_path(peer_id, doc_id);
         match tokio::fs::remove_file(&path).await {
             Ok(()) => Ok(()),
@@ -84,14 +74,30 @@ impl SyncStateStore {
     }
 
     /// Delete all sync states for a document (e.g., after compaction).
-    pub async fn delete_all_for_doc(&self, doc_id: &Uuid) {
+    pub async fn delete_all_for_doc(&self, doc_id: &Uuid) -> Result<(), std::io::Error> {
         let dir = self.base_dir.join("sync_states");
-        if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
-            while let Ok(Some(peer_dir)) = entries.next_entry().await {
-                let state_file = peer_dir.path().join(format!("{}.syncstate", doc_id));
-                let _ = tokio::fs::remove_file(&state_file).await;
+        let mut entries = match tokio::fs::read_dir(&dir).await {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        while let Some(peer_dir) = entries.next_entry().await? {
+            let state_file = peer_dir.path().join(format!("{}.syncstate", doc_id));
+            match tokio::fs::remove_file(&state_file).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
             }
         }
+        Ok(())
+    }
+
+    /// Delete all sync states for multiple documents.
+    pub async fn delete_all_for_docs(&self, doc_ids: &[Uuid]) -> Result<(), std::io::Error> {
+        for doc_id in doc_ids {
+            self.delete_all_for_doc(doc_id).await?;
+        }
+        Ok(())
     }
 }
 

@@ -3,8 +3,10 @@
 //! Tracks which peers belong to which project, maintains iroh connections,
 //! and provides methods for syncing docs with peers.
 
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -13,10 +15,18 @@ use iroh::EndpointId;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::blobs::BlobStore;
 use crate::events::{PeerConnectionState, PeerStatusEvent};
 use crate::sync_engine::{SyncEngine, NOTES_SYNC_ALPN};
 
 /// Manages peer connections and live sync for all projects.
+pub trait ProjectSyncResolver: Send + Sync {
+    fn manifest_doc_for_project<'a>(
+        &'a self,
+        project: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Option<Uuid>> + Send + 'a>>;
+}
+
 pub struct PeerManager {
     endpoint: Endpoint,
     sync_engine: Arc<SyncEngine>,
@@ -35,6 +45,8 @@ pub struct PeerManager {
 
     /// Test-only network gate used by E2E to simulate offline peers.
     network_blocked: AtomicBool,
+
+    project_sync_resolver: Option<Arc<dyn ProjectSyncResolver>>,
 }
 
 impl PeerManager {
@@ -48,7 +60,12 @@ impl PeerManager {
             cancel: CancellationToken::new(),
             status_tx,
             network_blocked: AtomicBool::new(false),
+            project_sync_resolver: None,
         }
+    }
+
+    pub fn set_project_sync_resolver(&mut self, resolver: Arc<dyn ProjectSyncResolver>) {
+        self.project_sync_resolver = Some(resolver);
     }
 
     /// Subscribe to peer status change events (connect/disconnect).
@@ -58,10 +75,7 @@ impl PeerManager {
 
     /// Register a peer for a project.
     pub fn add_peer_to_project(&self, project: &str, peer_id: EndpointId) {
-        let mut peers = self
-            .project_peers
-            .entry(project.to_string())
-            .or_default();
+        let mut peers = self.project_peers.entry(project.to_string()).or_default();
         if !peers.contains(&peer_id) {
             peers.push(peer_id);
             log::info!("Added peer {peer_id} to project {project}");
@@ -86,10 +100,7 @@ impl PeerManager {
     }
 
     /// Get or establish a connection to a peer.
-    pub async fn get_or_connect(
-        &self,
-        peer_id: EndpointId,
-    ) -> Result<Connection, PeerError> {
+    pub async fn get_or_connect(&self, peer_id: EndpointId) -> Result<Connection, PeerError> {
         if self.network_blocked.load(Ordering::Relaxed) {
             return Err(PeerError::NetworkBlocked);
         }
@@ -137,6 +148,21 @@ impl PeerManager {
         for peer_id in peer_ids {
             let result = async {
                 let connection = self.get_or_connect(peer_id).await?;
+                if let Some(resolver) = &self.project_sync_resolver {
+                    if let Some(manifest_doc_id) = resolver.manifest_doc_for_project(project).await
+                    {
+                        if manifest_doc_id != doc_id {
+                            tokio::time::timeout(
+                                Duration::from_secs(60),
+                                self.sync_engine
+                                    .sync_doc_with_peer(&connection, manifest_doc_id),
+                            )
+                            .await
+                            .map_err(|_| PeerError::SyncTimeout)?
+                            .map_err(|e| PeerError::Sync(e.to_string()))?;
+                        }
+                    }
+                }
                 tokio::time::timeout(
                     Duration::from_secs(60),
                     self.sync_engine.sync_doc_with_peer(&connection, doc_id),
@@ -155,6 +181,85 @@ impl PeerManager {
         }
 
         results
+    }
+
+    pub async fn fetch_doc_snapshot_from_project_peers(
+        &self,
+        project: &str,
+        doc_id: Uuid,
+    ) -> Vec<(EndpointId, Result<Vec<u8>, PeerError>)> {
+        let peer_ids: Vec<EndpointId> = self
+            .project_peers
+            .get(project)
+            .map(|entry| entry.value().clone())
+            .unwrap_or_default();
+
+        let mut results = Vec::new();
+
+        for peer_id in peer_ids {
+            let result = async {
+                let connection = self.get_or_connect(peer_id).await?;
+                tokio::time::timeout(
+                    Duration::from_secs(60),
+                    self.sync_engine
+                        .fetch_doc_snapshot_from_peer(&connection, doc_id),
+                )
+                .await
+                .map_err(|_| PeerError::SyncTimeout)?
+                .map_err(|e| PeerError::Sync(e.to_string()))
+            }
+            .await;
+
+            if let Err(ref e) = result {
+                log::warn!("Snapshot fetch from peer {peer_id} failed: {e}");
+            }
+            results.push((peer_id, result));
+        }
+
+        results
+    }
+
+    pub async fn fetch_blob_from_project_peers(
+        &self,
+        project: &str,
+        blob_store: &BlobStore,
+        hash: &str,
+    ) -> Option<EndpointId> {
+        let peer_ids: Vec<EndpointId> = self
+            .project_peers
+            .get(project)
+            .map(|entry| entry.value().clone())
+            .unwrap_or_default();
+
+        for peer_id in peer_ids {
+            let result = async {
+                let connection = tokio::time::timeout(
+                    Duration::from_secs(15),
+                    self.endpoint.connect(peer_id, crate::blobs::blob_alpn()),
+                )
+                .await
+                .map_err(|_| PeerError::ConnectionTimeout)?
+                .map_err(|e| PeerError::Connection(e.to_string()))?;
+
+                tokio::time::timeout(
+                    Duration::from_secs(60),
+                    blob_store.fetch_from_connection(connection, hash),
+                )
+                .await
+                .map_err(|_| PeerError::SyncTimeout)?
+                .map_err(|e| PeerError::Sync(e.to_string()))
+            }
+            .await;
+
+            match result {
+                Ok(()) => return Some(peer_id),
+                Err(error) => {
+                    log::warn!("Blob fetch from peer {peer_id} failed: {error}");
+                }
+            }
+        }
+
+        None
     }
 
     /// Get list of peers for a project.
@@ -257,11 +362,7 @@ impl PeerManager {
     pub async fn shutdown(&self) {
         self.cancel.cancel();
 
-        let keys: Vec<EndpointId> = self
-            .connections
-            .iter()
-            .map(|entry| *entry.key())
-            .collect();
+        let keys: Vec<EndpointId> = self.connections.iter().map(|entry| *entry.key()).collect();
 
         for peer_id in &keys {
             if let Some((_, conn)) = self.connections.remove(peer_id) {
@@ -281,11 +382,7 @@ impl PeerManager {
             return;
         }
 
-        let keys: Vec<EndpointId> = self
-            .connections
-            .iter()
-            .map(|entry| *entry.key())
-            .collect();
+        let keys: Vec<EndpointId> = self.connections.iter().map(|entry| *entry.key()).collect();
 
         for peer_id in keys {
             if let Some((_, conn)) = self.connections.remove(&peer_id) {

@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 /// Event names (Tauri event channel names).
 pub mod event_names {
-    /// A remote peer changed a document. Frontend should reload from backend.
+    /// A remote peer changed a document. Frontend should fetch the appropriate update path.
     pub const REMOTE_CHANGE: &str = "p2p:remote-change";
     /// Sync status changed for a document.
     pub const SYNC_STATUS: &str = "p2p:sync-status";
@@ -18,6 +18,8 @@ pub mod event_names {
     pub const PEER_STATUS: &str = "p2p:peer-status";
     /// Invite accept / resume lifecycle updates.
     pub const INVITE_ACCEPT_STATUS: &str = "p2p:invite-accept";
+    /// A project was evicted locally (e.g. revocation purge).
+    pub const PROJECT_EVICTED: &str = "p2p:project-evicted";
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,14 +54,26 @@ pub struct InviteAcceptEvent {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RemoteChangeMode {
+    IncrementalAvailable,
+    ViewerSnapshotAvailable,
+    MetadataOnly,
+}
+
 /// Emitted when a remote peer changes a document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteChangeEvent {
+    /// Project containing the changed document.
+    pub project_id: String,
     /// The document that was changed.
     pub doc_id: Uuid,
     /// The peer that made the change (if known).
     pub peer_id: Option<String>,
+    /// How the frontend should refresh this change.
+    pub mode: RemoteChangeMode,
 }
 
 /// Sync status for a document.
@@ -90,7 +104,11 @@ pub struct SyncStatusEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PresenceEvent {
+    pub project_id: String,
     pub peer_id: String,
+    pub session_id: String,
+    pub session_started_at: u64,
+    pub seq: u64,
     pub alias: String,
     /// Document the peer is viewing.
     pub active_doc: Option<Uuid>,
@@ -115,4 +133,12 @@ pub struct PeerStatusEvent {
     pub peer_id: String,
     pub state: PeerConnectionState,
     pub alias: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectEvictedEvent {
+    pub project_id: String,
+    pub project_name: String,
+    pub reason: String,
 }
