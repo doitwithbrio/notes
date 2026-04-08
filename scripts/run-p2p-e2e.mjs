@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 
@@ -21,6 +21,32 @@ function resolveTauriAppPath() {
   return candidates.find((candidate) => existsSync(candidate)) ?? null;
 }
 
+function ensureTauriServiceCompatibilityPath(appPath) {
+  const cwd = process.cwd();
+  const binaryName = process.platform === 'win32' ? 'notes.exe' : 'notes';
+  const compatibilityDir = path.join(cwd, 'src-tauri', 'target', 'release');
+  const compatibilityPath = path.join(compatibilityDir, binaryName);
+
+  mkdirSync(compatibilityDir, { recursive: true });
+
+  try {
+    if (existsSync(compatibilityPath)) {
+      rmSync(compatibilityPath, { force: true });
+    }
+  } catch {
+    // Best-effort cleanup before recreating the compatibility path.
+  }
+
+  if (process.platform === 'win32') {
+    copyFileSync(appPath, compatibilityPath);
+  } else {
+    symlinkSync(appPath, compatibilityPath);
+    chmodSync(appPath, 0o755);
+  }
+
+  return compatibilityPath;
+}
+
 if (process.platform === 'darwin') {
   console.error('P2P desktop E2E currently targets Linux/Windows CI. macOS WebDriver support for Tauri is not available.');
   process.exit(1);
@@ -31,6 +57,8 @@ if (!appPath) {
   console.error('No Tauri binary found. Build one first or set TAURI_APP_PATH.');
   process.exit(1);
 }
+
+ensureTauriServiceCompatibilityPath(appPath);
 
 const child = spawn(
   process.platform === 'win32' ? 'bunx.cmd' : 'bunx',

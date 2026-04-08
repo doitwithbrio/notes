@@ -2,6 +2,7 @@ import { bundleFailureArtifacts } from './tests/e2e/p2p/helpers/diagnostics.js';
 import { isSupportedDesktopE2EPlatform, resolveTauriAppPath } from './tests/e2e/p2p/helpers/runtime.js';
 
 const appPath = resolveTauriAppPath();
+const serviceAppPath = process.cwd();
 
 function tauriCapability() {
   return {
@@ -20,8 +21,16 @@ function tauriCapability() {
 }
 
 function tauriMultiremoteCapability() {
+  const capability = tauriCapability();
   return {
-    capabilities: tauriCapability(),
+    ...capability,
+    capabilities: {
+      ...capability,
+      'tauri:options': {
+        application: serviceAppPath,
+        args: [],
+      },
+    },
   };
 }
 
