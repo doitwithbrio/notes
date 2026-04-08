@@ -6,7 +6,11 @@ on:
       - 'v*'
 
 jobs:
+  ci-gate:
+    uses: ./.github/workflows/ci.yml
+
   verify-version:
+    needs: ci-gate
     runs-on: ubuntu-latest
     permissions:
       contents: write

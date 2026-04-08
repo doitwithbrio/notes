@@ -35,7 +35,7 @@ The suite should not primarily assert internal function calls unless the UI cann
 
 ### Main runner
 
-- Playwright drives real Tauri app windows
+- WebdriverIO drives real Tauri app windows
 - Each test launches 2 or 3 app processes
 - Each app process gets:
   - its own temp notes directory
