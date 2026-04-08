@@ -19,6 +19,12 @@ function tauriCapability() {
   };
 }
 
+function tauriMultiremoteCapability() {
+  return {
+    capabilities: tauriCapability(),
+  };
+}
+
 export const config = {
   runner: 'local',
   specs: ['./tests/e2e/p2p/**/*.spec.ts'],
@@ -39,9 +45,9 @@ export const config = {
     },
   ]],
   capabilities: {
-    owner: tauriCapability(),
-    editor: tauriCapability(),
-    viewer: tauriCapability(),
+    owner: tauriMultiremoteCapability(),
+    editor: tauriMultiremoteCapability(),
+    viewer: tauriMultiremoteCapability(),
   },
   before() {
     if (!isSupportedDesktopE2EPlatform()) {
