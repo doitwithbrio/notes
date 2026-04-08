@@ -47,7 +47,6 @@ impl ProjectSeenState {
     }
 
     pub fn mark_seen_heads(&mut self, doc_id: &DocId, heads: Vec<String>) {
-        
         self.docs.insert(
             doc_id.to_string(),
             DocSeenState {
@@ -65,7 +64,6 @@ impl ProjectSeenState {
     }
 
     pub fn has_unseen_changes_from_heads(&self, doc_id: &DocId, current_heads: &[String]) -> bool {
-
         match self.docs.get(&doc_id.to_string()) {
             Some(seen) => {
                 // Compare head sets (order-independent)
@@ -84,9 +82,7 @@ impl ProjectSeenState {
 
     /// Get the last-seen timestamp for a document.
     pub fn last_seen_at(&self, doc_id: &DocId) -> Option<DateTime<Utc>> {
-        self.docs
-            .get(&doc_id.to_string())
-            .map(|s| s.last_seen_at)
+        self.docs.get(&doc_id.to_string()).map(|s| s.last_seen_at)
     }
 
     /// Remove tracking for a document (e.g., when deleted).
@@ -105,18 +101,13 @@ impl SeenStateManager {
         match tokio::fs::read_to_string(&path).await {
             Ok(json) => serde_json::from_str(&json)
                 .map_err(|e| CoreError::InvalidData(format!("bad seen_state.json: {e}"))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Ok(ProjectSeenState::default())
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ProjectSeenState::default()),
             Err(e) => Err(CoreError::Io(e)),
         }
     }
 
     /// Save seen state to disk.
-    pub async fn save(
-        project_dir: &Path,
-        state: &ProjectSeenState,
-    ) -> Result<(), CoreError> {
+    pub async fn save(project_dir: &Path, state: &ProjectSeenState) -> Result<(), CoreError> {
         let path = project_dir.join(".p2p").join("seen_state.json");
         let json = serde_json::to_string_pretty(state)?;
         tokio::fs::create_dir_all(path.parent().unwrap()).await?;
@@ -182,12 +173,9 @@ mod tests {
         assert!(!state.has_unseen_changes(&id, &mut doc));
 
         // Simulate a remote change
-        let text_id = doc
-            .get(automerge::ROOT, "text")
-            .unwrap()
-            .unwrap()
-            .1;
-        doc.splice_text(&text_id, 0, 0, "new text from remote").unwrap();
+        let text_id = doc.get(automerge::ROOT, "text").unwrap().unwrap().1;
+        doc.splice_text(&text_id, 0, 0, "new text from remote")
+            .unwrap();
 
         // Now should have unseen changes
         assert!(state.has_unseen_changes(&id, &mut doc));

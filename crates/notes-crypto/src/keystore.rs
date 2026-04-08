@@ -5,9 +5,210 @@
 //!
 //! All key material is zeroized on drop.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 use crate::error::CryptoError;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretReadPhase {
+    Startup,
+    Runtime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretReadClass {
+    Unknown,
+    PeerIdentity,
+    ProjectEpochKeys,
+    ProjectX25519Identity,
+    OwnerInvitePassphrase,
+    JoinSessionSecret,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretReadBackend {
+    Keychain,
+    File,
+    LegacyKeychain,
+    LegacyFile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretReadOutcome {
+    Hit,
+    Miss,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SecretReadEvent {
+    pub phase: SecretReadPhase,
+    pub class: SecretReadClass,
+    pub backend: SecretReadBackend,
+    pub outcome: SecretReadOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretReadStats {
+    pub enabled: bool,
+    pub phase: SecretReadPhase,
+    pub startup_reads: usize,
+    pub runtime_reads: usize,
+    pub cache_hits: usize,
+    pub cache_misses: usize,
+    pub events: Vec<SecretReadEvent>,
+}
+
+impl Default for SecretReadStats {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            phase: SecretReadPhase::Startup,
+            startup_reads: 0,
+            runtime_reads: 0,
+            cache_hits: 0,
+            cache_misses: 0,
+            events: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SecretReadTracker {
+    enabled: bool,
+    phase: SecretReadPhase,
+    startup_reads: usize,
+    runtime_reads: usize,
+    cache_hits: usize,
+    cache_misses: usize,
+    events: VecDeque<SecretReadEvent>,
+}
+
+impl Default for SecretReadTracker {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            phase: SecretReadPhase::Startup,
+            startup_reads: 0,
+            runtime_reads: 0,
+            cache_hits: 0,
+            cache_misses: 0,
+            events: VecDeque::with_capacity(128),
+        }
+    }
+}
+
+static SECRET_READ_TRACKER: OnceLock<Mutex<SecretReadTracker>> = OnceLock::new();
+
+fn secret_read_tracker() -> &'static Mutex<SecretReadTracker> {
+    SECRET_READ_TRACKER.get_or_init(|| Mutex::new(SecretReadTracker::default()))
+}
+
+fn classify_secret(name: &str) -> SecretReadClass {
+    if name == "peer-identity" {
+        SecretReadClass::PeerIdentity
+    } else if name.starts_with("epoch-keys-") {
+        SecretReadClass::ProjectEpochKeys
+    } else if name.starts_with("x25519-identity-") {
+        SecretReadClass::ProjectX25519Identity
+    } else if name.starts_with("invite-passphrase-") {
+        SecretReadClass::OwnerInvitePassphrase
+    } else if name == "join-session-secret" {
+        SecretReadClass::JoinSessionSecret
+    } else {
+        SecretReadClass::Unknown
+    }
+}
+
+fn record_secret_read(name: &str, backend: SecretReadBackend, outcome: SecretReadOutcome) {
+    let tracker = secret_read_tracker();
+    let Ok(mut tracker) = tracker.lock() else {
+        return;
+    };
+    if !tracker.enabled {
+        return;
+    }
+    match tracker.phase {
+        SecretReadPhase::Startup => tracker.startup_reads += 1,
+        SecretReadPhase::Runtime => tracker.runtime_reads += 1,
+    }
+    let phase = tracker.phase;
+    if tracker.events.len() == 128 {
+        tracker.events.pop_front();
+    }
+    tracker.events.push_back(SecretReadEvent {
+        phase,
+        class: classify_secret(name),
+        backend,
+        outcome,
+    });
+}
+
+pub fn debug_record_secret_read(
+    name: &str,
+    backend: SecretReadBackend,
+    outcome: SecretReadOutcome,
+) {
+    record_secret_read(name, backend, outcome);
+}
+
+pub fn debug_enable_secret_read_tracking(enabled: bool) {
+    let tracker = secret_read_tracker();
+    if let Ok(mut tracker) = tracker.lock() {
+        tracker.enabled = enabled;
+    }
+}
+
+pub fn debug_reset_secret_read_tracking() {
+    let tracker = secret_read_tracker();
+    if let Ok(mut tracker) = tracker.lock() {
+        *tracker = SecretReadTracker::default();
+    }
+}
+
+pub fn debug_set_secret_read_phase(phase: SecretReadPhase) {
+    let tracker = secret_read_tracker();
+    if let Ok(mut tracker) = tracker.lock() {
+        tracker.phase = phase;
+    }
+}
+
+pub fn debug_note_secret_cache_hit() {
+    let tracker = secret_read_tracker();
+    if let Ok(mut tracker) = tracker.lock() {
+        if tracker.enabled {
+            tracker.cache_hits += 1;
+        }
+    }
+}
+
+pub fn debug_note_secret_cache_miss() {
+    let tracker = secret_read_tracker();
+    if let Ok(mut tracker) = tracker.lock() {
+        if tracker.enabled {
+            tracker.cache_misses += 1;
+        }
+    }
+}
+
+pub fn debug_get_secret_read_stats() -> SecretReadStats {
+    let tracker = secret_read_tracker();
+    if let Ok(tracker) = tracker.lock() {
+        SecretReadStats {
+            enabled: tracker.enabled,
+            phase: tracker.phase,
+            startup_reads: tracker.startup_reads,
+            runtime_reads: tracker.runtime_reads,
+            cache_hits: tracker.cache_hits,
+            cache_misses: tracker.cache_misses,
+            events: tracker.events.iter().copied().collect(),
+        }
+    } else {
+        SecretReadStats::default()
+    }
+}
 
 /// Service name for keychain entries.
 const KEYCHAIN_SERVICE: &str = "com.doitwithbrio.notes";
@@ -33,16 +234,16 @@ impl KeyStore {
 
     /// Whether to use the OS keychain.
     ///
-    /// macOS is the canonical backend for both debug and release so the same
-    /// machine keeps a single peer identity across builds. For local testing,
-    /// `NOTES_KEYSTORE_MODE=file-only` can force file-backed storage.
+    /// macOS defaults to the OS keychain. `NOTES_KEYSTORE_MODE=file-only`
+    /// can be used to opt into file-backed storage for local debugging.
     fn use_keychain() -> bool {
         #[cfg(target_os = "macos")]
         {
             #[cfg(test)]
             {
-                return false;
+                false
             }
+            #[cfg(not(test))]
             match std::env::var("NOTES_KEYSTORE_MODE") {
                 Ok(mode)
                     if mode.eq_ignore_ascii_case("file")
@@ -66,9 +267,9 @@ impl KeyStore {
         }
     }
 
-    /// Store a key. Attempts OS keychain first (release only), falls back to file.
+    /// Store a key. Attempts OS keychain first when enabled, falls back to file.
     pub fn store_key(&self, name: &str, key: &[u8]) -> Result<(), CryptoError> {
-        // Try OS keychain first (release builds only)
+        // Try OS keychain first when enabled.
         #[cfg(target_os = "macos")]
         if Self::use_keychain() {
             if let Ok(()) = store_keychain_macos(name, key) {
@@ -82,19 +283,27 @@ impl KeyStore {
         self.store_key_file(name, key)
     }
 
-    /// Retrieve a key. Tries OS keychain first (release only), falls back to file.
+    /// Retrieve a key. Tries OS keychain first when enabled, falls back to file.
     pub fn load_key(&self, name: &str) -> Result<Vec<u8>, CryptoError> {
         self.load_key_impl(name, Self::use_keychain())
     }
 
     fn load_key_impl(&self, name: &str, use_keychain: bool) -> Result<Vec<u8>, CryptoError> {
-        // Try OS keychain first (release builds only)
+        // Try OS keychain first when enabled.
         #[cfg(target_os = "macos")]
         if use_keychain {
             match load_keychain_with_legacy_migration(name) {
-                KeychainLookup::Found(key) => return Ok(key),
-                KeychainLookup::NotFound => {}
-                KeychainLookup::Error(err) => return Err(err),
+                KeychainLookup::Found(key) => {
+                    record_secret_read(name, SecretReadBackend::Keychain, SecretReadOutcome::Hit);
+                    return Ok(key);
+                }
+                KeychainLookup::NotFound => {
+                    record_secret_read(name, SecretReadBackend::Keychain, SecretReadOutcome::Miss);
+                }
+                KeychainLookup::Error(err) => {
+                    record_secret_read(name, SecretReadBackend::Keychain, SecretReadOutcome::Error);
+                    return Err(err);
+                }
             }
         }
 
@@ -233,13 +442,21 @@ impl KeyStore {
 
     fn load_key_file(&self, name: &str) -> Result<Vec<u8>, CryptoError> {
         let path = self.key_file_path(name);
-        std::fs::read(&path).map_err(|e| {
+        let result = std::fs::read(&path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 CryptoError::KeyNotFound(name.to_string())
             } else {
                 CryptoError::Io(e)
             }
-        })
+        });
+        match &result {
+            Ok(_) => record_secret_read(name, SecretReadBackend::File, SecretReadOutcome::Hit),
+            Err(CryptoError::KeyNotFound(_)) => {
+                record_secret_read(name, SecretReadBackend::File, SecretReadOutcome::Miss)
+            }
+            Err(_) => record_secret_read(name, SecretReadBackend::File, SecretReadOutcome::Error),
+        }
+        result
     }
 }
 
@@ -264,6 +481,11 @@ fn load_keychain_with_legacy_migration(name: &str) -> KeychainLookup {
     for legacy_service in LEGACY_KEYCHAIN_SERVICES {
         match load_keychain_lookup(legacy_service, name) {
             KeychainLookup::Found(key) => {
+                record_secret_read(
+                    name,
+                    SecretReadBackend::LegacyKeychain,
+                    SecretReadOutcome::Hit,
+                );
                 log::info!(
                     "Loaded key '{name}' from legacy macOS Keychain service '{legacy_service}', migrating"
                 );
@@ -275,7 +497,14 @@ fn load_keychain_with_legacy_migration(name: &str) -> KeychainLookup {
                 }
                 return KeychainLookup::Found(key);
             }
-            KeychainLookup::Error(err) => return KeychainLookup::Error(err),
+            KeychainLookup::Error(err) => {
+                record_secret_read(
+                    name,
+                    SecretReadBackend::LegacyKeychain,
+                    SecretReadOutcome::Error,
+                );
+                return KeychainLookup::Error(err);
+            }
             KeychainLookup::NotFound => {}
         }
     }
@@ -423,6 +652,38 @@ mod tests {
         assert_ne!(pub_a.as_bytes(), pub_b.as_bytes());
     }
 
+    #[test]
+    fn test_secret_read_tracking_records_runtime_file_reads() {
+        let previous_mode = std::env::var("NOTES_KEYSTORE_MODE").ok();
+        std::env::set_var("NOTES_KEYSTORE_MODE", "file-only");
+        debug_reset_secret_read_tracking();
+        debug_enable_secret_read_tracking(true);
+        debug_set_secret_read_phase(SecretReadPhase::Runtime);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = KeyStore::new(dir.path().to_path_buf());
+        store.store_key("tracked", b"secret").unwrap();
+
+        let loaded = store.load_key("tracked").unwrap();
+        assert_eq!(loaded, b"secret");
+
+        let stats = debug_get_secret_read_stats();
+        assert!(stats.runtime_reads >= 1);
+        assert_eq!(stats.startup_reads, 0);
+        assert!(stats.events.iter().any(|event| {
+            event.class == SecretReadClass::Unknown
+                && event.backend == SecretReadBackend::File
+                && event.outcome == SecretReadOutcome::Hit
+        }));
+
+        debug_reset_secret_read_tracking();
+        if let Some(mode) = previous_mode {
+            std::env::set_var("NOTES_KEYSTORE_MODE", mode);
+        } else {
+            std::env::remove_var("NOTES_KEYSTORE_MODE");
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn test_load_key_migrates_from_legacy_keychain_service() {
@@ -465,8 +726,7 @@ fn store_keychain_macos_for_service(
     name: &str,
     key: &[u8],
 ) -> Result<(), CryptoError> {
-    use security_framework::passwords::{delete_generic_password, set_generic_password};
-    let _ = delete_generic_password(service, name);
+    use security_framework::passwords::set_generic_password;
     set_generic_password(service, name, key).map_err(|e| CryptoError::KeychainError(e.to_string()))
 }
 
