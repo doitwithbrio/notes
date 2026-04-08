@@ -1,4 +1,5 @@
 <script lang="ts">
+  import DsSection from '../../design-system/DsSection.svelte';
   import {
     versionState,
     getSignificantVersions,
@@ -41,14 +42,7 @@
   }
 </script>
 
-<section class="section">
-  <div class="section-header">
-    <span class="section-title">versions</span>
-    {#if versionCount > 0}
-      <span class="section-count">{versionCount}</span>
-    {/if}
-  </div>
-
+<DsSection className="section-shell" count={versionCount > 0 ? versionCount : null} title="versions">
   <div class="section-body">
     {#if activeDoc}
       {#if !versionState.supported}
@@ -64,34 +58,39 @@
       {:else}
         <div class="version-list">
           {#each grouped as [dateLabel, versions] (dateLabel)}
-            <div class="date-group">
-              <span class="date-label">{dateLabel}</span>
-              {#each versions as version (version.id)}
-                <button
-                  class="version-item"
-                  class:selected={getSelectedHistoryVersionId() === version.id}
-                  class:named={version.type === 'named'}
-                  onclick={() => handleSelectVersion(version.id)}
-                  type="button"
-                >
-                  <div class="row-1">
-                    {#if version.type === 'named'}
-                      <span class="star">★</span>
-                    {:else}
-                      <span class="dot"></span>
-                    {/if}
-                    <span class="name">{version.name}</span>
-                    {#if version.createdAt > 0}
-                      <span class="time">{formatShortTime(version.createdAt)}</span>
-                    {/if}
-                  </div>
-                  {#if version.label}
-                    <div class="row-label">"{version.label}"</div>
-                  {/if}
-                  <div class="row-2">{formatStats(version)}</div>
-                </button>
-              {/each}
-            </div>
+            <section class="date-group" aria-label={dateLabel}>
+              <h3 class="date-label">{dateLabel}</h3>
+              <ul class="version-group-list">
+                {#each versions as version (version.id)}
+                  <li class="version-list-item">
+                    <button
+                      aria-current={getSelectedHistoryVersionId() === version.id ? 'page' : undefined}
+                      class="version-item"
+                      class:selected={getSelectedHistoryVersionId() === version.id}
+                      class:named={version.type === 'named'}
+                      onclick={() => handleSelectVersion(version.id)}
+                      type="button"
+                    >
+                      <div class="row-1">
+                        {#if version.type === 'named'}
+                          <span class="star">★</span>
+                        {:else}
+                          <span class="dot"></span>
+                        {/if}
+                        <span class="name">{version.name}</span>
+                        {#if version.createdAt > 0}
+                          <span class="time">{formatShortTime(version.createdAt)}</span>
+                        {/if}
+                      </div>
+                      {#if version.label}
+                        <div class="row-label">"{version.label}"</div>
+                      {/if}
+                      <div class="row-2">{formatStats(version)}</div>
+                    </button>
+                  </li>
+                {/each}
+              </ul>
+            </section>
           {/each}
         </div>
       {/if}
@@ -99,23 +98,11 @@
       <p class="empty-text">select a document to see versions</p>
     {/if}
   </div>
-</section>
+</DsSection>
 
 <style>
-  .section {
-    display: flex;
-    flex-direction: column;
-    min-height: 0;
+  :global(.section-shell) {
     flex: 1;
-
-  }
-
-  .section-header {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 12px 16px 8px;
-    flex-shrink: 0;
   }
 
   .section-body {
@@ -123,23 +110,6 @@
     min-height: 0;
     overflow-y: auto;
     padding: 0 16px 12px;
-  }
-
-  .section-title {
-    font-size: 13px;
-    font-weight: 700;
-    letter-spacing: -0.01em;
-    color: var(--text-primary);
-  }
-
-  .section-count {
-    font-size: 10px;
-    font-weight: 600;
-    color: var(--text-primary);
-    background: var(--surface-active);
-    padding: 0 5px;
-    border-radius: 8px;
-    line-height: 16px;
   }
 
   .empty-text {
@@ -158,6 +128,17 @@
     display: flex;
     flex-direction: column;
     gap: 2px;
+  }
+
+  .version-group-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    list-style: none;
+  }
+
+  .version-list-item {
+    list-style: none;
   }
 
   .date-label {

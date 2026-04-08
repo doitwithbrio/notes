@@ -7,6 +7,10 @@
 
 import type { DiffBlock } from '../types/index.js';
 
+export function getDiffBlockTargetId(block: DiffBlock, changedIndex: number): string {
+  return `${block.type}-${block.lineStart}-${changedIndex}`;
+}
+
 /** Split text into blocks (paragraphs separated by blank lines or single newlines). */
 function splitBlocks(text: string): string[] {
   // Split on double newlines for paragraph boundaries

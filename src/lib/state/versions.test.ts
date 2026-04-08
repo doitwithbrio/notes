@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const tauriApiMock = vi.hoisted(() => ({
   getDocVersions: vi.fn(async () => []),
@@ -59,6 +59,8 @@ async function loadFreshModules() {
   review.versionReviewState.previewText = null;
   review.versionReviewState.previewLoading = false;
   review.versionReviewState.previewError = null;
+  review.versionReviewState.status = 'idle';
+  review.versionReviewState.viewMode = 'snapshot';
 
   return { versions, review };
 }
@@ -72,6 +74,10 @@ describe('version review state', () => {
     tauriApiMock.restoreToVersion.mockClear();
     tauriApiMock.getVersionText.mockImplementation(async () => 'preview');
     tauriApiMock.restoreToVersion.mockImplementation(async () => undefined);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it('selectVersion previews a version without mutating route state', async () => {
@@ -103,9 +109,22 @@ describe('version review state', () => {
   it('restoreVersionData does not exit history review', async () => {
     const { review } = await loadFreshModules();
 
-    await review.restoreVersionData('project-1', 'doc-a', 'version-2');
+    const restored = await review.restoreVersionData('project-1', 'doc-a', 'version-2');
 
+    expect(restored).toBe(true);
     expect(tauriApiMock.restoreToVersion).toHaveBeenCalledWith('project-1', 'doc-a', 'version-2');
+  });
+
+  it('restoreVersionData returns false when the Tauri runtime is unavailable', async () => {
+    const { review } = await loadFreshModules();
+    const runtime = await import('../runtime/tauri.js');
+    tauriApiMock.restoreToVersion.mockImplementationOnce(async () => {
+      throw new runtime.TauriRuntimeUnavailableError('restore');
+    });
+
+    const restored = await review.restoreVersionData('project-1', 'doc-a', 'version-2');
+
+    expect(restored).toBe(false);
   });
 
   it('getAdjacentSignificantVersionId returns older, newer, or null', async () => {
@@ -151,6 +170,74 @@ describe('version review state', () => {
 
     expect(review.versionReviewState.previewVersionId).toBe('version-1');
     expect(review.versionReviewState.previewText).toBe('new preview');
+  });
+
+  it('keeps the last resolved preview visible while a newer version loads', async () => {
+    const { review } = await loadFreshModules();
+
+    review.versionReviewState.previewText = 'current preview';
+    let resolveText!: (value: string) => void;
+    tauriApiMock.getVersionText.mockImplementationOnce(
+      () => new Promise<string>((resolve) => { resolveText = resolve; }),
+    );
+
+    const previewPromise = review.previewVersion('project-1', 'doc-a', 'version-1');
+
+    expect(review.versionReviewState.previewLoading).toBe(true);
+    expect(review.versionReviewState.previewText).toBe('current preview');
+
+    resolveText('next preview');
+    await previewPromise;
+
+    expect(review.versionReviewState.previewText).toBe('next preview');
+  });
+
+  it('times out a stalled preview instead of loading forever', async () => {
+    vi.useFakeTimers();
+    const { review } = await loadFreshModules();
+
+    tauriApiMock.getVersionText.mockImplementationOnce(
+      () => new Promise<string>(() => undefined),
+    );
+
+    void review.previewVersion('project-1', 'doc-a', 'version-2');
+    await vi.advanceTimersByTimeAsync(15_000);
+
+    expect(review.versionReviewState.previewLoading).toBe(false);
+    expect(review.versionReviewState.previewError).toMatch(/timed out|failed/i);
+    vi.useRealTimers();
+  });
+
+  it('keeps preview ready when the Tauri runtime is unavailable', async () => {
+    const { review } = await loadFreshModules();
+    const runtime = await import('../runtime/tauri.js');
+    tauriApiMock.getVersionText.mockImplementationOnce(async () => {
+      throw new runtime.TauriRuntimeUnavailableError('preview');
+    });
+
+    await review.previewVersion('project-1', 'doc-a', 'version-2');
+
+    expect(review.versionReviewState.status).toBe('ready');
+    expect(review.versionReviewState.previewText).toBe('');
+  });
+
+  it('disables version features when preview command is missing', async () => {
+    const { versions, review } = await loadFreshModules();
+    tauriApiMock.getVersionText.mockImplementationOnce(async () => {
+      throw new Error('Command get_version_text not found');
+    });
+
+    await review.previewVersion('project-1', 'doc-a', 'version-2');
+
+    expect(versions.versionState.supported).toBe(false);
+    expect(versions.versionState.error).toMatch(/desktop app restart/i);
+    expect(review.versionReviewState.status).toBe('error');
+  });
+
+  it('defaults the review presentation mode to snapshot', async () => {
+    const { review } = await loadFreshModules();
+
+    expect((review.versionReviewState as Record<string, unknown>).viewMode).toBe('snapshot');
   });
 
   it('versions store keeps only list state and device metadata', async () => {

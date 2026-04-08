@@ -1,16 +1,21 @@
 <script lang="ts">
   import { isMac } from '../utils/platform.js';
-  import { presenceState } from '../state/presence.svelte.js';
+  import { getProjectPeerById } from '../state/presence.svelte.js';
   import { syncState } from '../state/sync.svelte.js';
   import { getSelectedDoc } from '../navigation/workspace-router.svelte.js';
+  import type { Peer } from '../types/index.js';
+
+  function isOnlinePeer(peer: Peer | null): peer is Peer {
+    return Boolean(peer?.online);
+  }
 
   const activeDoc = $derived(getSelectedDoc());
 
   const peersInDoc = $derived(
     activeDoc
-      ? presenceState.peers.filter(
-          (p) => activeDoc.activePeers.includes(p.id) && p.online,
-        )
+      ? activeDoc.activePeers
+          .map((peerId) => getProjectPeerById(activeDoc.projectId, peerId))
+          .filter(isOnlinePeer)
       : [],
   );
 </script>

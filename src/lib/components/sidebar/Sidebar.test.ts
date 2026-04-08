@@ -42,6 +42,7 @@ const mockState = vi.hoisted(() => ({
   createProject: vi.fn(async () => null),
   reorderProject: vi.fn(),
   removeProject: vi.fn(),
+  evictProject: vi.fn(async () => undefined),
   openJoinDialog: vi.fn(),
   closeEditorSession: vi.fn(async () => undefined),
   beginMovedDoc: vi.fn(),
@@ -74,6 +75,9 @@ vi.mock('../../state/projects.svelte.js', () => ({
   createProject: mockState.createProject,
   reorderProject: mockState.reorderProject,
   removeProject: mockState.removeProject,
+}));
+vi.mock('../../state/project-eviction.svelte.js', () => ({
+  evictProject: mockState.evictProject,
 }));
 vi.mock('../../state/ui.svelte.js', () => ({
   openQuickOpen: vi.fn(),
@@ -118,6 +122,7 @@ describe('Sidebar doc reconciliation', () => {
     mockState.navigateToDoc.mockReset();
     mockState.loadProjectDocs.mockReset();
     mockState.consoleError.mockReset();
+    mockState.evictProject.mockReset();
     mockState.tauriApi.createNote.mockReset();
     mockState.tauriApi.getDocBinary.mockReset();
     mockState.tauriApi.openDoc.mockReset();
@@ -278,5 +283,18 @@ describe('Sidebar doc reconciliation', () => {
       });
       expect(mockState.navigateToDoc).toHaveBeenCalledWith('project-2', 'doc-new');
     });
+  });
+
+  it('does not trigger sidebar shortcuts while typing in an input', async () => {
+    render(Sidebar);
+
+    const input = document.createElement('input');
+    document.body.appendChild(input);
+    input.focus();
+
+    await fireEvent.keyDown(input, { key: 'n', ctrlKey: true });
+
+    expect(mockState.createProject).not.toHaveBeenCalled();
+    input.remove();
   });
 });

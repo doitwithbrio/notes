@@ -2,6 +2,7 @@
   import { documentState } from '../../state/documents.svelte.js';
   import { closeQuickOpen } from '../../state/ui.svelte.js';
   import { navigateToDoc } from '../../navigation/workspace-router.svelte.js';
+  import DsModal from '../../design-system/DsModal.svelte';
 
   let query = $state('');
   let inputEl = $state<HTMLInputElement | null>(null);
@@ -66,30 +67,37 @@
   });
 </script>
 
-<div class="quick-open-shell">
-  <button
-    aria-label="close quick open"
-    class="quick-open-backdrop"
-    onclick={closeQuickOpen}
-    tabindex="-1"
-    type="button"
-  ></button>
-  <div class="quick-open" data-testid="quick-open-panel">
+<DsModal
+  closeLabel="close quick open"
+  label="Quick open"
+  onclose={closeQuickOpen}
+  panelTestId="quick-open-panel"
+>
+  <div class="quick-open">
     <input
+      aria-activedescendant={filtered[selectedIndex.value] ? `quick-open-option-${filtered[selectedIndex.value]!.id}` : undefined}
+      aria-controls="quick-open-results"
+      aria-label="Search notes"
+      aria-autocomplete="list"
+      aria-expanded="true"
       bind:this={inputEl}
       bind:value={query}
       class="search-input"
       placeholder="search notes..."
+      role="combobox"
       type="text"
       onkeydown={handleKeydown}
     />
 
-    <div class="results">
+    <div class="results" id="quick-open-results" role="listbox">
       {#each filtered as doc, i (doc.id)}
         <button
+          aria-selected={i === selectedIndex.value}
           class="result-item"
           class:selected={i === selectedIndex.value}
+          id={`quick-open-option-${doc.id}`}
           onclick={() => void select(doc.id)}
+          role="option"
         >
           <span class="result-title">{doc.title.toLowerCase()}</span>
           <span class="result-path">{doc.path}</span>
@@ -103,57 +111,12 @@
       {/if}
     </div>
   </div>
-</div>
+</DsModal>
 
 <style>
-  .quick-open-shell {
-    position: fixed;
-    inset: 0;
-    z-index: 100;
-    display: flex;
-    justify-content: center;
-    padding-top: 100px;
-  }
-
-  .quick-open-backdrop {
-    position: absolute;
-    inset: 0;
-    border: none;
-    padding: 0;
-    background: var(--overlay-backdrop);
-    backdrop-filter: blur(2px);
-    -webkit-backdrop-filter: blur(2px);
-    animation: fadeIn 150ms ease;
-  }
-
-  @keyframes fadeIn {
-    from { opacity: 0; }
-    to { opacity: 1; }
-  }
-
   .quick-open {
-    position: relative;
-    z-index: 1;
-    width: 560px;
-    max-height: 440px;
-    background: var(--surface);
-    border: 1px solid var(--border-subtle);
-    border-radius: 16px;
     display: flex;
     flex-direction: column;
-    overflow: hidden;
-    animation: quickOpenIn 200ms var(--ease-out-expo);
-  }
-
-  @keyframes quickOpenIn {
-    from {
-      opacity: 0;
-      transform: scale(0.97) translateY(-4px);
-    }
-    to {
-      opacity: 1;
-      transform: scale(1) translateY(0);
-    }
   }
 
   .search-input {

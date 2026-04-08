@@ -68,7 +68,7 @@ describe('QuickOpen', () => {
 
     render(QuickOpen);
 
-    const result = screen.getByRole('button', { name: /alpha alpha\.md/i });
+    const result = screen.getByRole('option', { name: /alpha alpha\.md/i });
     const clickPromise = fireEvent.click(result);
 
     expect(mockState.navigateToDoc).toHaveBeenCalledWith('project-1', 'doc-a');
@@ -124,12 +124,10 @@ describe('QuickOpen', () => {
   });
 
   it('closes when the backdrop is clicked', async () => {
-    const { container } = render(QuickOpen);
+    render(QuickOpen);
 
-    const backdrop = container.querySelector('.quick-open-backdrop');
-    expect(backdrop).toBeTruthy();
-
-    await fireEvent.click(backdrop!);
+    const backdrop = screen.getByRole('button', { name: /close quick open/i });
+    await fireEvent.click(backdrop);
 
     expect(mockState.closeQuickOpen).toHaveBeenCalledTimes(1);
   });
@@ -141,7 +139,7 @@ describe('QuickOpen', () => {
 
     render(QuickOpen);
 
-    await fireEvent.click(screen.getByRole('button', { name: /alpha alpha\.md/i }));
+    await fireEvent.click(screen.getByRole('option', { name: /alpha alpha\.md/i }));
 
     await waitFor(() => {
       expect(mockState.consoleError).toHaveBeenCalled();

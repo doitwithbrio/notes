@@ -215,8 +215,10 @@ export interface BackendSearchResult {
 }
 
 export interface BackendRemoteChangeEvent {
+  projectId: string;
   docId: string;
   peerId: string | null;
+  mode: 'incremental-available' | 'viewer-snapshot-available' | 'metadata-only';
 }
 
 export interface BackendSyncStatusEvent {
@@ -226,7 +228,11 @@ export interface BackendSyncStatusEvent {
 }
 
 export interface BackendPresenceEvent {
+  projectId: string;
   peerId: string;
+  sessionId: string;
+  sessionStartedAt: number;
+  seq: number;
   alias: string;
   activeDoc: string | null;
   cursorPos: number | null;
@@ -237,6 +243,18 @@ export interface BackendPeerStatusEvent {
   peerId: string;
   state: 'connected' | 'disconnected';
   alias: string | null;
+}
+
+export interface BackendProjectEvictedEvent {
+  projectId: string;
+  projectName: string;
+  reason: string;
+}
+
+export interface BackendProjectEvictionNotice {
+  projectId: string;
+  projectName: string;
+  reason: string;
 }
 
 export interface GenerateInviteResult {
@@ -293,8 +311,18 @@ export interface BackendPeerStatusSummary {
   peerId: string;
   connected: boolean;
   alias: string | null;
-  role: PeerRole | null;
+  role: PeerRole;
   activeDoc: string | null;
+  isSelf: boolean;
+}
+
+export interface BackendTodoItem {
+  id: string;
+  text: string;
+  done: boolean;
+  createdBy: string;
+  createdAt: string;
+  linkedDocId?: string;
 }
 
 export interface AppSettings {
@@ -341,15 +369,23 @@ export interface Document {
 
 export interface Peer {
   id: string;
+  projectId: string;
   alias: string;
   online: boolean;
   cursorColor: string;
-  role?: PeerRole | null;
-  activeDoc?: string | null;
+  role: PeerRole;
+  activeDoc: string | null;
+  isSelf: boolean;
 }
 
 export interface CursorPosition {
+  projectId: string;
   peerId: string;
+  alias: string;
+  cursorColor: string;
+  sessionId: string;
+  sessionStartedAt: number;
+  seq: number;
   docId: string;
   from: number;
   to: number;
@@ -358,11 +394,16 @@ export interface CursorPosition {
 
 export interface TodoItem {
   id: string;
+  todoId: string;
   projectId: string;
+  source: 'manual' | 'inline';
   text: string;
   done: boolean;
+  createdBy?: string;
+  createdAt?: string;
   linkedDocId?: string;
-  createdAt: number;
+  order?: number;
+  depth?: number;
 }
 
 // ── Auto-update types ────────────────────────────────────────────────

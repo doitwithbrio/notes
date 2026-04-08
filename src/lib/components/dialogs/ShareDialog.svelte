@@ -2,6 +2,7 @@
   import { inviteState, closeShareDialog, generateInvite } from '../../state/invite.svelte.js';
   import { getProject } from '../../state/projects.svelte.js';
   import { Copy, Check, Loader2 } from 'lucide-svelte';
+  import DsModal from '../../design-system/DsModal.svelte';
 
   const project = $derived(getProject(inviteState.shareProjectId));
   const invite = $derived(inviteState.activeInvite);
@@ -57,10 +58,6 @@
     }
   }
 
-  function handleKeydown(e: KeyboardEvent) {
-    if (e.key === 'Escape') closeShareDialog();
-  }
-
   function handleGenerate() {
     if (inviteState.shareProjectId) {
       void generateInvite(inviteState.shareProjectId, inviteState.inviteRole);
@@ -74,29 +71,17 @@
   }
 </script>
 
-<svelte:window onkeydown={handleKeydown} />
-
-<div class="dialog-shell">
-  <button
-    aria-label="close share dialog"
-    class="backdrop"
-    onclick={closeShareDialog}
-    tabindex="-1"
-    type="button"
-  ></button>
-  <div
-    class="panel"
-    data-testid="share-dialog"
-    role="dialog"
-    tabindex="-1"
-    aria-modal="true"
-    aria-labelledby="share-title"
-  >
+<DsModal
+  closeLabel="close share dialog"
+  labelledBy="share-title"
+  onclose={closeShareDialog}
+  panelTestId="share-dialog"
+>
     <div class="panel-header">
       <h3 id="share-title">share {project?.name ?? 'project'}</h3>
       <div class="role-switcher">
-        <button class="role-btn" data-testid="share-role-editor" class:active={inviteState.inviteRole === 'editor'} onclick={() => setRole('editor')}>editor</button>
-        <button class="role-btn" data-testid="share-role-viewer" class:active={inviteState.inviteRole === 'viewer'} onclick={() => setRole('viewer')}>viewer</button>
+        <button aria-pressed={inviteState.inviteRole === 'editor'} class="role-btn" data-testid="share-role-editor" class:active={inviteState.inviteRole === 'editor'} onclick={() => setRole('editor')}>editor</button>
+        <button aria-pressed={inviteState.inviteRole === 'viewer'} class="role-btn" data-testid="share-role-viewer" class:active={inviteState.inviteRole === 'viewer'} onclick={() => setRole('viewer')}>viewer</button>
       </div>
     </div>
 
@@ -181,54 +166,9 @@
         <button class="action-row" data-testid="share-generate" onclick={handleGenerate}>generate invite</button>
       {/if}
     </div>
-  </div>
-</div>
+</DsModal>
 
 <style>
-  .dialog-shell {
-    position: fixed;
-    inset: 0;
-    z-index: 100;
-    display: flex;
-    justify-content: center;
-    padding-top: 100px;
-  }
-
-  .backdrop {
-    position: absolute;
-    inset: 0;
-    border: none;
-    padding: 0;
-    background: var(--overlay-backdrop);
-    backdrop-filter: blur(2px);
-    -webkit-backdrop-filter: blur(2px);
-    animation: fadeIn 150ms ease;
-  }
-
-  @keyframes fadeIn {
-    from { opacity: 0; }
-    to { opacity: 1; }
-  }
-
-  .panel {
-    position: relative;
-    z-index: 1;
-    width: 560px;
-    max-height: 440px;
-    background: var(--surface);
-    border: 1px solid var(--border-subtle);
-    border-radius: 16px;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-    animation: panelIn 200ms var(--ease-out-expo);
-  }
-
-  @keyframes panelIn {
-    from { opacity: 0; transform: scale(0.97) translateY(-4px); }
-    to { opacity: 1; transform: scale(1) translateY(0); }
-  }
-
   .panel-header {
     display: flex;
     align-items: center;
@@ -322,7 +262,7 @@
   }
 
   .status-row :global(.spin) {
-    animation: spin 1s linear infinite;
+    animation: spin var(--motion-spin);
   }
 
   @keyframes spin {
@@ -331,7 +271,7 @@
 
   .error-row {
     font-size: 14px;
-    color: #a04130;
+    color: var(--status-danger-fg);
     padding: 11px 0;
   }
 
@@ -435,7 +375,7 @@
 
   .expired {
     font-size: 12px;
-    color: #a04130;
+    color: var(--status-danger-fg);
     font-weight: 500;
   }
 

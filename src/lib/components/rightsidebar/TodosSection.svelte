@@ -1,6 +1,8 @@
 <script lang="ts">
+  import DsSection from '../../design-system/DsSection.svelte';
   import { documentState } from '../../state/documents.svelte.js';
   import { todoState, addTodo, toggleTodo, removeTodo } from '../../state/todos.svelte.js';
+  import { getProject } from '../../state/projects.svelte.js';
   import { FileText, X } from 'lucide-svelte';
   import { getSelectedDoc, getSelectedProjectId, getWorkspaceContextRoute, isLiveDocRoute } from '../../navigation/workspace-router.svelte.js';
 
@@ -8,6 +10,12 @@
   const activeDoc = $derived(getSelectedDoc());
 
   const projectId = $derived(getSelectedProjectId());
+  const selectedProject = $derived(getProject(projectId));
+  const canEditTodos = $derived(selectedProject?.canEdit ?? false);
+  const todosHydrating = $derived.by(() =>
+    !!projectId
+    && todoState.loadingProjectIds.includes(projectId)
+    && !todoState.hydratedProjectIds.includes(projectId));
 
   // In editor view with an active doc: show file-specific todos only
   // In project overview: show all project todos
@@ -41,16 +49,16 @@
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === 'Enter') {
       e.preventDefault();
-      submitTodo();
+      void submitTodo();
     }
   }
 
-  function submitTodo() {
+  async function submitTodo() {
     const text = newTodoText.trim();
-    if (!text || !projectId) return;
+    if (!text || !projectId || !canEditTodos) return;
     // Auto-link to the active doc when in file mode
     const linkedDocId = isFileMode && activeDoc ? activeDoc.id : undefined;
-    addTodo(projectId, text, linkedDocId);
+    await addTodo(projectId, text, linkedDocId);
     newTodoText = '';
   }
 
@@ -58,101 +66,89 @@
     if (!docId) return null;
     return documentState.docs.find((d) => d.id === docId)?.title ?? null;
   }
+
+  function canToggleTodo(todo: typeof todos[number]) {
+    if (!canEditTodos) return false;
+    if (todo.source === 'manual') return true;
+    return !!todo.linkedDocId;
+  }
+
+  function canRemoveTodo(todo: typeof todos[number]) {
+    return canEditTodos && todo.source === 'manual';
+  }
 </script>
 
-<section class="section">
-  <div class="section-header">
-    <span class="section-title">{headerLabel}</span>
-    {#if pendingCount > 0}
-      <span class="section-count">{pendingCount}</span>
+{#snippet todoRow(todo: (typeof todos)[number])}
+  <li class="todo-item" class:done={todo.done}>
+    <label class="todo-check">
+      <input
+        aria-label={todo.text}
+        type="checkbox"
+        checked={todo.done}
+        disabled={!canToggleTodo(todo)}
+        onchange={() => void toggleTodo(todo.id)}
+      />
+    </label>
+    <div class="todo-content">
+      <span class="todo-text">{todo.text}</span>
+      {#if todo.linkedDocId && !isFileMode}
+        {@const title = getLinkedDocTitle(todo.linkedDocId)}
+        {#if title}
+          <span class="todo-link">
+            <FileText size={10} strokeWidth={1.5} />
+            {title}
+          </span>
+        {/if}
+      {/if}
+    </div>
+    {#if canRemoveTodo(todo)}
+      <button class="todo-remove" onclick={() => void removeTodo(todo.id)} aria-label="remove todo">
+        <X size={11} strokeWidth={1.5} />
+      </button>
     {/if}
-  </div>
+  </li>
+{/snippet}
 
+<DsSection className="section-shell" count={pendingCount > 0 ? pendingCount : null} divider title={headerLabel}>
   <div class="section-body">
     {#if !projectId}
       <p class="empty-text">select a project or note</p>
+    {:else if todosHydrating}
+      <p class="empty-text">loading todos...</p>
     {:else}
-      <div class="todo-input-wrap">
-        <input
-          class="todo-input"
-          type="text"
-          placeholder={isFileMode ? 'add a todo for this file...' : 'add a todo...'}
-          bind:value={newTodoText}
-          onkeydown={handleKeydown}
-        />
-      </div>
+      {#if canEditTodos}
+        <div class="todo-input-wrap">
+          <input
+            aria-label={isFileMode ? 'Add a todo for this file' : 'Add a todo'}
+            class="todo-input"
+            type="text"
+            placeholder={isFileMode ? 'add a todo for this file...' : 'add a todo...'}
+            bind:value={newTodoText}
+            onkeydown={handleKeydown}
+          />
+        </div>
+      {/if}
 
-      <div class="todo-list">
+      <ul class="todo-list">
         {#each pendingTodos as todo (todo.id)}
-          <div class="todo-item">
-            <label class="todo-check">
-              <input
-                type="checkbox"
-                checked={todo.done}
-                onchange={() => toggleTodo(todo.id)}
-              />
-            </label>
-            <div class="todo-content">
-              <span class="todo-text">{todo.text}</span>
-              {#if todo.linkedDocId && !isFileMode}
-                {@const title = getLinkedDocTitle(todo.linkedDocId)}
-                {#if title}
-                  <span class="todo-link">
-                    <FileText size={10} strokeWidth={1.5} />
-                    {title}
-                  </span>
-                {/if}
-              {/if}
-            </div>
-            <button class="todo-remove" onclick={() => removeTodo(todo.id)} aria-label="remove todo">
-              <X size={11} strokeWidth={1.5} />
-            </button>
-          </div>
+          {@render todoRow(todo)}
         {/each}
 
         {#each doneTodos as todo (todo.id)}
-          <div class="todo-item done">
-            <label class="todo-check">
-              <input
-                type="checkbox"
-                checked={todo.done}
-                onchange={() => toggleTodo(todo.id)}
-              />
-            </label>
-            <div class="todo-content">
-              <span class="todo-text">{todo.text}</span>
-            </div>
-            <button class="todo-remove" onclick={() => removeTodo(todo.id)} aria-label="remove todo">
-              <X size={11} strokeWidth={1.5} />
-            </button>
-          </div>
+          {@render todoRow(todo)}
         {/each}
 
         {#if todos.length === 0}
-          <p class="empty-text">{isFileMode ? 'no todos for this file' : 'no todos yet'}</p>
+          <li class="todo-item empty-row">
+            <p class="empty-text">{isFileMode ? 'no todos for this file' : 'no todos yet'}</p>
+          </li>
         {/if}
-      </div>
+      </ul>
     {/if}
   </div>
-</section>
+</DsSection>
 
 <style>
-  .section {
-    display: flex;
-    flex-direction: column;
-    min-height: 0;
-    flex: 1;
-    border-bottom: 1px solid var(--border-subtle);
-  }
-
-  .section-header {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 12px 16px 8px;
-    flex-shrink: 0;
-  }
-
   .section-body {
     flex: 1;
     min-height: 0;
@@ -160,32 +156,12 @@
     padding: 0 16px 12px;
   }
 
-  .section-title {
-    font-size: 13px;
-    font-weight: 700;
-    letter-spacing: -0.01em;
-    color: var(--text-primary);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .section-count {
-    font-size: 10px;
-    font-weight: 600;
-    color: var(--text-primary);
-    background: var(--surface-active);
-    padding: 0 5px;
-    border-radius: 8px;
-    line-height: 16px;
-    flex-shrink: 0;
-  }
-
   .todo-list {
     display: flex;
     flex-direction: column;
     gap: 1px;
     margin-bottom: 10px;
+    list-style: none;
   }
 
   .todo-item {
@@ -197,7 +173,8 @@
     transition: background var(--transition-fast);
   }
 
-  .todo-item:hover {
+  .todo-item:hover,
+  .todo-item:focus-within {
     background: var(--surface-hover);
   }
 
@@ -262,7 +239,8 @@
     transition: opacity var(--transition-fast), color var(--transition-fast);
   }
 
-  .todo-item:hover .todo-remove {
+  .todo-item:hover .todo-remove,
+  .todo-item:focus-within .todo-remove {
     opacity: 1;
   }
 

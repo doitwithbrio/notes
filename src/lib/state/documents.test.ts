@@ -12,6 +12,8 @@ function deferred<T>() {
 
 const tauriApiMock = vi.hoisted(() => ({
   listFiles: vi.fn(async () => []),
+  listProjectTodos: vi.fn(async () => []),
+  getDocBinary: vi.fn(async () => new Uint8Array()),
   getUnseenDocs: vi.fn(async () => []),
   openProject: vi.fn(async () => undefined),
   deleteNote: vi.fn(async () => undefined),
@@ -44,6 +46,8 @@ async function loadFreshModules() {
 describe('documents state', () => {
   beforeEach(() => {
     tauriApiMock.listFiles.mockClear();
+    tauriApiMock.listProjectTodos.mockClear();
+    tauriApiMock.getDocBinary.mockClear();
     tauriApiMock.getUnseenDocs.mockClear();
     tauriApiMock.openProject.mockClear();
     tauriApiMock.deleteNote.mockClear();
@@ -77,7 +81,9 @@ describe('documents state', () => {
     const gate = deferred<Array<{ id: string; path: string; created: string }>>();
     (tauriApiMock.listFiles as any)
       .mockImplementationOnce(() => gate.promise as any)
-      .mockImplementationOnce(async () => [{ id: 'doc-b', path: 'b.md', created: 'later' }]);
+      .mockImplementationOnce(async () => [])
+      .mockImplementationOnce(async () => [{ id: 'doc-b', path: 'b.md', created: 'later' }])
+      .mockImplementationOnce(async () => []);
     (tauriApiMock.getUnseenDocs as any)
       .mockImplementationOnce(async () => [])
       .mockImplementationOnce(async () => []);
@@ -90,7 +96,7 @@ describe('documents state', () => {
     await Promise.all([firstLoad, secondLoad]);
 
     expect(tauriApiMock.openProject).toHaveBeenCalledTimes(2);
-    expect(tauriApiMock.listFiles).toHaveBeenCalledTimes(2);
+    expect(tauriApiMock.listFiles).toHaveBeenCalledTimes(4);
     expect(documents.documentState.docs.some((doc) => doc.id === 'doc-b')).toBe(true);
   });
 });

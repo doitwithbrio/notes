@@ -112,10 +112,21 @@ export async function navigateToProject(projectId: string) {
   await closeEditorSession();
   setCurrentRoute({ kind: 'project', projectId });
 
-  if (!hasHydratedProject(projectId)) {
-    await loadProjectDocs(projectId, { connectPeers: true });
-  } else {
-    await tauriApi.openProject(projectId, true);
+  try {
+    if (!hasHydratedProject(projectId)) {
+      await loadProjectDocs(projectId, { connectPeers: true });
+    } else {
+      await tauriApi.openProject(projectId, true);
+    }
+  } catch (error) {
+    const eviction = await import('../state/project-eviction.svelte.js');
+    if ((error as { code?: string } | null)?.code === 'PROJECT_IDENTITY_MISMATCH'
+      || (error as { code?: string } | null)?.code === 'PROJECT_NOT_FOUND') {
+      await tauriApi.purgeProjectLocalData(projectId, 'access-revoked').catch(() => undefined);
+      await eviction.evictProject(projectId, 'access-revoked');
+      return;
+    }
+    throw error;
   }
 }
 
@@ -165,15 +176,27 @@ export function navigateBackToLive() {
   clearVersionPreview();
 }
 
-export async function restoreHistoryVersion(projectId: string, docId: string, versionId: string) {
-  await restoreVersionData(projectId, docId, versionId);
-  await reloadActiveSession();
-  await loadVersions(docId);
-  const route = getWorkspaceRoute();
-  if (!isHistoryRoute(route) || route.projectId !== projectId || route.docId !== docId || route.versionId !== versionId) {
-    return;
+export async function restoreHistoryVersion(projectId: string, docId: string, versionId: string): Promise<boolean> {
+  const restored = await restoreVersionData(projectId, docId, versionId);
+  if (!restored) {
+    return false;
   }
-  navigateBackToLive();
+
+  if (getSelectedProjectId() !== projectId || getSelectedDocId() !== docId) {
+    return true;
+  }
+
+  try {
+    await reloadActiveSession();
+    await loadVersions(docId);
+  } finally {
+    const route = getWorkspaceRoute();
+    if (isHistoryRoute(route) && route.projectId === projectId && route.docId === docId && route.versionId === versionId) {
+      navigateBackToLive();
+    }
+  }
+
+  return true;
 }
 
 export function navigateToSettings() {

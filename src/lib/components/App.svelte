@@ -5,9 +5,10 @@
   import { closeEditorSession, editorSessionState } from '../session/editor-session.svelte.js';
   import { teardownAppearance } from '../state/appearance.svelte.js';
   import { tauriApi } from '../api/tauri.js';
-  import { closeQuickOpen, toggleQuickOpen, uiState } from '../state/ui.svelte.js';
+  import { clearRevokedProjectNotice, closeQuickOpen, toggleQuickOpen, uiState } from '../state/ui.svelte.js';
   import { projectState } from '../state/projects.svelte.js';
   import { isMac } from '../utils/platform.js';
+  import { shouldIgnoreGlobalShortcut } from '../utils/keyboard.js';
   import { getSelectedDoc, getSelectedProjectId, getWorkspaceRoute, isProjectRoute, navigateToDoc, navigateToProject, reconcileMissingSelectedDoc } from '../navigation/workspace-router.svelte.js';
   import Sidebar from './sidebar/Sidebar.svelte';
   import ProjectOverview from './editor/ProjectOverview.svelte';
@@ -86,6 +87,7 @@
     }
     return null;
   });
+  const revokedNotice = $derived(uiState.revokedProjectNotices[0] ?? null);
 
   $effect(() => {
     if ((activeDoc || editorSessionState.loading) && !editorPanePromise) {
@@ -139,6 +141,7 @@
   });
 
   function handleKeydown(e: KeyboardEvent) {
+    if (shouldIgnoreGlobalShortcut(e)) return;
     const mod = isMac ? e.metaKey : e.ctrlKey;
     if (mod && e.key === 'f') {
       e.preventDefault();
@@ -179,6 +182,15 @@
         console.error('Failed to recover note from markdown:', error);
       });
   }
+
+  function handleDismissRevokedNotice() {
+    const notice = revokedNotice;
+    if (!notice) return;
+    clearRevokedProjectNotice(notice.projectId);
+    void tauriApi.dismissProjectEvictionNotice(notice.backendProjectId).catch((error) => {
+      console.error('Failed to dismiss revoked project notice:', error);
+    });
+  }
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
@@ -193,6 +205,15 @@
 
   <div class="editor-panel">
     <UpdateBanner />
+    {#if revokedNotice}
+      <div class="invite-banner error" data-testid="revoked-project-banner">
+        <div class="invite-copy">
+          <p class="invite-title">access revoked</p>
+          <p class="invite-body">{revokedNotice.projectName} was removed from this device. Any unsynced local changes for that project were removed and will not be sent.</p>
+        </div>
+        <button class="invite-action" onclick={handleDismissRevokedNotice}>dismiss</button>
+      </div>
+    {/if}
     {#if inviteBanner}
       <div class={`invite-banner ${inviteBanner.kind}`} data-testid="invite-banner">
         <div class="invite-copy">

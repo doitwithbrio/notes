@@ -100,3 +100,9 @@ export function saveDocOrder(projectId: string, docs: Document[]) {
   order.docOrder[projectId] = docs.map((d) => d.id);
   saveOrder();
 }
+
+export function removeProjectOrder(projectId: string) {
+  order.projectOrder = order.projectOrder.filter((id) => id !== projectId);
+  delete order.docOrder[projectId];
+  saveOrder();
+}

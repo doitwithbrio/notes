@@ -15,12 +15,9 @@
   let confirmingRemove = $state(false);
 </script>
 
-<div class="peer-row" data-testid={`peer-row-${peer.id}`} data-state={peer.online ? 'online' : 'offline'} class:offline={!peer.online} title="{peer.alias} · {peer.online ? 'online' : 'offline'}{peer.role ? ` · ${peer.role}` : ''}">
-  <span class="peer-dot" class:offline-dot={!peer.online} style={peer.online ? `background: ${peer.cursorColor}` : ''}></span>
-  <span class="peer-name">{peer.alias}</span>
-  {#if peer.role}
-    <span class="peer-role">{peer.role}</span>
-  {/if}
+<div class="peer-row" data-testid={`peer-row-${peer.id}`} data-state={peer.online ? 'online' : 'offline'} class:offline={!peer.online} title="{peer.alias} · {peer.online ? 'online' : 'offline'} · {peer.role}">
+  <span class="peer-name">{peer.alias}<span class="sr-only"> · {peer.online ? 'online' : 'offline'}</span></span>
+  <span class="peer-role">{peer.role}</span>
   {#if isOwner && onremove && peer.role !== 'owner'}
     {#if confirmingRemove}
       <button class="confirm-remove" data-testid={`peer-remove-confirm-${peer.id}`} onclick={() => { onremove(); confirmingRemove = false; }}>remove?</button>
@@ -31,9 +28,22 @@
       </button>
     {/if}
   {/if}
+  <span class="peer-dot" class:offline-dot={!peer.online} style={peer.online ? `background: ${peer.cursorColor}` : ''}></span>
 </div>
 
 <style>
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
   .peer-row {
     display: flex;
     align-items: center;
@@ -46,17 +56,6 @@
 
   .peer-row:hover {
     background: var(--surface-hover);
-  }
-
-  .peer-dot {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    flex-shrink: 0;
-  }
-
-  .offline-dot {
-    background: var(--text-tertiary);
   }
 
   .peer-name {
@@ -77,6 +76,19 @@
     font-size: 10px;
     color: var(--text-tertiary);
     flex-shrink: 0;
+    text-transform: none;
+  }
+
+  .peer-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    margin-left: auto;
+  }
+
+  .offline-dot {
+    background: var(--text-tertiary);
   }
 
   .remove-btn {
@@ -93,6 +105,10 @@
   }
 
   .peer-row:hover .remove-btn {
+    opacity: 1;
+  }
+
+  .peer-row:focus-within .remove-btn {
     opacity: 1;
   }
 
