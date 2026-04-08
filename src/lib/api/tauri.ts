@@ -8,12 +8,15 @@ import type {
   BackendPeerStatusSummary,
   BackendPresenceEvent,
   BackendProjectSummary,
-  BackendPendingJoinResume,
-  BackendOwnerInviteStatus,
-  BackendInviteAcceptEvent,
-  BackendRemoteChangeEvent,
+    BackendPendingJoinResume,
+    BackendOwnerInviteStatus,
+    BackendInviteAcceptEvent,
+    BackendProjectEvictedEvent,
+    BackendProjectEvictionNotice,
+    BackendRemoteChangeEvent,
   BackendSearchResult,
   BackendSyncStatusEvent,
+  BackendTodoItem,
   BackendUnseenDocInfo,
   BackendVersion,
   BackendRecoverableDocCorruptionDetails,
@@ -73,6 +76,11 @@ export const tauriApi = {
   listProjectSummaries: () => guardedInvoke<BackendProjectSummary[]>('list_project_summaries'),
   createProject: (name: string) => guardedInvoke<void>('create_project', { name }),
   deleteProject: (name: string) => guardedInvoke<void>('delete_project', { name }),
+  purgeProjectLocalData: (project: string, reason: string) =>
+    guardedInvoke<void>('purge_project_local_data', { project, reason }),
+  listProjectEvictionNotices: () => guardedInvoke<BackendProjectEvictionNotice[]>('list_project_eviction_notices'),
+  dismissProjectEvictionNotice: (projectId: string) =>
+    guardedInvoke<void>('dismiss_project_eviction_notice', { projectId }),
   openProject: (name: string, connectPeers = false) =>
     guardedInvoke<void>('open_project', { name, connectPeers }),
   listFiles: (project: string) => guardedInvoke<BackendDocInfo[]>('list_files', { project }),
@@ -93,13 +101,43 @@ export const tauriApi = {
   },
   getDocText: (project: string, docId: string) =>
     guardedInvoke<string>('get_doc_text', { project, docId }),
+  importImage: (project: string, data: Uint8Array, filename: string) =>
+    guardedInvoke<{ hash: string; size: number; filename: string; mimeType: string }>('import_image', {
+      project,
+      data: Array.from(data),
+      filename,
+    }),
+  getImage: async (hash: string) => {
+    const raw = await guardedInvoke<ArrayBuffer | number[]>('get_image', { hash });
+    if (raw instanceof ArrayBuffer) return new Uint8Array(raw);
+    return new Uint8Array(raw);
+  },
+  hasImage: (hash: string) => guardedInvoke<boolean>('has_image', { hash }),
+  getDocIncremental: async (project: string, docId: string) => {
+    const raw = await guardedInvoke<ArrayBuffer | number[]>('get_doc_incremental', { project, docId });
+    if (raw instanceof ArrayBuffer) return new Uint8Array(raw);
+    return new Uint8Array(raw);
+  },
+  getViewerDocSnapshot: async (project: string, docId: string) => {
+    const raw = await guardedInvoke<ArrayBuffer | number[]>('get_viewer_doc_snapshot', { project, docId });
+    if (raw instanceof ArrayBuffer) return new Uint8Array(raw);
+    return new Uint8Array(raw);
+  },
   applyChanges: (project: string, docId: string, data: Uint8Array) =>
     guardedInvoke<void>('apply_changes', { project, docId, data: Array.from(data) }),
   saveDoc: (project: string, docId: string) => guardedInvoke<void>('save_doc', { project, docId }),
   compactDoc: (project: string, docId: string) =>
     guardedInvoke<void>('compact_doc', { project, docId }),
+  ensureBlobAvailable: (project: string, hash: string) =>
+    guardedInvoke<{ available: boolean; fetched: boolean }>('ensure_blob_available', { project, hash }),
   getPeerStatus: (project: string) =>
     guardedInvoke<BackendPeerStatusSummary[]>('get_peer_status', { project }),
+  broadcastPresence: (
+    project: string,
+    activeDoc: string | null,
+    cursorPos: number | null,
+    selection: [number, number] | null,
+  ) => guardedInvoke<void>('broadcast_presence', { project, activeDoc, cursorPos, selection }),
   // Invite & peer management
   generateInvite: (project: string, role: 'editor' | 'viewer') =>
     guardedInvoke<import('../types/index.js').GenerateInviteResult>('generate_invite', { project, role }),
@@ -129,6 +167,16 @@ export const tauriApi = {
     guardedInvoke<BackendSearchResult[]>('search_notes', { query, limit }),
   searchProjectNotes: (query: string, project: string, limit?: number) =>
     guardedInvoke<BackendSearchResult[]>('search_project_notes', { query, project, limit }),
+  listProjectTodos: (project: string) =>
+    guardedInvoke<BackendTodoItem[]>('list_project_todos', { project }),
+  addProjectTodo: (project: string, text: string, linkedDocId?: string) =>
+    guardedInvoke<string>('add_project_todo', { project, text, linkedDocId: linkedDocId ?? null }),
+  toggleProjectTodo: (project: string, todoId: string) =>
+    guardedInvoke<boolean>('toggle_project_todo', { project, todoId }),
+  removeProjectTodo: (project: string, todoId: string) =>
+    guardedInvoke<void>('remove_project_todo', { project, todoId }),
+  updateProjectTodo: (project: string, todoId: string, text: string) =>
+    guardedInvoke<void>('update_project_todo', { project, todoId, text }),
   getUnseenDocs: (project: string) =>
     guardedInvoke<BackendUnseenDocInfo[]>('get_unseen_docs', { project }),
   markDocSeen: (project: string, docId: string) =>
@@ -147,6 +195,8 @@ export const tauriApi = {
     guardedListen<BackendPresenceEvent>('p2p:presence-update', handler),
   onInviteAcceptStatus: (handler: (payload: BackendInviteAcceptEvent) => void): Promise<UnlistenFn> =>
     guardedListen<BackendInviteAcceptEvent>('p2p:invite-accept', handler),
+  onProjectEvicted: (handler: (payload: BackendProjectEvictedEvent) => void): Promise<UnlistenFn> =>
+    guardedListen<BackendProjectEvictedEvent>('p2p:project-evicted', handler),
 
   // ── Auto-update ──────────────────────────────────────────────────
   getUpdaterAvailability: () => guardedInvoke<UpdaterAvailability>('get_updater_availability'),

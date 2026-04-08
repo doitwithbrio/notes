@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { DiffBlock } from '../../types/index.js';
+  import { getDiffBlockTargetId } from '../../utils/diff.js';
 
   let {
     diffBlocks = [],
@@ -8,7 +9,7 @@
   }: {
     diffBlocks: DiffBlock[];
     totalLines: number;
-    onClickRegion?: (lineStart: number) => void;
+    onClickRegion?: (targetId: string) => void;
   } = $props();
 
   // Map diff blocks to minibar segments
@@ -17,12 +18,14 @@
 
     return diffBlocks
       .filter((b) => b.type !== 'unchanged')
-      .map((block) => {
+      .map((block, index) => {
         const startPct = ((block.lineStart - 1) / totalLines) * 100;
         // Each block gets at least 2% height for visibility
         const heightPct = Math.max(2, (1 / totalLines) * 100);
 
         return {
+          targetId: getDiffBlockTargetId(block, index),
+          order: index + 1,
           type: block.type,
           top: startPct,
           height: heightPct,
@@ -47,12 +50,15 @@
 
 {#if segments.length > 0}
   <div class="minibar">
-    {#each segments as seg (seg.lineStart)}
+    {#each segments as seg (seg.targetId)}
       <button
         class="segment"
+        class:clickable={!!onClickRegion}
         style="top: {seg.top}%; height: {seg.height}%; background: {colorForType(seg.type)};"
-        onclick={() => onClickRegion?.(seg.lineStart)}
-        title="{seg.type} at line {seg.lineStart}"
+        onclick={() => onClickRegion?.(seg.targetId)}
+        disabled={!onClickRegion}
+        aria-label="{seg.type} change {seg.order}"
+        title="{seg.type} change {seg.order}"
       ></button>
     {/each}
   </div>
@@ -61,11 +67,13 @@
 <style>
   .minibar {
     position: absolute;
-    left: 0;
+    left: 10px;
     top: 0;
     bottom: 0;
-    width: 5px;
+    width: 8px;
     z-index: 5;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--border-default) 55%, transparent);
   }
 
   .segment {
@@ -74,8 +82,12 @@
     width: 100%;
     border-radius: 1px;
     opacity: 0.7;
-    cursor: pointer;
+    cursor: default;
     transition: opacity var(--transition-fast);
+  }
+
+  .segment.clickable {
+    cursor: pointer;
   }
 
   .segment:hover {

@@ -17,17 +17,19 @@ const mockState = vi.hoisted(() => ({
     }>,
   },
   todoState: {
-    todos: [] as Array<{ id: string; projectId: string; text: string; done: boolean; linkedDocId?: string }>,
+    loadingProjectIds: [] as string[],
+    hydratedProjectIds: [] as string[],
+    todos: [] as Array<{ id: string; todoId: string; source: 'manual' | 'inline'; projectId: string; text: string; done: boolean; linkedDocId?: string }>,
   },
-  presenceState: {
-    peers: [] as Array<{ id: string; online: boolean; cursorColor: string }>,
-  },
+  getVisibleProjectPeers: vi.fn(() => []),
+  getProjectPeerById: vi.fn(() => null),
   navigateToDoc: vi.fn(),
   consoleError: vi.fn(),
   openShareDialog: vi.fn(),
   addTodo: vi.fn(),
   toggleTodo: vi.fn(),
   removeTodo: vi.fn(),
+  getActiveSession: vi.fn<() => { projectId: string; docId: string } | null>(() => null),
 }));
 
 vi.mock('../../state/documents.svelte.js', () => ({
@@ -42,7 +44,8 @@ vi.mock('../../state/todos.svelte.js', () => ({
 }));
 
 vi.mock('../../state/presence.svelte.js', () => ({
-  presenceState: mockState.presenceState,
+  getVisibleProjectPeers: mockState.getVisibleProjectPeers,
+  getProjectPeerById: mockState.getProjectPeerById,
 }));
 
 vi.mock('../../state/invite.svelte.js', () => ({
@@ -51,6 +54,10 @@ vi.mock('../../state/invite.svelte.js', () => ({
 
 vi.mock('../../navigation/workspace-router.svelte.js', () => ({
   navigateToDoc: mockState.navigateToDoc,
+}));
+
+vi.mock('../../session/editor-session.svelte.js', () => ({
+  getActiveSession: mockState.getActiveSession,
 }));
 
 describe('ProjectOverview', () => {
@@ -82,9 +89,16 @@ describe('ProjectOverview', () => {
       },
     ];
     mockState.todoState.todos = [];
-    mockState.presenceState.peers = [];
+    mockState.todoState.loadingProjectIds = [];
+    mockState.todoState.hydratedProjectIds = [];
+    mockState.getVisibleProjectPeers.mockReset();
+    mockState.getVisibleProjectPeers.mockReturnValue([]);
+    mockState.getProjectPeerById.mockReset();
+    mockState.getProjectPeerById.mockReturnValue(null);
     mockState.navigateToDoc.mockReset();
     mockState.openShareDialog.mockReset();
+    mockState.toggleTodo.mockReset();
+    mockState.getActiveSession.mockReturnValue(null);
     mockState.consoleError.mockReset();
     vi.spyOn(console, 'error').mockImplementation(mockState.consoleError);
   });
@@ -178,5 +192,90 @@ describe('ProjectOverview', () => {
     expect(screen.getByText(/identity mismatch/i)).toBeTruthy();
     expect(screen.getByText(/different device identity/i)).toBeTruthy();
     expect(screen.queryByRole('button', { name: /share/i })).toBeNull();
+  });
+
+  it('does not expose todo entry controls to viewers', () => {
+    render(ProjectOverview, {
+      project: {
+        id: 'project-1',
+        name: 'alpha',
+        path: 'alpha',
+        shared: true,
+        peerCount: 1,
+        role: 'viewer',
+        accessState: 'viewer',
+        canEdit: false,
+        canManagePeers: false,
+      },
+    });
+
+    expect(screen.queryByPlaceholderText(/add a todo/i)).toBeNull();
+    expect(screen.queryByRole('button', { name: /share/i })).toBeNull();
+  });
+
+  it('shows a loading message while project todos are hydrating', () => {
+    mockState.todoState.loadingProjectIds = ['project-1'];
+
+    render(ProjectOverview, {
+      project: {
+        id: 'project-1',
+        name: 'alpha',
+        path: 'alpha',
+        shared: false,
+        peerCount: 0,
+        role: 'owner',
+        accessState: 'local-owner',
+        canEdit: true,
+        canManagePeers: true,
+      },
+    });
+
+    expect(screen.getByText(/loading todos/i)).toBeTruthy();
+  });
+
+  it('enables inline toggles when the linked note is the active session', async () => {
+    mockState.todoState.todos = [
+      {
+        id: 'todo-manual',
+        todoId: 'todo-manual',
+        source: 'manual',
+        projectId: 'project-1',
+        text: 'manual alpha',
+        done: false,
+      },
+      {
+        id: 'inline:doc-a:todo-a',
+        todoId: 'todo-a',
+        source: 'inline',
+        projectId: 'project-1',
+        text: 'inline alpha',
+        done: false,
+        linkedDocId: 'doc-a',
+      },
+    ];
+    mockState.getActiveSession.mockReturnValue({ projectId: 'project-1', docId: 'doc-a' });
+
+    render(ProjectOverview, {
+      project: {
+        id: 'project-1',
+        name: 'alpha',
+        path: 'alpha',
+        shared: false,
+        peerCount: 0,
+        role: 'owner',
+        accessState: 'local-owner',
+        canEdit: true,
+        canManagePeers: true,
+      },
+    });
+
+    expect(screen.getByText('manual alpha')).toBeTruthy();
+    expect(screen.getByText('inline alpha')).toBeTruthy();
+    expect(screen.getByRole('checkbox', { name: 'manual alpha' })).toHaveProperty('disabled', false);
+    expect(screen.getByRole('checkbox', { name: 'inline alpha' })).toHaveProperty('disabled', false);
+
+    await fireEvent.click(screen.getByRole('checkbox', { name: 'inline alpha' }));
+
+    expect(mockState.toggleTodo).toHaveBeenCalledWith('inline:doc-a:todo-a');
   });
 });

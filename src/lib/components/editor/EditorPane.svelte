@@ -1,30 +1,45 @@
 <script lang="ts">
   import { untrack } from 'svelte';
-  import type { Editor } from '@tiptap/core';
-  import { createEditor, editorToPlainText, textToEditorHtml } from '../../editor/setup.js';
-  import { presenceState } from '../../state/presence.svelte.js';
+  import type { Editor, EditorAdapter } from '../../editor/setup.js';
+  import type { AdapterChange } from '../../editor/automerge-prosemirror-adapter.js';
+  import { createEditorAdapter, textToEditorHtml } from '../../editor/setup.js';
+  import { getProjectPeerById, getRemoteCursorsForDoc } from '../../state/presence.svelte.js';
   import { syncState } from '../../state/sync.svelte.js';
-  import { editorSessionState, updateEditorText, reloadActiveSession } from '../../session/editor-session.svelte.js';
+  import {
+    bindEditorAdapter,
+    editorSessionState,
+    handleBoundEditorChange,
+    setLocalCursorPresence,
+  } from '../../session/editor-session.svelte.js';
   import { versionState } from '../../state/versions.svelte.js';
   import { showSavePrompt, versionReviewState } from '../../state/version-review.svelte.js';
-  import { computeBlockDiff } from '../../utils/diff.js';
+  import { computeBlockDiff, getDiffBlockTargetId } from '../../utils/diff.js';
   import { getSelectedDoc, getWorkspaceRoute, isHistoryRoute, navigateBackToLive } from '../../navigation/workspace-router.svelte.js';
   import TimelineScrubber from './TimelineScrubber.svelte';
   import SaveVersionBar from './SaveVersionBar.svelte';
   import ChangeMinibar from './ChangeMinibar.svelte';
+  import type { Peer } from '../../types/index.js';
+
+  function isOnlinePeer(peer: Peer | null): peer is Peer {
+    return Boolean(peer?.online);
+  }
 
 
   let editorElement = $state<HTMLDivElement | null>(null);
   let editor = $state<Editor | null>(null);
-  let applyingRemoteText = false;
+  let editorAdapter = $state<EditorAdapter | null>(null);
+  let diffOverlayElement = $state<HTMLDivElement | null>(null);
 
   const activeDoc = $derived(getSelectedDoc());
   const isHistoryReview = $derived.by(() => isHistoryRoute(getWorkspaceRoute()));
   const peersInDoc = $derived(
     activeDoc
-      ? presenceState.peers.filter((peer) => activeDoc.activePeers.includes(peer.id) && peer.online)
+      ? activeDoc.activePeers
+          .map((peerId) => getProjectPeerById(activeDoc.projectId, peerId))
+          .filter(isOnlinePeer)
       : [],
   );
+  const remoteCursors = $derived(activeDoc ? getRemoteCursorsForDoc(activeDoc.id) : []);
   const connectionLabel = $derived(
     syncState.connection === 'connected'
       ? 'connected'
@@ -35,62 +50,90 @@
           : 'offline',
   );
 
-  // Compute diff blocks when in history review mode
-  // Use untrack on editorSessionState.text to avoid reactive feedback loops —
-  // the user can't type during history review, so the text is static.
+  const previewReady = $derived(
+    isHistoryReview
+      && versionReviewState.status !== 'error'
+      && versionReviewState.previewText != null,
+  );
+  const hasHistorySurface = $derived(
+    isHistoryReview && (versionReviewState.previewText != null || !!versionReviewState.previewError),
+  );
+  const showDiffView = $derived(previewReady && versionReviewState.viewMode === 'diff');
+  const showSnapshotView = $derived(previewReady && versionReviewState.viewMode === 'snapshot');
+  const showHistoryOverlay = $derived(hasHistorySurface);
+
   const diffBlocks = $derived.by(() => {
-    if (isHistoryReview && versionReviewState.previewText != null) {
-      const currentText = untrack(() => editorSessionState.text);
-      return computeBlockDiff(versionReviewState.previewText, currentText);
+    if (showDiffView && versionReviewState.previewText != null) {
+      return computeBlockDiff(versionReviewState.previewText, editorSessionState.text);
     }
     return [];
   });
+  const visibleDiffBlocks = $derived(diffBlocks.filter((block) => block.type !== 'unchanged'));
 
   // Total lines for minibar calculation
   const totalLines = $derived(
     editorSessionState.text.split('\n').length,
   );
 
-  function syncEditorContent(text: string) {
-    if (!editor || isHistoryReview) return; // Don't sync while reviewing history
-    const current = editorToPlainText(editor);
-    if (current === text) return;
+  function scrollToDiffRegion(targetId: string) {
+    const scrollRoot = diffOverlayElement;
+    if (!scrollRoot) return;
 
-    applyingRemoteText = true;
-    editor.commands.setContent(textToEditorHtml(text), { emitUpdate: false });
-    applyingRemoteText = false;
+    const target = scrollRoot.querySelector<HTMLElement>(`[data-diff-target="${targetId}"]`);
+    if (!target) return;
+
+    const scrollRootRect = scrollRoot.getBoundingClientRect();
+    const targetRect = target.getBoundingClientRect();
+    const nextTop = scrollRoot.scrollTop + (targetRect.top - scrollRootRect.top) - 48;
+
+    scrollRoot.scrollTo({ top: Math.max(0, nextTop), behavior: 'smooth' });
   }
 
   $effect(() => {
     const el = editorElement;
     if (!el) return;
 
-    const initialText = untrack(() => editorSessionState.text);
-    const ed = createEditor(el, initialText, (text) => {
-      if (applyingRemoteText) return;
-      if (untrack(() => isHistoryReview)) return; // Block edits in review mode
-      updateEditorText(text);
+    const adapter = createEditorAdapter(el, {
+      onChange: (change: AdapterChange) => {
+        if (untrack(() => isHistoryReview)) return;
+        handleBoundEditorChange(change);
+        editor = adapter.getEditor();
+      },
+      onSelectionChange: (cursorPos: number | null, selection: [number, number] | null) => {
+      if (untrack(() => isHistoryReview)) {
+        setLocalCursorPresence(null, null);
+        return;
+      }
+      setLocalCursorPresence(cursorPos, selection);
+      },
+      onFocusChange: (focused: boolean) => {
+      if (!focused) {
+        setLocalCursorPresence(null, null);
+      }
+      },
+      getProjectId: () => untrack(() => editorSessionState.projectId),
     });
-    editor = ed;
+    editorAdapter = adapter;
+    bindEditorAdapter(adapter);
+    editor = adapter.getEditor();
 
     return () => {
-      ed.destroy();
+      bindEditorAdapter(null);
+      adapter.detach();
+      setLocalCursorPresence(null, null);
+      editorAdapter = null;
       editor = null;
     };
   });
 
   $effect(() => {
-    editorSessionState.revision;
-    const text = editorSessionState.text;
-    untrack(() => syncEditorContent(text));
+    if (!editorAdapter) return;
+    editorAdapter.updateRemotePresence(isHistoryReview ? [] : remoteCursors);
   });
 
   $effect(() => {
-    const reviewing = isHistoryReview;
-    if (!reviewing) {
-      const text = editorSessionState.text;
-      untrack(() => syncEditorContent(text));
-    }
+    editorSessionState.revision;
+    editor = untrack(() => editorAdapter?.getEditor() ?? null);
   });
 
   // When entering/leaving review mode, toggle editor editability
@@ -98,18 +141,9 @@
     const reviewing = isHistoryReview;
     const ed = untrack(() => editor);
     if (ed) {
-      ed.setEditable(!reviewing);
-    }
-  });
-
-  // When version preview text loads, show it in the editor
-  $effect(() => {
-    if (isHistoryReview && versionReviewState.previewText != null) {
-      const ed = untrack(() => editor);
-      if (!ed) return;
-      applyingRemoteText = true;
-      ed.commands.setContent(textToEditorHtml(versionReviewState.previewText), { emitUpdate: false });
-      applyingRemoteText = false;
+      ed.setEditable(!reviewing && editorSessionState.canEdit);
+    } else if (reviewing) {
+      setLocalCursorPresence(null, null);
     }
   });
 
@@ -139,11 +173,6 @@
       }
     }
   }
-
-  async function handleRestore() {
-    // Reload the active session to reflect restored content
-    await reloadActiveSession();
-  }
 </script>
 
 <svelte:window onkeydown={handleGlobalKeydown} />
@@ -171,64 +200,68 @@
 
   {#if activeDoc}
     <div class="editor-scroll">
-      {#if isHistoryReview}
-        <ChangeMinibar {diffBlocks} {totalLines} />
+      {#if showDiffView}
+        <ChangeMinibar diffBlocks={visibleDiffBlocks} {totalLines} onClickRegion={scrollToDiffRegion} />
       {/if}
 
-      <!-- Diff overlay (covers editor during version review) -->
-      {#if isHistoryReview && diffBlocks.length > 0}
-        <div class="diff-overlay">
+      {#if showDiffView && visibleDiffBlocks.length > 0}
+        <div class="diff-overlay" data-testid="history-diff-view" bind:this={diffOverlayElement}>
           <div class="editor-content-wrap">
             <h1 class="doc-title">{activeDoc.title}</h1>
             <div class="diff-view">
-              {#each diffBlocks as block}
-                <div class="diff-block diff-{block.type}">
+              {#each visibleDiffBlocks as block, index (getDiffBlockTargetId(block, index))}
+                <div
+                  class="diff-block diff-{block.type}"
+                  data-diff-target={getDiffBlockTargetId(block, index)}
+                >
                   {@html textToEditorHtml(block.content)}
                 </div>
               {/each}
             </div>
           </div>
         </div>
-      {:else if isHistoryReview && !versionReviewState.previewLoading && !versionReviewState.previewError && versionReviewState.previewText != null}
-        <div class="diff-overlay">
+      {:else if showDiffView && visibleDiffBlocks.length === 0}
+        <div class="diff-overlay" data-testid="history-diff-identical">
           <div class="editor-content-wrap">
             <h1 class="doc-title">{activeDoc.title}</h1>
             <div class="diff-identical">
-              <p>this version is identical to the current document</p>
+              <p>this version matches the current live note</p>
             </div>
           </div>
         </div>
-      {:else if isHistoryReview && versionReviewState.previewLoading}
-        <div class="diff-overlay">
+      {:else if showSnapshotView}
+        <div class="diff-overlay" data-testid="history-snapshot-view">
           <div class="editor-content-wrap">
             <h1 class="doc-title">{activeDoc.title}</h1>
-            <p class="history-loading">loading version...</p>
+            <div class="snapshot-view">{@html textToEditorHtml(versionReviewState.previewText ?? '')}</div>
           </div>
         </div>
       {:else if isHistoryReview && versionReviewState.previewError}
-        <div class="diff-overlay">
+        <div class="diff-overlay" data-testid="history-error-view">
           <div class="editor-content-wrap">
             <h1 class="doc-title">{activeDoc.title}</h1>
             <p class="editor-error">{versionReviewState.previewError}</p>
+            <p class="history-loading">return to live or pick another version.</p>
           </div>
         </div>
       {/if}
 
       <!-- Editor (always mounted, never moves) -->
-      <div class="editor-content-wrap" class:editor-hidden={isHistoryReview}>
+      <div class="editor-content-wrap" class:editor-hidden={showHistoryOverlay}>
         <h1 class="doc-title" data-testid="editor-doc-title">{activeDoc.title}</h1>
         {#if editorSessionState.lastError && !isHistoryReview}
           <p class="editor-error">{editorSessionState.lastError}</p>
+        {/if}
+        {#if isHistoryReview && versionReviewState.previewLoading}
+          <p class="history-loading">loading version...</p>
         {/if}
         <div class="editor-mount" data-testid="editor-mount" bind:this={editorElement}></div>
       </div>
     </div>
 
     <div class="bottom-bar">
-      {#if isHistoryReview}
-        <span class="history-hint">viewing history · read only</span>
-      {:else}
-        <span class="md-hints">**bold  _italic_  # heading  - list  [] task  > quote  `code`</span>
+      {#if !isHistoryReview}
+        <span class="md-hints">**bold  _italic_  # heading  - list  - [ ] task  > quote  `code`</span>
       {/if}
       <span class="connection-status" data-testid="connection-status" data-state={syncState.connection} class:connected={syncState.connection === 'connected'} class:slow={syncState.connection === 'slow'} class:offline={syncState.connection === 'offline'} class:local={syncState.connection === 'local'}>{connectionLabel}</span>
     </div>
@@ -359,6 +392,39 @@
     margin-bottom: 0.8em;
   }
 
+  .editor-mount :global(.remote-selection) {
+    background: color-mix(in srgb, var(--remote-selection-color) 18%, transparent);
+    border-radius: 3px;
+  }
+
+  .editor-mount :global(.remote-caret) {
+    position: relative;
+    display: inline-block;
+    width: 2px;
+    height: 1.35em;
+    margin-left: -1px;
+    margin-right: -1px;
+    vertical-align: text-bottom;
+    background: var(--remote-caret-color);
+    pointer-events: none;
+  }
+
+  .editor-mount :global(.remote-caret-label) {
+    position: absolute;
+    top: -1.55em;
+    left: -1px;
+    transform: translateX(-8%);
+    background: var(--remote-caret-color);
+    color: white;
+    border-radius: 999px;
+    padding: 2px 6px;
+    font-size: 10px;
+    line-height: 1.2;
+    font-weight: 600;
+    white-space: nowrap;
+    box-shadow: 0 4px 12px rgb(15 23 42 / 0.18);
+  }
+
   /* ── Diff View ── */
 
   .diff-view {
@@ -371,6 +437,19 @@
     letter-spacing: 0.005em;
     color: var(--text-primary);
     min-height: 40vh;
+  }
+
+  .snapshot-view {
+    font-family: var(--font-body);
+    font-size: 16px;
+    line-height: 1.85;
+    letter-spacing: 0.005em;
+    color: var(--text-primary);
+    min-height: 40vh;
+  }
+
+  .snapshot-view :global(p) {
+    margin-bottom: 0.8em;
   }
 
   .diff-block {
@@ -447,12 +526,6 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-  }
-
-  .history-hint {
-    font-size: 11px;
-    font-style: italic;
-    color: var(--text-tertiary);
   }
 
   .connection-status {
