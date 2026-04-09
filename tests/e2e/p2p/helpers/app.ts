@@ -88,10 +88,28 @@ export async function createProject(name: AppInstanceName, projectName: string) 
   await input.setValue(projectName);
   await (await app(name).$('button[aria-label="create project"]')).click();
   await waitForProjectVisible(name, projectName);
+  await waitForProjectHydrated(name, projectName);
 }
 
 export async function waitForProjectVisible(name: AppInstanceName, projectName: string) {
   await (await app(name).$(projectOpenSelector(projectName))).waitForDisplayed({ timeout: 30_000 });
+}
+
+export async function waitForProjectHydrated(name: AppInstanceName, projectName: string) {
+  const groupSelector = `[data-testid="project-group-${projectName}"]`;
+  await (await app(name).$(groupSelector)).waitForDisplayed({ timeout: 30_000 });
+  await app(name).waitUntil(async () => {
+    const group = await app(name).$(groupSelector);
+    if (!(await group.isExisting())) {
+      return false;
+    }
+    const html = await group.getHTML(false);
+    return !html.includes('loading notes...');
+  }, {
+    timeout: 30_000,
+    interval: 100,
+    timeoutMsg: `${name} project ${projectName} never finished hydrating`,
+  });
 }
 
 export async function expectProjectNotVisible(name: AppInstanceName, projectName: string) {
@@ -104,9 +122,11 @@ export async function expectProjectNotVisible(name: AppInstanceName, projectName
 
 export async function openProject(name: AppInstanceName, projectName: string) {
   await (await app(name).$(projectOpenSelector(projectName))).click();
+  await waitForProjectHydrated(name, projectName);
 }
 
 export async function createNote(name: AppInstanceName, projectName: string, noteTitle: string) {
+  await waitForProjectHydrated(name, projectName);
   await (await app(name).$(projectAddNoteSelector(projectName))).click();
   const input = await app(name).$(selectors.noteTitleInput);
   await input.waitForDisplayed({ timeout: 10_000 });
