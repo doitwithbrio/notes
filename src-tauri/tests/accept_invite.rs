@@ -133,14 +133,27 @@ impl TestNode {
                 let _ = self.project_manager.open_doc(project, &file.id).await;
             }
         }
-        let _ = register_project_sync_objects(
-            &self.project_manager,
-            &self.sync_engine,
-            &self.endpoint.id(),
-            project,
-        )
-        .await
-        .unwrap();
+        for attempt in 0..5 {
+            match register_project_sync_objects(
+                &self.project_manager,
+                &self.sync_engine,
+                &self.endpoint.id(),
+                project,
+            )
+            .await
+            {
+                Ok(_) => return,
+                Err(notes_core::CoreError::Io(error))
+                    if error.kind() == std::io::ErrorKind::NotFound && attempt < 4 =>
+                {
+                    tokio::time::sleep(Duration::from_millis(100 * (attempt + 1) as u64)).await;
+                }
+                Err(error) => panic!(
+                    "register_project_sync failed for project {project} on attempt {}: {error:?}",
+                    attempt + 1
+                ),
+            }
+        }
     }
 
     async fn add_manual_todo(
