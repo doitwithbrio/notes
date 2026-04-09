@@ -3410,6 +3410,43 @@ async fn preload_startup_secrets(
     }
 }
 
+async fn init_endpoint_and_gossip(
+    secret_key: iroh::SecretKey,
+    startup_settings: notes_core::AppSettings,
+) -> anyhow::Result<(iroh::endpoint::Endpoint, iroh_gossip::net::Gossip)> {
+    let mut builder = Endpoint::builder(iroh::endpoint::presets::N0)
+        .secret_key(secret_key)
+        .address_lookup(iroh::address_lookup::MdnsAddressLookupBuilder::default());
+
+    // Apply custom relay servers from settings.
+    // This overrides the default N0 relay with user-configured relays,
+    // while keeping the N0 DNS address lookup for peer discovery.
+    if !startup_settings.custom_relays.is_empty() {
+        let mut relay_urls = Vec::new();
+        for url_str in &startup_settings.custom_relays {
+            match url_str.parse::<iroh::RelayUrl>() {
+                Ok(url) => {
+                    log::info!("Using custom relay: {url_str}");
+                    relay_urls.push(url);
+                }
+                Err(e) => {
+                    log::warn!("Invalid custom relay URL '{url_str}': {e}");
+                }
+            }
+        }
+        if !relay_urls.is_empty() {
+            builder = builder.relay_mode(iroh::RelayMode::custom(relay_urls));
+        }
+    }
+
+    let endpoint = builder
+        .bind()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to bind iroh endpoint: {e}"))?;
+    let gossip = iroh_gossip::net::Gossip::builder().spawn(endpoint.clone());
+    Ok((endpoint, gossip))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
@@ -3607,37 +3644,30 @@ pub fn run() {
                 notes_core::AppSettings::load(&notes_dir)
             );
 
-            let endpoint = tauri::async_runtime::block_on(async {
-                let mut builder = Endpoint::builder(iroh::endpoint::presets::N0)
-                    .secret_key(secret_key)
-                    .address_lookup(iroh::address_lookup::MdnsAddressLookupBuilder::default());
-
-                // Apply custom relay servers from settings.
-                // This overrides the default N0 relay with user-configured relays,
-                // while keeping the N0 DNS address lookup for peer discovery.
-                if !startup_settings.custom_relays.is_empty() {
-                    let mut relay_urls = Vec::new();
-                    for url_str in &startup_settings.custom_relays {
-                        match url_str.parse::<iroh::RelayUrl>() {
-                            Ok(url) => {
-                                log::info!("Using custom relay: {url_str}");
-                                relay_urls.push(url);
-                            }
-                            Err(e) => {
-                                log::warn!("Invalid custom relay URL '{url_str}': {e}");
-                            }
-                        }
-                    }
-                    if !relay_urls.is_empty() {
-                        builder = builder.relay_mode(iroh::RelayMode::custom(relay_urls));
-                    }
+            log::info!("Initializing iroh endpoint and gossip on Tauri async runtime");
+            let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+            let startup_secret_key = secret_key.clone();
+            let startup_settings = startup_settings.clone();
+            tauri::async_runtime::spawn(async move {
+                let result = init_endpoint_and_gossip(startup_secret_key, startup_settings).await;
+                let _ = startup_tx.send(result);
+            });
+            let (endpoint, gossip) = match startup_rx.blocking_recv() {
+                Ok(Ok((endpoint, gossip))) => {
+                    log::info!("iroh endpoint and gossip initialized");
+                    (endpoint, gossip)
                 }
-
-                builder
-                    .bind()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("failed to bind iroh endpoint: {e}"))
-            })?;
+                Ok(Err(err)) => {
+                    log::error!("Failed to initialize iroh endpoint and gossip: {err:#}");
+                    return Err(err.into());
+                }
+                Err(_) => {
+                    return Err(anyhow::anyhow!(
+                        "iroh startup task terminated before returning endpoint/gossip"
+                    )
+                    .into());
+                }
+            };
 
             let mut sync_engine = Arc::new(SyncEngine::new());
             Arc::get_mut(&mut sync_engine)
@@ -3646,7 +3676,6 @@ pub fn run() {
 
             log::info!("iroh endpoint bound, id: {}", endpoint.id());
 
-            let gossip = iroh_gossip::net::Gossip::builder().spawn(endpoint.clone());
             let presence_manager = Arc::new(PresenceManager::new(gossip.clone()));
 
             // Create the PeerManager for managing persistent connections
@@ -4052,6 +4081,19 @@ mod tests {
             queued.contains(&("project".to_string(), files[0].id))
                 || queued.contains(&("project".to_string(), files[1].id))
         );
+    }
+
+    #[tokio::test]
+    async fn init_endpoint_and_gossip_succeeds_on_tokio_runtime() {
+        let secret_key = iroh::SecretKey::from_bytes(&[7u8; 32]);
+        let startup_settings = notes_core::AppSettings::default();
+
+        let (endpoint, gossip) = init_endpoint_and_gossip(secret_key, startup_settings)
+            .await
+            .expect("iroh bootstrap should succeed on tokio runtime");
+
+        assert!(!endpoint.id().to_string().is_empty());
+        assert!(gossip.max_message_size() > 0);
     }
 
     #[test]
