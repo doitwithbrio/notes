@@ -70,6 +70,7 @@ jobs:
             build-essential \
             file \
             libwebkit2gtk-4.1-dev \
+            webkit2gtk-driver \
             libgtk-3-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
@@ -77,6 +78,11 @@ jobs:
             libssl-dev \
             libxdo-dev \
             xvfb
+
+      - name: Verify WebKitWebDriver
+        run: |
+          which WebKitWebDriver
+          WebKitWebDriver --version || true
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
