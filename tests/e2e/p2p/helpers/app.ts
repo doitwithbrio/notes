@@ -86,7 +86,7 @@ export async function createProject(name: AppInstanceName, projectName: string) 
   const input = await app(name).$(selectors.projectNameInput);
   await input.waitForDisplayed({ timeout: 10_000 });
   await input.setValue(projectName);
-  await app(name).keys('Enter');
+  await (await app(name).$('button[aria-label="create project"]')).click();
   await waitForProjectVisible(name, projectName);
 }
 
@@ -111,7 +111,7 @@ export async function createNote(name: AppInstanceName, projectName: string, not
   const input = await app(name).$(selectors.noteTitleInput);
   await input.waitForDisplayed({ timeout: 10_000 });
   await input.setValue(noteTitle);
-  await app(name).keys('Enter');
+  await (await app(name).$('button[aria-label="create note"]')).click();
   await waitForNoteVisible(name, noteTitle);
 }
 
