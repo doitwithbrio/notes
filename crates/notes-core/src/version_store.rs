@@ -264,6 +264,14 @@ impl VersionStore {
         Ok(())
     }
 
+    /// Remove all stored versions for a project.
+    pub fn delete_project(&self, project: &str) -> Result<(), CoreError> {
+        self.conn
+            .execute("DELETE FROM versions WHERE project = ?1", params![project])
+            .map_err(|e| CoreError::InvalidData(format!("version delete failed: {e}")))?;
+        Ok(())
+    }
+
     /// Get all versions for a document, ordered by sequence (most recent first).
     pub fn get_versions(&self, doc_id: &DocId) -> Result<Vec<Version>, CoreError> {
         let mut stmt = self

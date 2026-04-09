@@ -20,6 +20,8 @@ hkdf = "0.12"
 sha2 = "0.10"
 whoami = "1"
 getrandom = "0.3"
+zeroize = "1.8"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,18 +1,17 @@
-import { Editor } from '@tiptap/core';
-import StarterKit from '@tiptap/starter-kit';
-import Image from '@tiptap/extension-image';
-import Link from '@tiptap/extension-link';
-import CodeBlockLowlight from '@tiptap/extension-code-block-lowlight';
-import { Table, TableRow, TableCell, TableHeader } from '@tiptap/extension-table';
-import TaskList from '@tiptap/extension-task-list';
-import TaskItem from '@tiptap/extension-task-item';
-import Placeholder from '@tiptap/extension-placeholder';
-import Typography from '@tiptap/extension-typography';
-import Dropcursor from '@tiptap/extension-dropcursor';
-import Gapcursor from '@tiptap/extension-gapcursor';
-import { common, createLowlight } from 'lowlight';
+import * as Automerge from '@automerge/automerge';
 
-const lowlight = createLowlight(common);
+import type { CursorPosition } from '../types/index.js';
+import {
+  createAutomergeProsemirrorAdapter,
+  type AutomergeEditorAdapter,
+  type AutomergeEditorAdapterOptions,
+  type NotesEditor,
+  updateEditorRemotePresence,
+} from './automerge-prosemirror-adapter.js';
+import type { AdapterChange } from './automerge-prosemirror-adapter.js';
+import type { StoredNoteDoc } from './document-adapter.js';
+import type { EditorDocument } from './schema.js';
+import { getVisibleTextFromDocument } from './schema.js';
 
 function escapeHtml(value: string) {
   return value
@@ -29,87 +28,57 @@ export function textToEditorHtml(text: string) {
   return paragraphs.map((paragraph) => `<p>${escapeHtml(paragraph)}</p>`).join('');
 }
 
+export type Editor = NotesEditor;
+export type EditorAdapter = AutomergeEditorAdapter;
+
 export function editorToPlainText(editor: Editor) {
-  return editor.getText({ blockSeparator: '\n\n' });
+  return getVisibleTextFromDocument(editorToDocument(editor));
+}
+
+export function editorToDocument(editor: Editor): EditorDocument {
+  return {
+    schemaVersion: 2,
+    doc: editor.getJSON(),
+  };
+}
+
+export function createEditorAdapter(
+  element: HTMLElement,
+  options: AutomergeEditorAdapterOptions = {},
+) {
+  return createAutomergeProsemirrorAdapter(element, options);
 }
 
 export function createEditor(
   element: HTMLElement,
-  initialText: string,
-  onTextChange: (text: string) => void,
+  initialDocument: EditorDocument,
+  onDocumentChange: (document: EditorDocument, text: string) => void,
+  onSelectionChange?: (cursorPos: number | null, selection: [number, number] | null) => void,
+  onFocusChange?: (focused: boolean) => void,
 ): Editor {
-  let pendingFrame: number | null = null;
-
-  const flushTextChange = (editor: Editor) => {
-    pendingFrame = null;
-    onTextChange(editorToPlainText(editor));
-  };
-
-  const editor = new Editor({
-    element,
-    extensions: [
-      StarterKit.configure({
-        codeBlock: false,
-        dropcursor: false,
-        gapcursor: false,
-        link: false,
-        // Disable undo/redo — Automerge handles this
-        undoRedo: false,
-      }),
-      Image.configure({
-        inline: true,
-        allowBase64: false,
-      }),
-      Link.configure({
-        openOnClick: false,
-        autolink: true,
-        protocols: ['http', 'https', 'mailto'],
-      }),
-      CodeBlockLowlight.configure({
-        lowlight,
-      }),
-      Table.configure({
-        resizable: true,
-      }),
-      TableRow,
-      TableCell,
-      TableHeader,
-      TaskList,
-      TaskItem.configure({
-        nested: true,
-      }),
-      Placeholder.configure({
-        placeholder: 'begin writing...',
-      }),
-      Typography,
-      Dropcursor.configure({
-        color: 'var(--accent)',
-        width: 2,
-      }),
-      Gapcursor,
-    ],
-    content: textToEditorHtml(initialText),
-    editorProps: {
-      attributes: {
-        class: 'editor-content',
-      },
-    },
-    onUpdate: ({ editor, transaction }) => {
-      if (!transaction.docChanged) return;
-
-      if (pendingFrame !== null) {
-        cancelAnimationFrame(pendingFrame);
-      }
-
-      pendingFrame = requestAnimationFrame(() => flushTextChange(editor));
-    },
-    onDestroy: () => {
-      if (pendingFrame !== null) {
-        cancelAnimationFrame(pendingFrame);
-        flushTextChange(editor);
+  const adapter = createEditorAdapter(element, {
+    onChange: ({ source, document, text }: AdapterChange) => {
+      if (source === 'local') {
+        onDocumentChange(document, text);
       }
     },
+    onSelectionChange,
+    onFocusChange,
   });
 
+  const doc = Automerge.from<StoredNoteDoc>({
+    schemaVersion: 2,
+    doc: initialDocument.doc,
+    text: getVisibleTextFromDocument(initialDocument),
+  });
+  adapter.attach(doc, true);
+  const editor = adapter.getEditor();
+  if (!editor) {
+    throw new Error('Failed to create editor');
+  }
   return editor;
+}
+
+export function updateRemotePresence(editor: Editor, cursors: CursorPosition[]) {
+  updateEditorRemotePresence(editor, cursors);
 }

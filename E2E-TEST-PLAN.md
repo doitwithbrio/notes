@@ -34,7 +34,7 @@ Two test layers cover the full stack:
 
 ```
 tests/
-├── e2e/                             # Playwright — drives the real Tauri desktop app
+├── e2e/                             # WebdriverIO — drives the real Tauri desktop app
 │   ├── helpers/
 │   │   ├── app.ts                   # launch / teardown a Tauri process
 │   │   ├── peer.ts                  # spawn two-app peer setup (Alice + Bob)
@@ -62,7 +62,7 @@ tests/
     └── security_test.rs             # input validation, attack scenarios
 ```
 
-### Playwright layer
+### WebdriverIO layer
 
 - Drives the compiled Tauri binary directly (not a browser).
 - Multi-peer tests spawn **two separate Tauri processes** with different `--notes-dir` temp directories and different iroh identity keys. They connect via LocalSwarmDiscovery on loopback (no relay needed in CI).
@@ -80,25 +80,25 @@ tests/
 ## 2. CI Setup (GitHub Actions)
 
 ```yaml
-# .github/workflows/e2e.yml (sketch)
+# .github/workflows/ci.yml (sketch)
 jobs:
   rust-tests:
     runs-on: ubuntu-latest
     steps:
       - cargo test --workspace --all-features
 
-  playwright-tests:
+  webdriverio-tests:
     runs-on: ubuntu-latest
     steps:
       - cargo build --release               # build Tauri binary first
-      - npm ci
-      - xvfb-run npx playwright test        # headless via virtual display
+      - bun install --frozen-lockfile
+      - xvfb-run -a bun run e2e:p2p        # headless via virtual display
 ```
 
 Key CI constraints:
 - Linux runner with `xvfb` for headless Tauri/Electron webview.
 - Tests are hermetic: no external relay, no internet access needed. iroh LocalSwarmDiscovery works on loopback.
-- Playwright test timeout: 60s per test (sync / invite flows can be slow).
+- WebdriverIO test timeout: 60s per test (sync / invite flows can be slow).
 - Rust test timeout: 30s per test (compaction, large doc word-count are the slowest).
 - Two-process tests: each process gets a unique temp dir via `mktemp -d`; both processes are killed in `afterAll`.
 
@@ -145,7 +145,7 @@ These are bugs confirmed by reading the source code. Tests for these will fail o
 
 ## Suite 01 — Editor
 
-**Layer:** Playwright (E2E) + Vitest (frontend unit)
+**Layer:** WebdriverIO (E2E) + Vitest (frontend unit)
 **Scope:** TipTap initialization, CRDT change pipeline, editor session lifecycle, content sync, history review mode.
 
 ---
@@ -356,7 +356,7 @@ expect(editorToPlainText(editor)).toBe(original)
 
 ## Suite 02 — CRDT Correctness
 
-**Layer:** Rust integration tests + Playwright (two-process)
+**Layer:** Rust integration tests + WebdriverIO (two-process)
 **Scope:** Automerge convergence, concurrent edits, manifest CRDT, compaction, schema versioning.
 
 ---
@@ -744,7 +744,7 @@ assert!(path.is_ok());
 
 ## Suite 04 — Invite Flow (SPAKE2)
 
-**Layer:** Rust integration tests + Playwright (two-process for full flow)
+**Layer:** Rust integration tests + WebdriverIO (two-process for full flow)
 **Scope:** SPAKE2 correctness, TTL, rate limiting, payload security, role integrity.
 
 ---
@@ -933,7 +933,7 @@ normalizePassphrase("   ") → "" (empty, blocked by guard)
 
 ## Suite 05 — Permissions
 
-**Layer:** Rust integration tests + Playwright (two-process for enforcement)
+**Layer:** Rust integration tests + WebdriverIO (two-process for enforcement)
 **Scope:** `check_role`, manifest ACL, viewer isolation, ACL initialization.
 
 ---
@@ -1320,7 +1320,7 @@ assert!(!path.to_str().unwrap().contains(".."));
 
 ## Suite 07 — Offline / Reconnect
 
-**Layer:** Playwright (two-process) + Rust integration tests
+**Layer:** WebdriverIO (two-process) + Rust integration tests
 **Scope:** Offline edits accumulation, sync recovery, unseen changes, graceful shutdown.
 
 ---
@@ -1432,7 +1432,7 @@ After Alice opens it: `mark_doc_seen` called. Indicator clears.
 
 ## Suite 08 — Presence Indicators
 
-**Layer:** Playwright (two-process) + frontend unit tests
+**Layer:** WebdriverIO (two-process) + frontend unit tests
 **Scope:** Sync status dots, cursor presence, file tree indicators, gossip.
 
 ---
@@ -1550,7 +1550,7 @@ After Alice opens it: `mark_doc_seen` called. Indicator clears.
 
 ## Suite 09 — Version History
 
-**Layer:** Rust integration tests + Playwright
+**Layer:** Rust integration tests + WebdriverIO
 **Scope:** Auto-versioning, named versions, significance thresholds, restore, navigation, migration.
 
 ---
@@ -1967,7 +1967,7 @@ assert_eq!(results.len(), 1);
 
 ## Suite 12 — Large Document Degradation
 
-**Layer:** Rust (backend) + Playwright (frontend integration)
+**Layer:** Rust (backend) + WebdriverIO (frontend integration)
 **Scope:** Degradation thresholds, frontend behavior at each level.
 
 ---
@@ -2031,7 +2031,7 @@ assert_eq!(get_degradation(&text_5000, &settings), DegradationLevel::Warning);
 
 **Why:** The backend returns the correct level, but the frontend's TipTap editor is configured once at initialization with a static extension list. There is no code that disables `CollaborationCursor` at 15k words, or shows the warning banner at 10k words.
 
-**Test (Playwright):**
+**Test (WebdriverIO):**
 1. Open a doc. Verify all extensions active.
 2. Backend returns `DegradationLevel::Warning`.
 3. Assert warning banner is visible in the editor.
@@ -2056,7 +2056,7 @@ assert_eq!(get_degradation(&text_5000, &settings), DegradationLevel::Warning);
 
 **Why:** `get_doc_degradation` is never called automatically after edits. The check must be explicitly triggered from the editor component, which it currently isn't.
 
-**Test (Playwright):** Add words until crossing the 10k threshold. Assert warning banner appears automatically.
+**Test (WebdriverIO):** Add words until crossing the 10k threshold. Assert warning banner appears automatically.
 
 **Expected (current behavior):** Banner never appears automatically (no auto-check on edit).
 **Expected (after fix):** Banner appears after word count crosses threshold.
@@ -2065,7 +2065,7 @@ assert_eq!(get_degradation(&text_5000, &settings), DegradationLevel::Warning);
 
 ## Suite 13 — UI / App Shell
 
-**Layer:** Playwright
+**Layer:** WebdriverIO
 **Scope:** App boot, theme, settings, quick-open, drag-and-drop, update system.
 
 ---
@@ -2402,13 +2402,13 @@ match rx.recv().await {
 
 ## Appendix: Test Helpers Needed
 
-### `helpers/app.ts` (Playwright)
+### `helpers/app.ts` (WebdriverIO)
 ```typescript
 export async function launchApp(opts?: { notesDir?: string }): Promise<Page>
 export async function teardownApp(page: Page): Promise<void>
 ```
 
-### `helpers/peer.ts` (Playwright)
+### `helpers/peer.ts` (WebdriverIO)
 ```typescript
 export async function launchTwoPeers(): Promise<{ alice: Page; bob: Page }>
 export async function teardownTwoPeers(alice: Page, bob: Page): Promise<void>
@@ -2417,7 +2417,7 @@ export async function disconnectPeers(alice: Page, bob: Page): Promise<void>
 export async function reconnectPeers(alice: Page, bob: Page): Promise<void>
 ```
 
-### `helpers/fixtures.ts` (Playwright)
+### `helpers/fixtures.ts` (WebdriverIO)
 ```typescript
 export async function createProject(page: Page, name: string): Promise<string>
 export async function createNote(page: Page, project: string, path: string): Promise<string>

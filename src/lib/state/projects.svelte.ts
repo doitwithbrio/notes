@@ -30,7 +30,19 @@ export async function loadProjects() {
   projectState.loading = true;
   try {
     const projects = await tauriApi.listProjectSummaries();
-    projectState.projects = applyProjectOrder(projects.map(mapProject));
+    const mappedProjects = projects.map(mapProject);
+    projectState.projects = applyProjectOrder(
+      mappedProjects.filter((project) => project.accessState !== 'identity-mismatch'),
+    );
+
+    const revokedProjects = mappedProjects.filter((project) => project.accessState === 'identity-mismatch');
+    if (revokedProjects.length > 0) {
+      const eviction = await import('./project-eviction.svelte.js');
+      for (const project of revokedProjects) {
+        await tauriApi.purgeProjectLocalData(project.id, 'access-revoked').catch(() => undefined);
+        await eviction.evictProject(project.id, 'access-revoked', project.name);
+      }
+    }
   } finally {
     projectState.loading = false;
   }

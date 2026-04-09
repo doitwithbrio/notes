@@ -4,6 +4,7 @@ export const selectors = {
   editorLoading: '[data-testid="editor-loading"]',
   editorPane: '[data-testid="editor-pane"]',
   editorMount: '[data-testid="editor-mount"] .editor-content',
+  blobImageNode: '[data-testid="blob-image-node"]',
   editorDocTitle: '[data-testid="editor-doc-title"]',
   connectionStatus: '[data-testid="connection-status"]',
   sidebar: '[data-testid="sidebar"]',

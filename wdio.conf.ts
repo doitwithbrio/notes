@@ -2,6 +2,7 @@ import { bundleFailureArtifacts } from './tests/e2e/p2p/helpers/diagnostics.js';
 import { isSupportedDesktopE2EPlatform, resolveTauriAppPath } from './tests/e2e/p2p/helpers/runtime.js';
 
 const appPath = resolveTauriAppPath();
+const serviceAppPath = process.cwd();
 
 function tauriCapability() {
   return {
@@ -15,6 +16,20 @@ function tauriCapability() {
       captureFrontendLogs: true,
       backendLogLevel: 'info',
       frontendLogLevel: 'info',
+    },
+  };
+}
+
+function tauriMultiremoteCapability() {
+  const capability = tauriCapability();
+  return {
+    ...capability,
+    capabilities: {
+      ...capability,
+      'tauri:options': {
+        application: serviceAppPath,
+        args: [],
+      },
     },
   };
 }
@@ -39,9 +54,9 @@ export const config = {
     },
   ]],
   capabilities: {
-    owner: tauriCapability(),
-    editor: tauriCapability(),
-    viewer: tauriCapability(),
+    owner: tauriMultiremoteCapability(),
+    editor: tauriMultiremoteCapability(),
+    viewer: tauriMultiremoteCapability(),
   },
   before() {
     if (!isSupportedDesktopE2EPlatform()) {

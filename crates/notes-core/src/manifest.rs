@@ -1,5 +1,6 @@
 use automerge::{transaction::Transactable, AutoCommit, ObjType, ReadDoc};
 use chrono::Utc;
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 use crate::error::CoreError;
@@ -24,6 +25,25 @@ pub struct ProjectManifest {
     doc: AutoCommit,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnerControlledPeerSnapshot {
+    role: Option<String>,
+    alias: Option<String>,
+    since: Option<String>,
+    actor_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnerControlledSnapshot {
+    owner: Option<String>,
+    owner_alias: Option<String>,
+    owner_actor_id: Option<String>,
+    key_epoch: Option<u64>,
+    sharing_group: Option<String>,
+    peers: BTreeMap<String, OwnerControlledPeerSnapshot>,
+    epoch_keys: BTreeMap<String, String>,
+}
+
 impl ProjectManifest {
     /// Create a new project manifest.
     pub fn new(name: &str) -> Result<Self, CoreError> {
@@ -40,6 +60,8 @@ impl ProjectManifest {
         // _ownerControlled section (for shared projects)
         let owner_section = doc.put_object(automerge::ROOT, "_ownerControlled", ObjType::Map)?;
         doc.put(&owner_section, "owner", "")?; // Set when sharing is enabled
+        doc.put(&owner_section, "ownerAlias", "")?;
+        doc.put(&owner_section, "ownerActorId", "")?;
         doc.put_object(&owner_section, "peers", ObjType::Map)?;
         doc.put(&owner_section, "keyEpoch", 0_u64)?;
         doc.put_object(&owner_section, "epochKeys", ObjType::Map)?;
@@ -487,6 +509,38 @@ impl ProjectManifest {
             .ok_or_else(|| CoreError::InvalidData("manifest missing owner".into()))
     }
 
+    /// Set the project owner alias.
+    pub fn set_owner_alias(&mut self, alias: &str) -> Result<(), CoreError> {
+        let section = self.owner_section_id()?;
+        self.doc.put(&section, "ownerAlias", alias)?;
+        Ok(())
+    }
+
+    pub fn set_owner_actor_id(&mut self, actor_id: &str) -> Result<(), CoreError> {
+        let section = self.owner_section_id()?;
+        self.doc.put(&section, "ownerActorId", actor_id)?;
+        Ok(())
+    }
+
+    pub fn get_owner_actor_id(&self) -> Result<Option<String>, CoreError> {
+        let section = self.owner_section_id()?;
+        Ok(self
+            .doc
+            .get(&section, "ownerActorId")?
+            .and_then(|(v, _)| value_to_string(v))
+            .filter(|value| !value.trim().is_empty()))
+    }
+
+    /// Get the project owner alias if known.
+    pub fn get_owner_alias(&self) -> Result<Option<String>, CoreError> {
+        let section = self.owner_section_id()?;
+        Ok(self
+            .doc
+            .get(&section, "ownerAlias")?
+            .and_then(|(v, _)| value_to_string(v))
+            .filter(|alias| !alias.trim().is_empty()))
+    }
+
     /// Add a peer to the project.
     pub fn add_peer(&mut self, peer_id: &str, role: &str, alias: &str) -> Result<(), CoreError> {
         let section = self.owner_section_id()?;
@@ -529,6 +583,13 @@ impl ProjectManifest {
         let mut aliases = std::collections::HashMap::new();
 
         let section = self.owner_section_id()?;
+        if let Some(owner_actor_id) = self.get_owner_actor_id()? {
+            let alias = self
+                .get_owner_alias()?
+                .or_else(|| self.get_owner().ok().filter(|owner| !owner.is_empty()))
+                .unwrap_or_else(|| "Owner".to_string());
+            aliases.insert(owner_actor_id, alias);
+        }
         let peers_result = self.doc.get(&section, "peers")?;
         let (_, peers_id) = match peers_result {
             Some(v) => v,
@@ -642,6 +703,60 @@ impl ProjectManifest {
             .ok_or_else(|| CoreError::InvalidData("manifest missing keyEpoch".into()))
     }
 
+    pub fn set_wrapped_epoch_key(
+        &mut self,
+        peer_id: &str,
+        wrapped_key: &str,
+    ) -> Result<(), CoreError> {
+        let section = self.owner_section_id()?;
+        let (_, epoch_keys_id) = self
+            .doc
+            .get(&section, "epochKeys")?
+            .ok_or_else(|| CoreError::InvalidData("manifest missing epochKeys map".into()))?;
+        self.doc.put(&epoch_keys_id, peer_id, wrapped_key)?;
+        Ok(())
+    }
+
+    pub fn get_wrapped_epoch_key(&self, peer_id: &str) -> Result<Option<String>, CoreError> {
+        let section = self.owner_section_id()?;
+        let (_, epoch_keys_id) = self
+            .doc
+            .get(&section, "epochKeys")?
+            .ok_or_else(|| CoreError::InvalidData("manifest missing epochKeys map".into()))?;
+        Ok(self
+            .doc
+            .get(&epoch_keys_id, peer_id)?
+            .and_then(|(value, _)| value_to_string(value))
+            .filter(|value| !value.is_empty()))
+    }
+
+    pub fn remove_wrapped_epoch_key(&mut self, peer_id: &str) -> Result<(), CoreError> {
+        let section = self.owner_section_id()?;
+        let (_, epoch_keys_id) = self
+            .doc
+            .get(&section, "epochKeys")?
+            .ok_or_else(|| CoreError::InvalidData("manifest missing epochKeys map".into()))?;
+        self.doc.delete(&epoch_keys_id, peer_id)?;
+        Ok(())
+    }
+
+    pub fn list_wrapped_epoch_keys(&self) -> Result<BTreeMap<String, String>, CoreError> {
+        let section = self.owner_section_id()?;
+        let (_, epoch_keys_id) = self
+            .doc
+            .get(&section, "epochKeys")?
+            .ok_or_else(|| CoreError::InvalidData("manifest missing epochKeys map".into()))?;
+        let mut result = BTreeMap::new();
+        for peer_id in self.doc.keys(&epoch_keys_id) {
+            if let Some((value, _)) = self.doc.get(&epoch_keys_id, peer_id.as_str())? {
+                if let Some(wrapped) = value_to_string(value).filter(|value| !value.is_empty()) {
+                    result.insert(peer_id, wrapped);
+                }
+            }
+        }
+        Ok(result)
+    }
+
     // ── Accessors ────────────────────────────────────────────────────
 
     /// Get a reference to the underlying Automerge document.
@@ -676,40 +791,10 @@ impl ProjectManifest {
             return Ok(());
         }
 
-        // Get the _ownerControlled object ID
-        let owner_section_id = self.owner_section_id()?;
+        let before_snapshot = self.owner_controlled_snapshot(Some(before_heads))?;
+        let after_snapshot = self.owner_controlled_snapshot(None)?;
 
-        // For each new change, check if it touches the _ownerControlled subtree.
-        // We do this by checking if any operation in the change targets the
-        // _ownerControlled object or any of its descendants.
-        //
-        // A simpler heuristic: compare _ownerControlled state at before_heads
-        // vs current heads. If it changed, verify ALL new changes are from the owner.
-        let owner_before = self
-            .doc
-            .get_at(&owner_section_id, "owner", before_heads)?
-            .and_then(|(v, _)| value_to_string(v));
-        let owner_after = self
-            .doc
-            .get(&owner_section_id, "owner")?
-            .and_then(|(v, _)| value_to_string(v));
-
-        let epoch_before = self
-            .doc
-            .get_at(&owner_section_id, "keyEpoch", before_heads)?
-            .and_then(|(v, _)| v.to_u64());
-        let epoch_after = self
-            .doc
-            .get(&owner_section_id, "keyEpoch")?
-            .and_then(|(v, _)| v.to_u64());
-
-        // Check if _ownerControlled fields changed
-        let owner_changed = owner_before != owner_after;
-        let epoch_changed = epoch_before != epoch_after;
-        // Note: peers map changes are harder to detect generically.
-        // For now, check the two most critical fields.
-
-        if owner_changed || epoch_changed {
+        if before_snapshot != after_snapshot {
             // Verify all new changes are from the owner actor
             for change in &changes {
                 let actor = change.actor_id().to_hex_string();
@@ -727,6 +812,127 @@ impl ProjectManifest {
         }
 
         Ok(())
+    }
+
+    fn owner_controlled_snapshot(
+        &self,
+        heads: Option<&[automerge::ChangeHash]>,
+    ) -> Result<OwnerControlledSnapshot, CoreError> {
+        let section = self.owner_section_id()?;
+        let peers = self.owner_controlled_peers_snapshot(&section, heads)?;
+        let epoch_keys = self.owner_controlled_epoch_keys_snapshot(&section, heads)?;
+        let sharing_group = self
+            .owner_controlled_map_id(&section, "sharing", heads)?
+            .map(|sharing_id| self.owner_controlled_string(&sharing_id, "group", heads))
+            .transpose()?
+            .flatten();
+
+        Ok(OwnerControlledSnapshot {
+            owner: self.owner_controlled_string(&section, "owner", heads)?,
+            owner_alias: self.owner_controlled_string(&section, "ownerAlias", heads)?,
+            owner_actor_id: self.owner_controlled_string(&section, "ownerActorId", heads)?,
+            key_epoch: self.owner_controlled_u64(&section, "keyEpoch", heads)?,
+            sharing_group,
+            peers,
+            epoch_keys,
+        })
+    }
+
+    fn owner_controlled_peers_snapshot(
+        &self,
+        section: &automerge::ObjId,
+        heads: Option<&[automerge::ChangeHash]>,
+    ) -> Result<BTreeMap<String, OwnerControlledPeerSnapshot>, CoreError> {
+        let Some(peers_id) = self.owner_controlled_map_id(section, "peers", heads)? else {
+            return Ok(BTreeMap::new());
+        };
+        let keys: Vec<String> = match heads {
+            Some(heads) => self.doc.keys_at(&peers_id, heads).collect(),
+            None => self.doc.keys(&peers_id).collect(),
+        };
+        let mut peers = BTreeMap::new();
+        for peer_id in keys {
+            let Some(entry_id) =
+                self.owner_controlled_map_id(&peers_id, peer_id.as_str(), heads)?
+            else {
+                continue;
+            };
+            peers.insert(
+                peer_id,
+                OwnerControlledPeerSnapshot {
+                    role: self.owner_controlled_string(&entry_id, "role", heads)?,
+                    alias: self.owner_controlled_string(&entry_id, "alias", heads)?,
+                    since: self.owner_controlled_string(&entry_id, "since", heads)?,
+                    actor_id: self.owner_controlled_string(&entry_id, "actorId", heads)?,
+                },
+            );
+        }
+        Ok(peers)
+    }
+
+    fn owner_controlled_epoch_keys_snapshot(
+        &self,
+        section: &automerge::ObjId,
+        heads: Option<&[automerge::ChangeHash]>,
+    ) -> Result<BTreeMap<String, String>, CoreError> {
+        let Some(epoch_keys_id) = self.owner_controlled_map_id(section, "epochKeys", heads)? else {
+            return Ok(BTreeMap::new());
+        };
+        let keys: Vec<String> = match heads {
+            Some(heads) => self.doc.keys_at(&epoch_keys_id, heads).collect(),
+            None => self.doc.keys(&epoch_keys_id).collect(),
+        };
+        let mut epoch_keys = BTreeMap::new();
+        for peer_id in keys {
+            if let Some(value) =
+                self.owner_controlled_string(&epoch_keys_id, peer_id.as_str(), heads)?
+            {
+                epoch_keys.insert(peer_id, value);
+            }
+        }
+        Ok(epoch_keys)
+    }
+
+    fn owner_controlled_string(
+        &self,
+        obj: &automerge::ObjId,
+        prop: &str,
+        heads: Option<&[automerge::ChangeHash]>,
+    ) -> Result<Option<String>, CoreError> {
+        let value = match heads {
+            Some(heads) => self.doc.get_at(obj, prop, heads)?,
+            None => self.doc.get(obj, prop)?,
+        };
+        Ok(value.and_then(|(value, _)| value_to_string(value)))
+    }
+
+    fn owner_controlled_u64(
+        &self,
+        obj: &automerge::ObjId,
+        prop: &str,
+        heads: Option<&[automerge::ChangeHash]>,
+    ) -> Result<Option<u64>, CoreError> {
+        let value = match heads {
+            Some(heads) => self.doc.get_at(obj, prop, heads)?,
+            None => self.doc.get(obj, prop)?,
+        };
+        Ok(value.and_then(|(value, _)| value.to_u64()))
+    }
+
+    fn owner_controlled_map_id(
+        &self,
+        obj: &automerge::ObjId,
+        prop: &str,
+        heads: Option<&[automerge::ChangeHash]>,
+    ) -> Result<Option<automerge::ObjId>, CoreError> {
+        let value = match heads {
+            Some(heads) => self.doc.get_at(obj, prop, heads)?,
+            None => self.doc.get(obj, prop)?,
+        };
+        Ok(value.and_then(|(value, id)| match value {
+            automerge::Value::Object(ObjType::Map) => Some(id),
+            _ => None,
+        }))
     }
 }
 
@@ -790,6 +996,39 @@ mod tests {
     }
 
     #[test]
+    fn test_todo_roundtrip_persists_text_and_done_state() {
+        let mut manifest = ProjectManifest::new("test-project").unwrap();
+        let todo_id = manifest
+            .add_todo("Buy milk", "peer-1", Some("doc-1"))
+            .unwrap();
+        manifest.toggle_todo(&todo_id.to_string()).unwrap();
+        manifest
+            .update_todo_text(&todo_id.to_string(), "Buy oat milk")
+            .unwrap();
+
+        let data = manifest.save();
+        let loaded = ProjectManifest::load(&data).unwrap();
+        let todos = loaded.list_todos().unwrap();
+
+        assert_eq!(todos.len(), 1);
+        assert_eq!(todos[0].id.to_string(), todo_id.to_string());
+        assert_eq!(todos[0].text, "Buy oat milk");
+        assert!(todos[0].done);
+        assert_eq!(todos[0].linked_doc_id.as_deref(), Some("doc-1"));
+    }
+
+    #[test]
+    fn test_remove_todo_persists_after_reload() {
+        let mut manifest = ProjectManifest::new("test-project").unwrap();
+        let todo_id = manifest.add_todo("Buy milk", "peer-1", None).unwrap();
+        manifest.remove_todo(&todo_id.to_string()).unwrap();
+
+        let data = manifest.save();
+        let loaded = ProjectManifest::load(&data).unwrap();
+        assert!(loaded.list_todos().unwrap().is_empty());
+    }
+
+    #[test]
     fn test_validate_owner_controlled_no_changes() {
         let mut manifest = ProjectManifest::new("test").unwrap();
         manifest.set_owner("owner-node-id").unwrap();
@@ -798,5 +1037,47 @@ mod tests {
         assert!(manifest
             .validate_owner_controlled_changes(&heads, "owner-actor-hex")
             .is_ok());
+    }
+
+    #[test]
+    fn test_wrapped_epoch_key_roundtrip() {
+        let mut manifest = ProjectManifest::new("shared").unwrap();
+        manifest
+            .set_wrapped_epoch_key("peer-a", "deadbeef")
+            .unwrap();
+        manifest
+            .set_wrapped_epoch_key("peer-b", "cafebabe")
+            .unwrap();
+
+        assert_eq!(
+            manifest.get_wrapped_epoch_key("peer-a").unwrap().as_deref(),
+            Some("deadbeef")
+        );
+        assert_eq!(
+            manifest.list_wrapped_epoch_keys().unwrap().get("peer-b"),
+            Some(&"cafebabe".to_string())
+        );
+
+        manifest.remove_wrapped_epoch_key("peer-a").unwrap();
+        assert!(manifest.get_wrapped_epoch_key("peer-a").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_validate_owner_controlled_rejects_peer_map_change_from_non_owner() {
+        let mut manifest = ProjectManifest::new("shared").unwrap();
+        manifest.set_owner("owner-node-id").unwrap();
+        let heads = manifest.doc.get_heads().to_vec();
+
+        manifest
+            .doc_mut()
+            .set_actor(automerge::ActorId::from([7_u8; 32]));
+        manifest.add_peer("peer-a", "editor", "Alice").unwrap();
+
+        let err = manifest
+            .validate_owner_controlled_changes(&heads, "not-owner-actor")
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unauthorized modification of owner-controlled fields"));
     }
 }

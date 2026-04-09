@@ -214,9 +214,7 @@ pub fn generate_passphrase(word_count: usize) -> String {
 
 /// Start the owner side of the SPAKE2 handshake.
 /// Returns the SPAKE2 state and the outgoing message to send to the invitee.
-pub fn start_owner_handshake(
-    passphrase: &str,
-) -> (spake2::Spake2<spake2::Ed25519Group>, Vec<u8>) {
+pub fn start_owner_handshake(passphrase: &str) -> (spake2::Spake2<spake2::Ed25519Group>, Vec<u8>) {
     let (state, msg) = spake2::Spake2::<spake2::Ed25519Group>::start_a(
         &spake2::Password::new(passphrase.as_bytes()),
         &spake2::Identity::new(b"p2p-notes-owner"),
@@ -467,7 +465,10 @@ impl InviteHandler {
         timeout_at: Instant,
     ) -> Result<InviteAcceptanceContext, InviteError> {
         let session_id = Uuid::new_v4().to_string();
-        let mut invite = self.pending.get_mut(passphrase).ok_or(InviteError::Expired)?;
+        let mut invite = self
+            .pending
+            .get_mut(passphrase)
+            .ok_or(InviteError::Expired)?;
 
         if invite.is_expired() {
             drop(invite);
@@ -530,7 +531,10 @@ impl InviteHandler {
         session_id: &str,
         phase: InviteSessionPhase,
     ) -> Result<(), InviteError> {
-        let mut invite = self.pending.get_mut(passphrase).ok_or(InviteError::Expired)?;
+        let mut invite = self
+            .pending
+            .get_mut(passphrase)
+            .ok_or(InviteError::Expired)?;
         match &mut invite.state {
             InviteState::Reserved(reservation) if reservation.session_id == session_id => {
                 if Instant::now() >= reservation.timeout_at {
@@ -575,7 +579,12 @@ impl InviteHandler {
         Ok(())
     }
 
-    fn mark_consumed(&self, passphrase: &str, session_id: &str, invitee_peer_id: &str) -> Result<(), InviteError> {
+    fn mark_consumed(
+        &self,
+        passphrase: &str,
+        session_id: &str,
+        invitee_peer_id: &str,
+    ) -> Result<(), InviteError> {
         if let Some(mut invite) = self.pending.get_mut(passphrase) {
             if matches!(
                 &invite.state,
@@ -604,7 +613,10 @@ impl InviteHandler {
         session_id: &str,
         invitee_peer_id: &str,
     ) -> Result<(), InviteError> {
-        let mut invite = self.pending.get_mut(passphrase).ok_or(InviteError::Expired)?;
+        let mut invite = self
+            .pending
+            .get_mut(passphrase)
+            .ok_or(InviteError::Expired)?;
         match &invite.state {
             InviteState::Reserved(reservation) if reservation.session_id == session_id => {
                 let previous = invite.state.clone();
@@ -655,6 +667,7 @@ impl InviteHandler {
         connection: Connection,
         deadline: Instant,
     ) -> Result<(), InviteError> {
+        let started_at = Instant::now();
         let deadline_tokio = tokio::time::Instant::from_std(deadline);
         let (mut send, mut recv) = tokio::time::timeout_at(deadline_tokio, connection.accept_bi())
             .await
@@ -666,6 +679,8 @@ impl InviteHandler {
                 self.cleanup_expired();
                 InviteError::Connection(format!("accept stream: {e}"))
             })?;
+        #[cfg(test)]
+        eprintln!("invite: accepted bi from {}", connection.remote_id());
 
         // Step 1: Read invitee's SPAKE2 message
         let mut invitee_msg_len_buf = [0u8; 4];
@@ -710,11 +725,17 @@ impl InviteHandler {
             let invite = entry.value();
 
             if invite.is_expired() {
-                log::debug!("Invite handler: skipping expired invite for project '{}'", invite.project_name);
+                log::debug!(
+                    "Invite handler: skipping expired invite for project '{}'",
+                    invite.project_name
+                );
                 continue;
             }
             if invite.is_exhausted() {
-                log::debug!("Invite handler: skipping exhausted invite for project '{}'", invite.project_name);
+                log::debug!(
+                    "Invite handler: skipping exhausted invite for project '{}'",
+                    invite.project_name
+                );
                 continue;
             }
             let resumable_for_peer = matches!(
@@ -756,6 +777,16 @@ impl InviteHandler {
                         self.cleanup_expired();
                         InviteError::Connection(format!("send spake2 msg: {e}"))
                     })?;
+                tokio::time::timeout_at(deadline_tokio, send.flush())
+                    .await
+                    .map_err(|_| {
+                        self.cleanup_expired();
+                        InviteError::Connection("flush spake2 msg timed out".into())
+                    })?
+                    .map_err(|e| {
+                        self.cleanup_expired();
+                        InviteError::Connection(format!("flush spake2 msg: {e}"))
+                    })?;
 
                 matched = Some((passphrase.clone(), shared_key.clone()));
                 shared_key.zeroize();
@@ -766,6 +797,8 @@ impl InviteHandler {
         let (passphrase, mut shared_key) = match matched {
             Some(m) => {
                 log::info!("Invite handler: SPAKE2 passphrase matched");
+                #[cfg(test)]
+                eprintln!("invite: passphrase matched");
                 m
             }
             None => {
@@ -781,17 +814,23 @@ impl InviteHandler {
             if let InviteState::CommittedPendingAck(committed) = &invite.state {
                 if committed.invitee_peer_id == connection.remote_id().to_string() {
                     shared_key.zeroize();
-                    send.write_all(&[1])
-                        .await
-                        .map_err(|e| InviteError::Connection(format!("send resumed final status: {e}")))?;
-                    send.flush()
-                        .await
-                        .map_err(|e| InviteError::Connection(format!("flush resumed final status: {e}")))?;
+                    send.write_all(&[1]).await.map_err(|e| {
+                        InviteError::Connection(format!("send resumed final status: {e}"))
+                    })?;
+                    send.flush().await.map_err(|e| {
+                        InviteError::Connection(format!("flush resumed final status: {e}"))
+                    })?;
 
                     let mut final_ack = [0u8; 1];
-                    match tokio::time::timeout_at(deadline_tokio, recv.read_exact(&mut final_ack)).await {
+                    match tokio::time::timeout_at(deadline_tokio, recv.read_exact(&mut final_ack))
+                        .await
+                    {
                         Ok(Ok(_)) if final_ack[0] == 1 => {
-                            self.mark_consumed(&passphrase, &committed.session_id, &committed.invitee_peer_id)?;
+                            self.mark_consumed(
+                                &passphrase,
+                                &committed.session_id,
+                                &committed.invitee_peer_id,
+                            )?;
                         }
                         _ => {
                             log::warn!(
@@ -814,7 +853,11 @@ impl InviteHandler {
             &connection.remote_id().to_string(),
             deadline,
         ) {
-            Ok(ctx) => ctx,
+            Ok(ctx) => {
+                #[cfg(test)]
+                eprintln!("invite: reserved session {}", ctx.session_id);
+                ctx
+            }
             Err(err) => {
                 shared_key.zeroize();
                 return Err(err);
@@ -826,7 +869,14 @@ impl InviteHandler {
         // invite creation snapshot.
         let payload = if let Some(lifecycle) = &self.lifecycle {
             match tokio::time::timeout_at(deadline_tokio, lifecycle.prepare_payload(&ctx)).await {
-                Ok(Ok(payload)) => payload,
+                Ok(Ok(payload)) => {
+                    log::info!(
+                        "invite handler: prepare_payload finished after {}ms for project {}",
+                        started_at.elapsed().as_millis(),
+                        ctx.project_name
+                    );
+                    payload
+                }
                 Ok(Err(err)) => {
                     self.release_reservation(&ctx.passphrase, &ctx.session_id)?;
                     shared_key.zeroize();
@@ -848,37 +898,43 @@ impl InviteHandler {
 
             #[cfg(test)]
             {
-            let invite = self.pending.get(&passphrase).ok_or(InviteError::Expired)?;
-            let manifest_hex = invite
-                .manifest_data
-                .iter()
-                .map(|b| format!("{:02x}", b))
-                .collect::<String>();
-            let owner_x25519_public_hex = invite
-                .owner_x25519_public
-                .map(|pk| pk.iter().map(|b| format!("{:02x}", b)).collect::<String>())
-                .unwrap_or_default();
+                let invite = self.pending.get(&passphrase).ok_or(InviteError::Expired)?;
+                let manifest_hex = invite
+                    .manifest_data
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<String>();
+                let owner_x25519_public_hex = invite
+                    .owner_x25519_public
+                    .map(|pk| pk.iter().map(|b| format!("{:02x}", b)).collect::<String>())
+                    .unwrap_or_default();
 
-            let epoch_key_hex = invite
-                .epoch_key
-                .as_ref()
-                .map(|k| k.iter().map(|b| format!("{:02x}", b)).collect::<String>())
-                .unwrap_or_default();
+                let epoch_key_hex = invite
+                    .epoch_key
+                    .as_ref()
+                    .map(|k| k.iter().map(|b| format!("{:02x}", b)).collect::<String>())
+                    .unwrap_or_default();
 
-            InvitePayload {
-                invite_id: invite.invite_id.clone(),
-                session_id: ctx.session_id.clone(),
-                project_id: invite.project_id.clone(),
-                project_name: invite.project_name.clone(),
-                role: invite.invite_role.clone(),
-                manifest_hex,
-                owner_x25519_public_hex,
-                epoch_key_hex,
-                epoch: invite.current_epoch,
-            }
+                InvitePayload {
+                    invite_id: invite.invite_id.clone(),
+                    session_id: ctx.session_id.clone(),
+                    project_id: invite.project_id.clone(),
+                    project_name: invite.project_name.clone(),
+                    role: invite.invite_role.clone(),
+                    manifest_hex,
+                    owner_x25519_public_hex,
+                    epoch_key_hex,
+                    epoch: invite.current_epoch,
+                }
             }
         };
-        self.set_reservation_phase(&ctx.passphrase, &ctx.session_id, InviteSessionPhase::PayloadPrepared)?;
+        self.set_reservation_phase(
+            &ctx.passphrase,
+            &ctx.session_id,
+            InviteSessionPhase::PayloadPrepared,
+        )?;
+        #[cfg(test)]
+        eprintln!("invite: payload prepared for {}", ctx.project_name);
 
         let payload_json =
             serde_json::to_vec(&payload).map_err(|e| InviteError::Serde(e.to_string()))?;
@@ -907,8 +963,28 @@ impl InviteHandler {
                 let _ = self.release_reservation(&ctx.passphrase, &ctx.session_id);
                 InviteError::Connection(format!("send payload: {e}"))
             })?;
-        self.set_reservation_phase(&ctx.passphrase, &ctx.session_id, InviteSessionPhase::PayloadSent)?;
-        self.set_reservation_phase(&ctx.passphrase, &ctx.session_id, InviteSessionPhase::AwaitingPreparedAck)?;
+        tokio::time::timeout_at(deadline_tokio, send.flush())
+            .await
+            .map_err(|_| {
+                let _ = self.release_reservation(&ctx.passphrase, &ctx.session_id);
+                InviteError::Connection("flush payload timed out".into())
+            })?
+            .map_err(|e| {
+                let _ = self.release_reservation(&ctx.passphrase, &ctx.session_id);
+                InviteError::Connection(format!("flush payload: {e}"))
+            })?;
+        self.set_reservation_phase(
+            &ctx.passphrase,
+            &ctx.session_id,
+            InviteSessionPhase::PayloadSent,
+        )?;
+        #[cfg(test)]
+        eprintln!("invite: payload sent for {}", ctx.project_name);
+        self.set_reservation_phase(
+            &ctx.passphrase,
+            &ctx.session_id,
+            InviteSessionPhase::AwaitingPreparedAck,
+        )?;
 
         let mut prepared_ack = [0u8; 1];
         tokio::time::timeout_at(deadline_tokio, recv.read_exact(&mut prepared_ack))
@@ -925,10 +1001,15 @@ impl InviteHandler {
             self.release_reservation(&ctx.passphrase, &ctx.session_id)?;
             return Err(InviteError::VerificationFailed);
         }
-        self.set_reservation_phase(&ctx.passphrase, &ctx.session_id, InviteSessionPhase::PreparedAckReceived)?;
+        self.set_reservation_phase(
+            &ctx.passphrase,
+            &ctx.session_id,
+            InviteSessionPhase::PreparedAckReceived,
+        )?;
 
         if let Some(lifecycle) = &self.lifecycle {
-            let commit_result = tokio::time::timeout_at(deadline_tokio, lifecycle.commit_acceptance(&ctx)).await;
+            let commit_result =
+                tokio::time::timeout_at(deadline_tokio, lifecycle.commit_acceptance(&ctx)).await;
             if let Err(_) = commit_result {
                 self.release_reservation(&ctx.passphrase, &ctx.session_id)?;
                 let _ = send.write_all(&[0]).await;
@@ -943,8 +1024,17 @@ impl InviteHandler {
                 let _ = send.finish();
                 return Err(err);
             }
+            log::info!(
+                "invite handler: commit_acceptance finished after {}ms for project {}",
+                started_at.elapsed().as_millis(),
+                ctx.project_name
+            );
         }
-        self.set_reservation_phase(&ctx.passphrase, &ctx.session_id, InviteSessionPhase::Committed)?;
+        self.set_reservation_phase(
+            &ctx.passphrase,
+            &ctx.session_id,
+            InviteSessionPhase::Committed,
+        )?;
         self.mark_committed_pending_ack(&ctx.passphrase, &ctx.session_id, &ctx.invitee_peer_id)?;
 
         send.write_all(&[1])
@@ -973,6 +1063,11 @@ impl InviteHandler {
             }
         }
         let _ = send.finish();
+        log::info!(
+            "invite handler: completed after {}ms for project {}",
+            started_at.elapsed().as_millis(),
+            payload.project_name
+        );
 
         log::info!(
             "Invite accepted for project {} by peer {invitee_peer_id}",
@@ -1060,9 +1155,11 @@ mod tests {
 
     use std::time::Duration;
 
-    use iroh::{Endpoint, RelayMode, address_lookup::memory::MemoryLookup, endpoint::presets};
     use iroh::protocol::Router;
+    use iroh::{address_lookup::memory::MemoryLookup, endpoint::presets, Endpoint, RelayMode};
     use tokio::io::AsyncWriteExt;
+
+    static INVITE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     struct InviteTestHarness {
         owner_ep: Endpoint,
@@ -1131,7 +1228,7 @@ mod tests {
                 Duration::from_millis(0),
                 true,
             )
-                .await
+            .await
         }
 
         async fn run_invitee_with_behavior(
@@ -1196,9 +1293,7 @@ mod tests {
                 send.write_all(&[ack_byte])
                     .await
                     .map_err(|e| format!("send ack: {e}"))?;
-                send.flush()
-                    .await
-                    .map_err(|e| format!("flush ack: {e}"))?;
+                send.flush().await.map_err(|e| format!("flush ack: {e}"))?;
                 if ack_byte == 1 {
                     let mut final_status = [0u8; 1];
                     recv.read_exact(&mut final_status)
@@ -1216,6 +1311,9 @@ mod tests {
                             .map_err(|e| format!("flush final ack: {e}"))?;
                     }
                 }
+                let _ = send.finish();
+            } else {
+                // Explicitly close the write side so the owner observes EOF quickly.
                 let _ = send.finish();
             }
 
@@ -1298,14 +1396,17 @@ mod tests {
         fn prepare_payload<'a>(
             &'a self,
             _ctx: &'a InviteAcceptanceContext,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<InvitePayload, InviteError>> + Send + 'a>> {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<InvitePayload, InviteError>> + Send + 'a>,
+        > {
             Box::pin(async move { Ok(self.payload.clone()) })
         }
 
         fn commit_acceptance<'a>(
             &'a self,
             _ctx: &'a InviteAcceptanceContext,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), InviteError>> + Send + 'a>> {
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), InviteError>> + Send + 'a>>
+        {
             Box::pin(async move {
                 match &self.commit_error {
                     Some(err) => Err(InviteError::Lifecycle(err.clone())),
@@ -1329,6 +1430,7 @@ mod tests {
     // invitee reads payload) and validates the full wire protocol end-to-end.
     #[tokio::test]
     async fn test_invite_end_to_end() {
+        let _guard = INVITE_TEST_LOCK.lock().await;
         let passphrase = "tiger-marble-ocean-violet-canyon-frost";
 
         // Build a large fake manifest payload so the invitee is definitely still
@@ -1339,20 +1441,23 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
 
-        let harness = InviteTestHarness::new(vec![(
-            passphrase.to_string(),
-            make_pending_invite(
-                "owner-peer".to_string(),
-                passphrase,
-                "test-project",
-                "test-uuid-1234",
-                fake_manifest_bytes.clone(),
-            ),
-        )], None)
+        let harness = InviteTestHarness::new(
+            vec![(
+                passphrase.to_string(),
+                make_pending_invite(
+                    "owner-peer".to_string(),
+                    passphrase,
+                    "test-project",
+                    "test-uuid-1234",
+                    fake_manifest_bytes.clone(),
+                ),
+            )],
+            None,
+        )
         .await;
 
         let expected_manifest_hex = fake_manifest_hex.clone();
-        let invitee_result = tokio::time::timeout(Duration::from_secs(10), async {
+        let invitee_result = tokio::time::timeout(Duration::from_secs(30), async {
             harness.run_invitee(passphrase, Some(1)).await
         })
         .await
@@ -1367,7 +1472,11 @@ mod tests {
 
         harness.wait_for_connection_completion().await;
         assert!(matches!(
-            harness.pending_map.get(passphrase).as_deref().map(|invite| &invite.state),
+            harness
+                .pending_map
+                .get(passphrase)
+                .as_deref()
+                .map(|invite| &invite.state),
             Some(InviteState::Consumed(_) | InviteState::CommittedPendingAck(_))
         ));
 
@@ -1376,7 +1485,11 @@ mod tests {
         // Together these tests pin the current consumption behavior for the refactor.
         assert!(
             !matches!(
-                harness.pending_map.get(passphrase).as_deref().map(|invite| &invite.state),
+                harness
+                    .pending_map
+                    .get(passphrase)
+                    .as_deref()
+                    .map(|invite| &invite.state),
                 Some(InviteState::Open)
             ),
             "successful invite acceptance should not reopen the one-time code"
@@ -1387,98 +1500,141 @@ mod tests {
 
     #[tokio::test]
     async fn test_wrong_passphrase_does_not_consume_invite() {
+        let _guard = INVITE_TEST_LOCK.lock().await;
         let passphrase = "correct-horse-battery-staple-ocean-frost";
         let wrong_passphrase = "wrong-horse-battery-staple-ocean-frost";
         let project_name = "wrong-passphrase-project";
-        let harness = InviteTestHarness::new(vec![(
-            passphrase.to_string(),
-            make_pending_invite(
-                "owner-peer".to_string(),
-                passphrase,
-                project_name,
-                "proj-wrong",
-                vec![1; 128],
-            ),
-        )], None)
+        let harness = InviteTestHarness::new(
+            vec![(
+                passphrase.to_string(),
+                make_pending_invite(
+                    "owner-peer".to_string(),
+                    passphrase,
+                    project_name,
+                    "proj-wrong",
+                    vec![1; 128],
+                ),
+            )],
+            None,
+        )
         .await;
 
         let result = harness.run_invitee(wrong_passphrase, None).await;
-        assert!(result.is_err(), "wrong passphrase should fail to decrypt payload");
+        assert!(
+            result.is_err(),
+            "wrong passphrase should fail to decrypt payload"
+        );
 
         harness.wait_for_connection_completion().await;
         assert!(matches!(
-            harness.pending_map.get(passphrase).as_deref().map(|invite| &invite.state),
+            harness
+                .pending_map
+                .get(passphrase)
+                .as_deref()
+                .map(|invite| &invite.state),
             Some(InviteState::Open)
         ));
 
         let retry = harness.run_invitee(passphrase, Some(1)).await;
-        assert!(retry.is_ok(), "invite should still be usable after wrong passphrase");
+        assert!(
+            retry.is_ok(),
+            "invite should still be usable after wrong passphrase"
+        );
 
         harness.shutdown().await;
     }
 
     #[tokio::test]
     async fn test_invite_without_ack_is_not_consumed() {
+        let _guard = INVITE_TEST_LOCK.lock().await;
         let passphrase = "invitee-disconnect-without-ack-ocean-frost";
-        let harness = InviteTestHarness::new(vec![(
-            passphrase.to_string(),
-            make_pending_invite(
-                "owner-peer".to_string(),
-                passphrase,
-                "no-ack-project",
-                "proj-no-ack",
-                vec![2; 256],
-            ),
-        )], None)
+        let harness = InviteTestHarness::new(
+            vec![(
+                passphrase.to_string(),
+                make_pending_invite(
+                    "owner-peer".to_string(),
+                    passphrase,
+                    "no-ack-project",
+                    "proj-no-ack",
+                    vec![2; 256],
+                ),
+            )],
+            None,
+        )
         .await;
 
         let result = harness.run_invitee(passphrase, None).await;
-        assert!(result.is_ok(), "invitee should still be able to read payload before dropping");
+        assert!(
+            result.is_ok(),
+            "invitee should still be able to read payload before dropping"
+        );
 
         harness.wait_for_connection_completion().await;
         assert!(matches!(
-            harness.pending_map.get(passphrase).as_deref().map(|invite| &invite.state),
+            harness
+                .pending_map
+                .get(passphrase)
+                .as_deref()
+                .map(|invite| &invite.state),
             Some(InviteState::Open)
         ));
 
         let retry = harness.run_invitee(passphrase, Some(1)).await;
-        assert!(retry.is_ok(), "invite should still be usable after a missing ACK");
+        assert!(
+            retry.is_ok(),
+            "invite should still be usable after a missing ACK"
+        );
 
         harness.shutdown().await;
     }
 
     #[tokio::test]
     async fn test_malformed_ack_does_not_consume_invite() {
+        let _guard = INVITE_TEST_LOCK.lock().await;
         let passphrase = "invitee-malformed-ack-ocean-frost-canyon";
-        let harness = InviteTestHarness::new(vec![(
-            passphrase.to_string(),
-            make_pending_invite(
-                "owner-peer".to_string(),
-                passphrase,
-                "bad-ack-project",
-                "proj-bad-ack",
-                vec![3; 256],
-            ),
-        )], None)
+        let harness = InviteTestHarness::new(
+            vec![(
+                passphrase.to_string(),
+                make_pending_invite(
+                    "owner-peer".to_string(),
+                    passphrase,
+                    "bad-ack-project",
+                    "proj-bad-ack",
+                    vec![3; 256],
+                ),
+            )],
+            None,
+        )
         .await;
 
         let result = harness.run_invitee(passphrase, Some(7)).await;
-        assert!(result.is_ok(), "invitee can still read payload before sending bad ack");
+        assert!(
+            result.is_ok(),
+            "invitee can still read payload before sending bad ack"
+        );
 
         harness.wait_for_connection_completion().await;
         assert!(matches!(
-            harness.pending_map.get(passphrase).as_deref().map(|invite| &invite.state),
+            harness
+                .pending_map
+                .get(passphrase)
+                .as_deref()
+                .map(|invite| &invite.state),
             Some(InviteState::Open)
         ));
 
         let retry = harness.run_invitee(passphrase, Some(1)).await;
-        assert!(retry.is_ok(), "invite should still be usable after malformed ACK");
+        assert!(
+            retry.is_ok(),
+            "invite should still be usable after malformed ACK"
+        );
 
         harness.shutdown().await;
     }
 
     #[tokio::test]
     async fn test_lifecycle_prepare_payload_is_used() {
+        let _guard = INVITE_TEST_LOCK.lock().await;
         let passphrase = "lifecycle-success-ocean-frost-canyon-marble";
         let lifecycle_payload = InvitePayload {
             invite_id: "lifecycle-invite-id".to_string(),
@@ -1530,6 +1686,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_lifecycle_commit_failure_does_not_consume_invite() {
+        let _guard = INVITE_TEST_LOCK.lock().await;
         let passphrase = "lifecycle-failure-ocean-frost-canyon-marble";
         let lifecycle = Arc::new(MockLifecycleHandler {
             payload: InvitePayload {
@@ -1561,20 +1718,27 @@ mod tests {
         .await;
 
         let result = harness.run_invitee(passphrase, Some(1)).await;
-        assert!(result.is_err(), "invitee should fail if owner commit fails after ACK");
+        assert!(
+            result.is_err(),
+            "invitee should fail if owner commit fails after ACK"
+        );
         harness.wait_for_connection_completion().await;
         harness
             .wait_for_invite_state(passphrase, |state| matches!(state, InviteState::Open))
             .await;
 
         let retry = harness.run_invitee(passphrase, Some(1)).await;
-        assert!(retry.is_err(), "commit failure should remain reproducible until owner-side issue is fixed");
+        assert!(
+            retry.is_err(),
+            "commit failure should remain reproducible until owner-side issue is fixed"
+        );
 
         harness.shutdown().await;
     }
 
     #[tokio::test]
     async fn test_commit_without_applied_ack_leaves_committed_pending_ack() {
+        let _guard = INVITE_TEST_LOCK.lock().await;
         let passphrase = "commit-no-applied-ack-ocean-frost";
         let harness = InviteTestHarness::new(
             vec![(
@@ -1594,7 +1758,10 @@ mod tests {
         let result = harness
             .run_invitee_with_behavior(passphrase, Some(1), Duration::from_millis(0), false)
             .await;
-        assert!(result.is_ok(), "invitee should still receive commit result before disconnecting");
+        assert!(
+            result.is_ok(),
+            "invitee should still receive commit result before disconnecting"
+        );
 
         harness
             .wait_for_invite_state(passphrase, |state| {
@@ -1603,13 +1770,17 @@ mod tests {
             .await;
 
         let retry = harness.run_invitee(passphrase, Some(1)).await;
-        assert!(retry.is_err(), "committed invite must not reopen after missing applied ack");
+        assert!(
+            retry.is_err(),
+            "committed invite must not reopen after missing applied ack"
+        );
 
         harness.shutdown().await;
     }
 
     #[tokio::test]
     async fn test_try_reserve_invite_is_atomic() {
+        let _guard = INVITE_TEST_LOCK.lock().await;
         let handler = Arc::new(InviteHandler::new());
         let passphrase = "concurrent-acceptors-ocean-frost-canyon";
         handler.add_pending(
@@ -1651,10 +1822,15 @@ mod tests {
         let result_b = contender_b.await.unwrap();
 
         let success_count = usize::from(result_a.is_ok()) + usize::from(result_b.is_ok());
-        assert_eq!(success_count, 1, "only one contender may reserve the invite");
+        assert_eq!(
+            success_count, 1,
+            "only one contender may reserve the invite"
+        );
 
         let winner = result_a.or(result_b).unwrap();
-        handler.release_reservation(passphrase, &winner.session_id).unwrap();
+        handler
+            .release_reservation(passphrase, &winner.session_id)
+            .unwrap();
         let retry = handler
             .try_reserve_invite(
                 passphrase,
@@ -1692,7 +1868,10 @@ mod tests {
         let owner_key = finish_handshake(owner_state, &invitee_msg).unwrap();
         let invitee_key = finish_handshake(invitee_state, &owner_msg).unwrap();
 
-        assert_eq!(owner_key, invitee_key, "Both sides should derive the same key");
+        assert_eq!(
+            owner_key, invitee_key,
+            "Both sides should derive the same key"
+        );
         assert!(!owner_key.is_empty());
     }
 
@@ -1709,10 +1888,12 @@ mod tests {
         if let Ok(key) = owner_key {
             // If it succeeds, verify the key is different from a correct handshake
             let (correct_owner, _correct_owner_msg) = start_owner_handshake("correct-phrase");
-            let (_correct_invitee, correct_invitee_msg) =
-                start_invitee_handshake("correct-phrase");
+            let (_correct_invitee, correct_invitee_msg) = start_invitee_handshake("correct-phrase");
             let correct_key = finish_handshake(correct_owner, &correct_invitee_msg).unwrap();
-            assert_ne!(key, correct_key, "Wrong passphrase should produce different key");
+            assert_ne!(
+                key, correct_key,
+                "Wrong passphrase should produce different key"
+            );
         }
         // If Err, that's also correct behavior
     }

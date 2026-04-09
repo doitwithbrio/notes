@@ -1,6 +1,7 @@
-import { tauriApi } from '../api/tauri.js';
+import { TauriCommandError, tauriApi } from '../api/tauri.js';
 import type { BackendDocInfo, BackendUnseenDocInfo, Document, SyncStatus } from '../types/index.js';
 import { applyDocOrder, saveDocOrder } from './ordering.svelte.js';
+import { loadProjectTodos } from './todos.svelte.js';
 
 export const documentState = $state({
   docs: [] as Document[],
@@ -95,6 +96,17 @@ async function fetchProjectDocs(projectId: string): Promise<Document[]> {
   );
 }
 
+function isRevokedProjectError(error: unknown) {
+  return error instanceof TauriCommandError
+    && (error.code === 'PROJECT_IDENTITY_MISMATCH' || error.code === 'PROJECT_NOT_FOUND');
+}
+
+async function purgeInaccessibleProject(projectId: string, reason: string) {
+  await tauriApi.purgeProjectLocalData(projectId, reason).catch(() => undefined);
+  const eviction = await import('./project-eviction.svelte.js');
+  await eviction.evictProject(projectId, reason);
+}
+
 export function getDocById(docId: string | null): Document | null {
   if (!docId) return null;
   return documentState.docs.find((doc) => doc.id === docId) ?? null;
@@ -133,10 +145,19 @@ export async function loadProjectDocs(
             ...orderedDocs,
           ];
           markProjectHydrated(projectId);
+          void loadProjectTodos(projectId, { force: true }).catch((error) => {
+            console.error(`Failed to hydrate todos for ${projectId}`, error);
+          });
         } else if (shouldConnectPeers) {
           await tauriApi.openProject(projectId, true);
         }
       } while (loadState.reloadRequested || loadState.connectPeersRequested);
+    } catch (error) {
+      if (isRevokedProjectError(error)) {
+        await purgeInaccessibleProject(projectId, 'access-revoked');
+        return;
+      }
+      throw error;
     } finally {
       setProjectLoading(projectId, false);
       loadState.promise = null;
@@ -170,6 +191,13 @@ export function addDoc(doc: Document) {
 export function removeDoc(docId: string) {
   const index = documentState.docs.findIndex((doc) => doc.id === docId);
   if (index >= 0) documentState.docs.splice(index, 1);
+}
+
+export function clearProjectDocs(projectId: string) {
+  documentState.docs = documentState.docs.filter((doc) => doc.projectId !== projectId);
+  documentState.loadingProjectIds = documentState.loadingProjectIds.filter((id) => id !== projectId);
+  documentState.hydratedProjectIds = documentState.hydratedProjectIds.filter((id) => id !== projectId);
+  projectLoadStates.delete(projectId);
 }
 
 export async function deleteDoc(projectId: string, docId: string) {

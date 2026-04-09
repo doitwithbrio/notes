@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -73,6 +74,14 @@ pub struct PersistedJoinSession {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedJoinSecret {
+    pub passphrase: String,
+    #[serde(default)]
+    pub epoch_key_hex: Option<String>,
+}
+
 pub struct OwnerInviteStateStore {
     dir: PathBuf,
 }
@@ -90,12 +99,25 @@ impl OwnerInviteStateStore {
         atomic_write_json(&self.path_for(&record.invite_id), &record)
     }
 
+    pub fn exists(&self, invite_id: &str) -> bool {
+        self.path_for(invite_id).exists()
+    }
+
     pub fn load_all(&self) -> Result<Vec<PersistedOwnerInviteRecord>, CoreError> {
         load_all_json(&self.dir)
     }
 
     pub fn delete(&self, invite_id: &str) -> Result<(), CoreError> {
         remove_file_if_exists(&self.path_for(invite_id))
+    }
+
+    pub fn delete_project(&self, project_id: &str) -> Result<(), CoreError> {
+        for record in self.load_all()? {
+            if record.project_id == project_id {
+                self.delete(&record.invite_id)?;
+            }
+        }
+        Ok(())
     }
 
     fn path_for(&self, invite_id: &str) -> PathBuf {
@@ -126,25 +148,104 @@ impl JoinSessionStore {
 
     pub fn delete(&self, session_id: &str) -> Result<(), CoreError> {
         remove_file_if_exists(&self.path_for(session_id))?;
-        remove_file_if_exists(&self.secret_path_for(session_id))
+        remove_sensitive_file_if_exists(&self.secret_path_for(session_id))
+    }
+
+    pub fn delete_project(&self, project_id: &str) -> Result<(), CoreError> {
+        for session in self.load_all()? {
+            if session.project_id == project_id {
+                self.delete(&session.session_id)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn save_secret(&self, session_id: &str, secret: &str) -> Result<(), CoreError> {
+        self.save_secret_bundle(
+            session_id,
+            &PersistedJoinSecret {
+                passphrase: secret.to_string(),
+                epoch_key_hex: None,
+            },
+        )
+    }
+
+    pub fn save_secret_bundle(
+        &self,
+        session_id: &str,
+        secret: &PersistedJoinSecret,
+    ) -> Result<(), CoreError> {
         let path = self.secret_path_for(session_id);
         let Some(parent) = path.parent() else {
             return Err(CoreError::InvalidData("missing parent directory".into()));
         };
         fs::create_dir_all(parent)?;
-        fs::write(path, secret.as_bytes())?;
-        Ok(())
+        let secret = serde_json::to_vec(secret)?;
+
+        #[cfg(unix)]
+        {
+            use std::fs::OpenOptions;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .mode(0o600)
+                .open(&path)?;
+            file.write_all(&secret)?;
+            Ok(())
+        }
+
+        #[cfg(not(unix))]
+        {
+            fs::write(&path, &secret)?;
+            Ok(())
+        }
     }
 
     pub fn load_secret(&self, session_id: &str) -> Result<Option<String>, CoreError> {
+        Ok(self
+            .load_secret_bundle(session_id)?
+            .map(|secret| secret.passphrase))
+    }
+
+    pub fn load_secret_bundle(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<PersistedJoinSecret>, CoreError> {
         let path = self.secret_path_for(session_id);
         match fs::read_to_string(path) {
-            Ok(secret) => Ok(Some(secret)),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(CoreError::Io(err)),
+            Ok(secret) => {
+                notes_crypto::debug_record_secret_read(
+                    "join-session-secret",
+                    notes_crypto::SecretReadBackend::File,
+                    notes_crypto::SecretReadOutcome::Hit,
+                );
+                match serde_json::from_str::<PersistedJoinSecret>(&secret) {
+                    Ok(bundle) => Ok(Some(bundle)),
+                    Err(_) => Ok(Some(PersistedJoinSecret {
+                        passphrase: secret,
+                        epoch_key_hex: None,
+                    })),
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                notes_crypto::debug_record_secret_read(
+                    "join-session-secret",
+                    notes_crypto::SecretReadBackend::File,
+                    notes_crypto::SecretReadOutcome::Miss,
+                );
+                Ok(None)
+            }
+            Err(err) => {
+                notes_crypto::debug_record_secret_read(
+                    "join-session-secret",
+                    notes_crypto::SecretReadBackend::File,
+                    notes_crypto::SecretReadOutcome::Error,
+                );
+                Err(CoreError::Io(err))
+            }
         }
     }
 
@@ -190,6 +291,21 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), CoreErr
 fn remove_file_if_exists(path: &Path) -> Result<(), CoreError> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(CoreError::Io(err)),
+    }
+}
+
+fn remove_sensitive_file_if_exists(path: &Path) -> Result<(), CoreError> {
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            let len = metadata.len() as usize;
+            if len > 0 {
+                let zeros = vec![0u8; len];
+                let _ = fs::write(path, &zeros);
+            }
+            remove_file_if_exists(path)
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(CoreError::Io(err)),
     }

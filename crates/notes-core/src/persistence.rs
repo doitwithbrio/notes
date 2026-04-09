@@ -160,11 +160,7 @@ impl Persistence {
 
     /// Load a document from disk.
     /// Falls back to the backup file if the primary is corrupted or unreadable.
-    pub async fn load_doc(
-        &self,
-        project_name: &str,
-        doc_id: &DocId,
-    ) -> Result<Vec<u8>, CoreError> {
+    pub async fn load_doc(&self, project_name: &str, doc_id: &DocId) -> Result<Vec<u8>, CoreError> {
         let path = self.doc_path(project_name, doc_id);
 
         match fs::read(&path).await {
@@ -198,9 +194,7 @@ impl Persistence {
     ) -> Result<Vec<u8>, CoreError> {
         let backup = self.backup_path(project_name, doc_id);
         let data = fs::read(&backup).await.map_err(|_| {
-            CoreError::InvalidData(format!(
-                "Primary and backup both unreadable for {doc_id}"
-            ))
+            CoreError::InvalidData(format!("Primary and backup both unreadable for {doc_id}"))
         })?;
 
         // Validate the backup too
@@ -227,9 +221,7 @@ impl Persistence {
     ) -> Result<Vec<u8>, CoreError> {
         let backup = self.backup_path(project_name, doc_id);
         let raw = fs::read(&backup).await.map_err(|_| {
-            CoreError::InvalidData(format!(
-                "Primary and backup both unreadable for {doc_id}"
-            ))
+            CoreError::InvalidData(format!("Primary and backup both unreadable for {doc_id}"))
         })?;
 
         if automerge::AutoCommit::load(&raw).is_ok() {
@@ -256,11 +248,7 @@ impl Persistence {
     }
 
     /// Delete a document file and its backup from disk.
-    pub async fn delete_doc(
-        &self,
-        project_name: &str,
-        doc_id: &DocId,
-    ) -> Result<(), CoreError> {
+    pub async fn delete_doc(&self, project_name: &str, doc_id: &DocId) -> Result<(), CoreError> {
         let path = self.doc_path(project_name, doc_id);
         let backup = self.backup_path(project_name, doc_id);
 
@@ -306,11 +294,7 @@ impl Persistence {
     }
 
     /// Save the project manifest to disk (atomic write).
-    pub async fn save_manifest(
-        &self,
-        project_name: &str,
-        data: &[u8],
-    ) -> Result<(), CoreError> {
+    pub async fn save_manifest(&self, project_name: &str, data: &[u8]) -> Result<(), CoreError> {
         let path = self.manifest_path(project_name);
         atomic_write(&path, data).await
     }
@@ -319,6 +303,13 @@ impl Persistence {
     pub async fn load_manifest(&self, project_name: &str) -> Result<Vec<u8>, CoreError> {
         let path = self.manifest_path(project_name);
         Ok(fs::read(&path).await?)
+    }
+
+    /// Check whether a persisted Automerge snapshot exists locally for a document.
+    pub async fn doc_exists(&self, project_name: &str, doc_id: &DocId) -> Result<bool, CoreError> {
+        validation::validate_project_name(project_name)?;
+        let path = self.doc_path(project_name, doc_id);
+        Ok(fs::try_exists(path).await.unwrap_or(false))
     }
 
     /// Export a document's text content as a read-only .md file.
@@ -539,13 +530,28 @@ mod tests {
     async fn test_load_nonexistent_doc() {
         let dir = tempfile::tempdir().unwrap();
         let persistence = Persistence::new(dir.path());
-        persistence
-            .ensure_project_dirs("test")
-            .await
-            .unwrap();
+        persistence.ensure_project_dirs("test").await.unwrap();
 
         let result = persistence.load_doc("test", &Uuid::new_v4()).await;
         assert!(matches!(result, Err(CoreError::DocNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_doc_exists_tracks_persisted_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let persistence = Persistence::new(dir.path());
+        let project = "test-project";
+        let doc_id = Uuid::new_v4();
+        persistence.ensure_project_dirs(project).await.unwrap();
+
+        assert!(!persistence.doc_exists(project, &doc_id).await.unwrap());
+
+        persistence
+            .save_doc(project, &doc_id, b"not-an-automerge-check")
+            .await
+            .unwrap();
+
+        assert!(persistence.doc_exists(project, &doc_id).await.unwrap());
     }
 
     #[tokio::test]
@@ -554,9 +560,7 @@ mod tests {
         let persistence = Persistence::new(dir.path());
 
         let project = "test-project";
-        fs::create_dir_all(dir.path().join(project))
-            .await
-            .unwrap();
+        fs::create_dir_all(dir.path().join(project)).await.unwrap();
 
         persistence
             .export_markdown(project, "notes/hello.md", "# Hello\n\nWorld")

@@ -8,6 +8,7 @@
 use automerge::{AutoCommit, ChangeHash, ReadDoc};
 use serde::{Deserialize, Serialize};
 
+use crate::editor_migration::migrate_legacy_text_to_v2;
 use crate::error::CoreError;
 
 // ── Sea Creature Name Generator ─────────────────────────────────────
@@ -346,9 +347,13 @@ pub fn get_text_at(
         return Ok(String::new());
     }
     if let Some((automerge::Value::Object(automerge::ObjType::Text), text_id)) =
-        doc.get(automerge::ROOT, "text")?
+        doc.get_at(automerge::ROOT, "text", heads)?
     {
         doc.text_at(&text_id, heads)
+    } else if let Some((automerge::Value::Scalar(scalar), _)) =
+        doc.get_at(automerge::ROOT, "text", heads)?
+    {
+        Ok(scalar.to_str().unwrap_or_default().to_string())
     } else {
         Ok(String::new())
     }
@@ -374,27 +379,59 @@ pub fn strings_to_heads(strings: &[String]) -> Vec<ChangeHash> {
 ///
 /// If `snapshot_data` is provided, loads from the Automerge binary snapshot
 /// to preserve rich text formatting. Otherwise falls back to plain text.
+fn schema_version(doc: &AutoCommit) -> Result<u64, CoreError> {
+    Ok(doc
+        .get(automerge::ROOT, "schemaVersion")?
+        .and_then(|(value, _)| value.to_u64())
+        .unwrap_or(1))
+}
+
+fn commit_restore(doc: &mut AutoCommit) {
+    doc.commit_with(
+        automerge::transaction::CommitOptions::default()
+            .with_message("Restored to previous version".to_string())
+            .with_time(now_secs()),
+    );
+}
+
+fn legacy_snapshot_text(snapshot_data: &[u8]) -> Option<String> {
+    let text = String::from_utf8(snapshot_data.to_vec()).ok()?;
+    if !text
+        .chars()
+        .all(|ch| matches!(ch, '\n' | '\r' | '\t') || !ch.is_control())
+    {
+        return None;
+    }
+    Some(text)
+}
+
 pub fn restore_to_version(
     doc: &mut AutoCommit,
     target_heads: &[ChangeHash],
     snapshot_data: Option<&[u8]>,
 ) -> Result<(), CoreError> {
-    // Try rich text restore from snapshot first
+    let current_schema_version = schema_version(doc)?;
+
     if let Some(data) = snapshot_data {
-        if let Ok(snapshot_doc) = AutoCommit::load(data) {
-            // Get text from the snapshot (which preserves full structure)
-            if let Some((automerge::Value::Object(automerge::ObjType::Text), text_id)) =
-                snapshot_doc
-                    .get(automerge::ROOT, "text")
-                    .map_err(CoreError::from)?
-            {
-                let target_text = snapshot_doc.text(&text_id).map_err(CoreError::from)?;
-                return apply_text_restore(doc, &target_text);
+        match crate::doc_store::restore_doc_from_snapshot_bytes(doc, data) {
+            Ok(()) => {
+                commit_restore(doc);
+                return Ok(());
+            }
+            Err(error) if current_schema_version >= 2 => {
+                if let Some(text) = legacy_snapshot_text(data) {
+                    return apply_text_restore(doc, &text);
+                }
+                return Err(error);
+            }
+            Err(_) => {
+                if let Some(text) = legacy_snapshot_text(data) {
+                    return apply_text_restore(doc, &text);
+                }
             }
         }
     }
 
-    // Fall back to heads-based plain text restore
     let target_text = get_text_at(doc, target_heads).map_err(CoreError::from)?;
     apply_text_restore(doc, &target_text)
 }
@@ -403,7 +440,10 @@ pub fn restore_to_version(
 fn apply_text_restore(doc: &mut AutoCommit, target_text: &str) -> Result<(), CoreError> {
     use automerge::transaction::Transactable;
 
-    if let Some((automerge::Value::Object(automerge::ObjType::Text), text_id)) =
+    if schema_version(doc)? >= 2 {
+        let editor_document = migrate_legacy_text_to_v2(target_text);
+        crate::doc_store::apply_editor_document_to_doc(doc, &editor_document)?;
+    } else if let Some((automerge::Value::Object(automerge::ObjType::Text), text_id)) =
         doc.get(automerge::ROOT, "text").map_err(CoreError::from)?
     {
         let current_text = doc.text(&text_id).map_err(CoreError::from)?;
@@ -412,13 +452,15 @@ fn apply_text_restore(doc: &mut AutoCommit, target_text: &str) -> Result<(), Cor
             doc.splice_text(&text_id, 0, current_len as isize, target_text)
                 .map_err(CoreError::from)?;
         }
+    } else if matches!(
+        doc.get(automerge::ROOT, "text").map_err(CoreError::from)?,
+        Some((automerge::Value::Scalar(_), _))
+    ) {
+        doc.put(automerge::ROOT, "text", target_text)
+            .map_err(CoreError::from)?;
     }
 
-    doc.commit_with(
-        automerge::transaction::CommitOptions::default()
-            .with_message("Restored to previous version".to_string())
-            .with_time(now_secs()),
-    );
+    commit_restore(doc);
 
     Ok(())
 }
@@ -473,6 +515,10 @@ pub fn load_or_create_device_actor_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::doc_store::DocStore;
+    use crate::{EditorDocument, EditorNode};
+    use automerge::transaction::Transactable as _;
 
     #[test]
     fn test_creature_name_deterministic() {
@@ -590,5 +636,302 @@ mod tests {
         let id1 = load_or_create_device_actor_id(dir.path()).unwrap();
         let id2 = load_or_create_device_actor_id(dir.path()).unwrap();
         assert_eq!(id1, id2, "Same device should get same actor ID");
+    }
+
+    #[test]
+    fn get_text_at_supports_scalar_string_mirrors() {
+        let mut doc = AutoCommit::new();
+        doc.put(automerge::ROOT, "text", "scalar mirror").unwrap();
+        let heads = doc.get_heads();
+
+        let text = get_text_at(&mut doc, &heads).unwrap();
+
+        assert_eq!(text, "scalar mirror");
+    }
+
+    #[test]
+    fn get_text_at_reads_scalar_string_at_requested_heads() {
+        let mut doc = AutoCommit::new();
+        doc.put(automerge::ROOT, "text", "before").unwrap();
+        let before_heads = doc.get_heads();
+        doc.put(automerge::ROOT, "text", "after").unwrap();
+
+        let text = get_text_at(&mut doc, &before_heads).unwrap();
+
+        assert_eq!(text, "before");
+    }
+
+    #[test]
+    fn legacy_scalar_restore_updates_scalar_text() {
+        let mut doc = AutoCommit::new();
+        doc.put(automerge::ROOT, "schemaVersion", 1_u64).unwrap();
+        doc.put(automerge::ROOT, "text", "before").unwrap();
+
+        apply_text_restore(&mut doc, "after").unwrap();
+
+        let text = match doc.get(automerge::ROOT, "text").unwrap() {
+            Some((automerge::Value::Scalar(scalar), _)) => scalar.to_str().unwrap().to_string(),
+            other => panic!("expected scalar text, got {other:?}"),
+        };
+        assert_eq!(text, "after");
+    }
+
+    #[test]
+    fn legacy_snapshot_only_restore_uses_plaintext_snapshot() {
+        let mut doc = AutoCommit::new();
+        doc.put(automerge::ROOT, "schemaVersion", 1_u64).unwrap();
+        doc.put(automerge::ROOT, "text", "before").unwrap();
+
+        restore_to_version(&mut doc, &[], Some(b"legacy body")).unwrap();
+
+        let text = match doc.get(automerge::ROOT, "text").unwrap() {
+            Some((automerge::Value::Scalar(scalar), _)) => scalar.to_str().unwrap().to_string(),
+            other => panic!("expected scalar text, got {other:?}"),
+        };
+        assert_eq!(text, "legacy body");
+    }
+
+    fn graph_document_with_heading_and_body() -> EditorDocument {
+        EditorDocument {
+            schema_version: 2,
+            doc: EditorNode {
+                id: "root".into(),
+                node_type: "doc".into(),
+                node_version: 1,
+                attrs: Default::default(),
+                content: vec![
+                    EditorNode {
+                        id: "heading-1".into(),
+                        node_type: "heading".into(),
+                        node_version: 1,
+                        attrs: serde_json::Map::from_iter([(
+                            "level".into(),
+                            serde_json::Value::Number(serde_json::Number::from(2)),
+                        )]),
+                        content: vec![EditorNode {
+                            id: "text-1".into(),
+                            node_type: "text".into(),
+                            node_version: 1,
+                            attrs: Default::default(),
+                            content: vec![],
+                            text: Some("Title".into()),
+                            marks: vec![],
+                        }],
+                        text: None,
+                        marks: vec![],
+                    },
+                    EditorNode {
+                        id: "paragraph-1".into(),
+                        node_type: "paragraph".into(),
+                        node_version: 1,
+                        attrs: Default::default(),
+                        content: vec![EditorNode {
+                            id: "text-2".into(),
+                            node_type: "text".into(),
+                            node_version: 1,
+                            attrs: Default::default(),
+                            content: vec![],
+                            text: Some("Body copy".into()),
+                            marks: vec![],
+                        }],
+                        text: None,
+                        marks: vec![],
+                    },
+                ],
+                text: None,
+                marks: vec![],
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn graph_v2_restore_from_snapshot_keeps_structure_and_text_in_sync() {
+        let store = DocStore::new();
+        let id = uuid::Uuid::new_v4();
+        store.create_doc_with_id(id).unwrap();
+
+        {
+            let doc_arc = store.get_doc(&id).unwrap();
+            let mut doc = doc_arc.write().await;
+            crate::doc_store::apply_editor_document_to_doc(
+                &mut doc,
+                &graph_document_with_heading_and_body(),
+            )
+            .unwrap();
+            doc.commit();
+        }
+
+        let snapshot = {
+            let doc_arc = store.get_doc(&id).unwrap();
+            let mut doc = doc_arc.write().await;
+            doc.save()
+        };
+
+        store.replace_text(&id, "Current live text").await.unwrap();
+
+        {
+            let doc_arc = store.get_doc(&id).unwrap();
+            let mut doc = doc_arc.write().await;
+            restore_to_version(&mut doc, &[], Some(snapshot.as_slice())).unwrap();
+        }
+
+        assert_eq!(store.get_text(&id).await.unwrap(), "Title\n\nBody copy");
+        assert_eq!(
+            store.get_visible_text(&id).await.unwrap(),
+            "Title\n\nBody copy"
+        );
+
+        let reloaded = {
+            let doc_arc = store.get_doc(&id).unwrap();
+            let mut doc = doc_arc.write().await;
+            crate::doc_store::read_snapshot_from_bytes(&doc.save()).unwrap()
+        };
+        assert_eq!(reloaded.visible_text, "Title\n\nBody copy");
+        assert_eq!(reloaded.source_schema, crate::DocumentSourceSchema::GraphV2);
+    }
+
+    #[tokio::test]
+    async fn graph_v2_restore_without_snapshot_restores_plain_text_into_valid_graph() {
+        let store = DocStore::new();
+        let id = uuid::Uuid::new_v4();
+        store.create_doc_with_id(id).unwrap();
+        store.replace_text(&id, "Current live text").await.unwrap();
+
+        {
+            let doc_arc = store.get_doc(&id).unwrap();
+            let mut doc = doc_arc.write().await;
+            restore_to_version(&mut doc, &[], None).unwrap();
+        }
+
+        assert_eq!(store.get_visible_text(&id).await.unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn graph_v2_restore_is_additive_and_preserves_history() {
+        let store = DocStore::new();
+        let id = uuid::Uuid::new_v4();
+        store.create_doc_with_id(id).unwrap();
+        store.replace_text(&id, "Original text").await.unwrap();
+        let snapshot = {
+            let doc_arc = store.get_doc(&id).unwrap();
+            let mut doc = doc_arc.write().await;
+            doc.save()
+        };
+        store.replace_text(&id, "Current live text").await.unwrap();
+
+        let (changes_before, changes_after) = {
+            let doc_arc = store.get_doc(&id).unwrap();
+            let mut doc = doc_arc.write().await;
+            let before = doc.get_changes(&[]).len();
+            restore_to_version(&mut doc, &[], Some(snapshot.as_slice())).unwrap();
+            let after = doc.get_changes(&[]).len();
+            (before, after)
+        };
+
+        assert!(changes_after > changes_before);
+        assert_eq!(store.get_visible_text(&id).await.unwrap(), "Original text");
+    }
+
+    #[tokio::test]
+    async fn graph_v2_restore_preserves_heading_structure_from_snapshot() {
+        let store = DocStore::new();
+        let id = uuid::Uuid::new_v4();
+        store.create_doc_with_id(id).unwrap();
+
+        {
+            let doc_arc = store.get_doc(&id).unwrap();
+            let mut doc = doc_arc.write().await;
+            crate::doc_store::apply_editor_document_to_doc(
+                &mut doc,
+                &graph_document_with_heading_and_body(),
+            )
+            .unwrap();
+            doc.commit();
+        }
+
+        let snapshot = {
+            let doc_arc = store.get_doc(&id).unwrap();
+            let mut doc = doc_arc.write().await;
+            doc.save()
+        };
+        store.replace_text(&id, "Current live text").await.unwrap();
+
+        {
+            let doc_arc = store.get_doc(&id).unwrap();
+            let mut doc = doc_arc.write().await;
+            restore_to_version(&mut doc, &[], Some(snapshot.as_slice())).unwrap();
+        }
+
+        let editor_document = store.get_editor_document(&id).await.unwrap();
+        assert_eq!(editor_document.doc.content[0].node_type, "heading");
+        assert_eq!(
+            editor_document.doc.content[0].attrs.get("level"),
+            Some(&serde_json::Value::Number(2.into()))
+        );
+        assert_eq!(editor_document.doc.content[1].node_type, "paragraph");
+    }
+
+    #[tokio::test]
+    async fn graph_v2_restore_without_snapshot_rebuilds_valid_structure_from_text() {
+        let store = DocStore::new();
+        let id = uuid::Uuid::new_v4();
+        store.create_doc_with_id(id).unwrap();
+        store.replace_text(&id, "before\n\nafter").await.unwrap();
+        let heads = {
+            let doc_arc = store.get_doc(&id).unwrap();
+            let mut doc = doc_arc.write().await;
+            doc.get_heads()
+        };
+        store.replace_text(&id, "Current live text").await.unwrap();
+
+        {
+            let doc_arc = store.get_doc(&id).unwrap();
+            let mut doc = doc_arc.write().await;
+            restore_to_version(&mut doc, &heads, None).unwrap();
+        }
+
+        assert_eq!(
+            store.get_visible_text(&id).await.unwrap(),
+            "before\n\nafter"
+        );
+        let editor_document = store.get_editor_document(&id).await.unwrap();
+        assert_eq!(editor_document.doc.node_type, "doc");
+    }
+
+    #[tokio::test]
+    async fn graph_v2_restore_supports_plaintext_legacy_snapshots() {
+        let store = DocStore::new();
+        let id = uuid::Uuid::new_v4();
+        store.create_doc_with_id(id).unwrap();
+        store.replace_text(&id, "Current live text").await.unwrap();
+
+        {
+            let doc_arc = store.get_doc(&id).unwrap();
+            let mut doc = doc_arc.write().await;
+            restore_to_version(&mut doc, &[], Some(b"legacy markdown body")).unwrap();
+        }
+
+        assert_eq!(
+            store.get_visible_text(&id).await.unwrap(),
+            "legacy markdown body"
+        );
+        let editor_document = store.get_editor_document(&id).await.unwrap();
+        assert_eq!(editor_document.doc.node_type, "doc");
+    }
+
+    #[tokio::test]
+    async fn graph_v2_restore_supports_empty_plaintext_legacy_snapshots() {
+        let store = DocStore::new();
+        let id = uuid::Uuid::new_v4();
+        store.create_doc_with_id(id).unwrap();
+        store.replace_text(&id, "Current live text").await.unwrap();
+
+        {
+            let doc_arc = store.get_doc(&id).unwrap();
+            let mut doc = doc_arc.write().await;
+            restore_to_version(&mut doc, &[], Some(b"")).unwrap();
+        }
+
+        assert_eq!(store.get_visible_text(&id).await.unwrap(), "");
     }
 }

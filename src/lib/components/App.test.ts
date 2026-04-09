@@ -13,7 +13,7 @@ const mockState = vi.hoisted(() => ({
     projectId: null as string | null,
     docId: null as string | null,
   },
-  uiState: { sidebarOpen: true, rightSidebarOpen: false, quickOpenVisible: false },
+  uiState: { sidebarOpen: true, rightSidebarOpen: false, quickOpenVisible: false, revokedProjectNotices: [] as Array<{ projectId: string; backendProjectId: string; projectName: string; reason: string }> },
   projectState: { projects: [{ id: 'project-1', name: 'Project 1', path: 'project-1', shared: true, role: 'owner', accessState: 'owner', canEdit: true, canManagePeers: true, peerCount: 1 }] },
   inviteState: {
     shareDialogOpen: false,
@@ -32,6 +32,8 @@ const mockState = vi.hoisted(() => ({
   recoverDocFromMarkdown: vi.fn(async () => ({ id: 'doc-a', path: 'ideas.md', fileType: 'note', created: new Date().toISOString() })),
   resumePendingJoins: vi.fn(async () => undefined),
   clearInviteBanner: vi.fn(),
+  clearRevokedProjectNotice: vi.fn(),
+  dismissProjectEvictionNotice: vi.fn(async () => undefined),
 }));
 
 vi.mock('../state/app-session.svelte.js', () => ({
@@ -53,6 +55,7 @@ vi.mock('../state/ui.svelte.js', () => ({
   closeQuickOpen: vi.fn(),
   toggleQuickOpen: vi.fn(),
   uiState: mockState.uiState,
+  clearRevokedProjectNotice: mockState.clearRevokedProjectNotice,
 }));
 
 vi.mock('../state/projects.svelte.js', () => ({
@@ -62,6 +65,7 @@ vi.mock('../state/projects.svelte.js', () => ({
 vi.mock('../api/tauri.js', () => ({
   tauriApi: {
     recoverDocFromMarkdown: mockState.recoverDocFromMarkdown,
+    dismissProjectEvictionNotice: mockState.dismissProjectEvictionNotice,
     e2eIsEnabled: vi.fn(async () => false),
     e2eSetNetworkBlocked: vi.fn(async () => undefined),
   },
@@ -105,12 +109,15 @@ describe('App fallback behavior', () => {
     mockState.editorSessionState.docId = null;
     mockState.inviteState.pendingJoinResumes = [];
     mockState.inviteState.latestInviteEvent = null;
+    mockState.uiState.revokedProjectNotices = [];
     mockState.reconcileMissingSelectedDoc.mockReset();
     mockState.navigateToDoc.mockReset();
     mockState.navigateToProject.mockReset();
     mockState.recoverDocFromMarkdown.mockReset();
     mockState.resumePendingJoins.mockReset();
     mockState.clearInviteBanner.mockReset();
+    mockState.clearRevokedProjectNotice.mockReset();
+    mockState.dismissProjectEvictionNotice.mockReset();
   });
 
   afterEach(() => {
@@ -275,5 +282,36 @@ describe('App fallback behavior', () => {
 
     expect(screen.getByTestId('invite-banner').textContent).toContain('finishing join for Project 1');
     expect(screen.getByText('retry')).toBeTruthy();
+  });
+
+  it('shows and dismisses the revoked project notice banner', async () => {
+    mockState.uiState.revokedProjectNotices = [{
+      projectId: 'project-1',
+      backendProjectId: 'manifest-uuid-1',
+      projectName: 'Project 1',
+      reason: 'access-revoked',
+    }];
+
+    render(App);
+
+    expect(screen.getByTestId('revoked-project-banner').textContent).toContain('Project 1 was removed from this device');
+    await fireEvent.click(screen.getByText('dismiss'));
+
+    expect(mockState.clearRevokedProjectNotice).toHaveBeenCalledWith('project-1');
+    expect(mockState.dismissProjectEvictionNotice).toHaveBeenCalledWith('manifest-uuid-1');
+  });
+
+  it('does not trigger quick open while typing in an input', async () => {
+    const ui = await import('../state/ui.svelte.js');
+    render(App);
+
+    const input = document.createElement('input');
+    document.body.appendChild(input);
+    input.focus();
+
+    await fireEvent.keyDown(input, { key: 'f', ctrlKey: true });
+
+    expect(ui.toggleQuickOpen).not.toHaveBeenCalled();
+    input.remove();
   });
 });

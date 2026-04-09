@@ -50,28 +50,28 @@ describe('JoinDialog', () => {
     expect(mockState.closeJoinDialog).toHaveBeenCalledTimes(1);
   });
 
-  it('submits on Enter when both fields are present', async () => {
+  it('submits via the form when both fields are present', async () => {
     render(JoinDialog);
 
     const passphrase = screen.getByTestId('join-passphrase-input');
     const peerId = screen.getByTestId('join-peer-id-input');
     await fireEvent.input(passphrase, { target: { value: 'tiger-marble' } });
     await fireEvent.input(peerId, { target: { value: 'peer-1' } });
-    await fireEvent.keyDown(window, { key: 'Enter' });
+    await fireEvent.submit(passphrase.closest('form')!);
 
     expect(mockState.acceptInvite).toHaveBeenCalledWith('tiger-marble', 'peer-1');
   });
 
-  it('does not submit on Enter while accepting or with blank values', async () => {
+  it('does not submit via the form while accepting or with blank values', async () => {
     render(JoinDialog);
 
-    await fireEvent.keyDown(window, { key: 'Enter' });
+    await fireEvent.submit(screen.getByTestId('join-passphrase-input').closest('form')!);
     expect(mockState.acceptInvite).not.toHaveBeenCalled();
 
     mockState.inviteState.accepting = true;
     await fireEvent.input(screen.getByTestId('join-passphrase-input'), { target: { value: 'tiger-marble' } });
     await fireEvent.input(screen.getByTestId('join-peer-id-input'), { target: { value: 'peer-1' } });
-    await fireEvent.keyDown(window, { key: 'Enter' });
+    await fireEvent.submit(screen.getByTestId('join-peer-id-input').closest('form')!);
 
     expect(mockState.acceptInvite).not.toHaveBeenCalled();
   });

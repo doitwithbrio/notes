@@ -1,11 +1,13 @@
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
 use iroh::endpoint::{Endpoint, RecvStream, SendStream};
+use notes_core::invite_state::PersistedJoinSecret;
 use notes_core::{
-    manifest::ProjectManifest, CoreError, DocId, JoinSessionStore, OwnerInviteStateStore,
-    PeerRole, PersistedJoinSession, PersistedJoinStage, PersistedOwnerInvitePhase,
+    manifest::ProjectManifest, CoreError, DocId, JoinSessionStore, OwnerInviteStateStore, PeerRole,
+    PersistedJoinSession, PersistedJoinStage, PersistedOwnerInvitePhase,
     PersistedOwnerInviteRecord, ProjectManager,
 };
 use notes_sync::invite::{
@@ -13,7 +15,8 @@ use notes_sync::invite::{
     InviteState, PendingInvite,
 };
 use notes_sync::peer_manager::PeerManager;
-use notes_sync::sync_engine::SyncEngine;
+use notes_sync::peer_manager::ProjectSyncResolver;
+use notes_sync::sync_engine::{SyncChangeHandler, SyncEngine};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
@@ -49,6 +52,118 @@ pub struct OwnerInviteStatus {
     pub phase: String,
     pub invitee_peer_id: Option<String>,
     pub session_id: Option<String>,
+}
+
+pub struct ProjectSyncObserver {
+    project_manager: Arc<ProjectManager>,
+    sync_engine: std::sync::Weak<SyncEngine>,
+    peer_manager: std::sync::Weak<PeerManager>,
+    local_peer_id: iroh::EndpointId,
+}
+
+pub struct ProjectSyncResolverImpl {
+    project_manager: Arc<ProjectManager>,
+}
+
+impl ProjectSyncResolverImpl {
+    pub fn new(project_manager: Arc<ProjectManager>) -> Self {
+        Self { project_manager }
+    }
+}
+
+impl ProjectSyncResolver for ProjectSyncResolverImpl {
+    fn manifest_doc_for_project<'a>(
+        &'a self,
+        project: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<uuid::Uuid>> + Send + 'a>> {
+        Box::pin(async move { self.project_manager.manifest_doc_id(project).await.ok() })
+    }
+}
+
+impl ProjectSyncObserver {
+    pub fn new(
+        project_manager: Arc<ProjectManager>,
+        sync_engine: std::sync::Weak<SyncEngine>,
+        peer_manager: std::sync::Weak<PeerManager>,
+        local_peer_id: iroh::EndpointId,
+    ) -> Self {
+        Self {
+            project_manager,
+            sync_engine,
+            peer_manager,
+            local_peer_id,
+        }
+    }
+
+    async fn apply_doc_change(&self, doc_id: DocId) {
+        let Some(project_name) = self.project_manager.get_project_for_doc(&doc_id) else {
+            log::debug!("ProjectSyncObserver: no project mapping for doc {doc_id}");
+            return;
+        };
+
+        let Some(sync_engine) = self.sync_engine.upgrade() else {
+            log::debug!("ProjectSyncObserver: sync engine gone for doc {doc_id}");
+            return;
+        };
+        let Some(peer_manager) = self.peer_manager.upgrade() else {
+            log::debug!("ProjectSyncObserver: peer manager gone for doc {doc_id}");
+            return;
+        };
+
+        let manifest_doc_id = match self.project_manager.manifest_doc_id(&project_name).await {
+            Ok(id) => id,
+            Err(_) => return,
+        };
+
+        if manifest_doc_id == doc_id {
+            log::debug!(
+                "ProjectSyncObserver: applying manifest doc {doc_id} for project {project_name}"
+            );
+            if let Ok(registered_docs) = self
+                .project_manager
+                .apply_remote_manifest_doc_to_project(&project_name, &doc_id)
+                .await
+            {
+                log::debug!(
+                    "ProjectSyncObserver: registered docs after manifest apply: {:?}",
+                    registered_docs
+                );
+                for id in std::iter::once(manifest_doc_id).chain(registered_docs.iter().copied()) {
+                    if let Ok(doc_arc) = self.project_manager.doc_store().get_doc(&id) {
+                        sync_engine.register_doc(id, doc_arc);
+                        populate_doc_acl_from_parts(
+                            &self.project_manager,
+                            &sync_engine,
+                            &self.local_peer_id,
+                            &project_name,
+                            id,
+                        )
+                        .await;
+                    }
+                }
+                let _ = hydrate_missing_doc_snapshots(
+                    &self.project_manager,
+                    &sync_engine,
+                    &peer_manager,
+                    &self.local_peer_id,
+                    &project_name,
+                    &registered_docs,
+                )
+                .await;
+            }
+        }
+    }
+}
+
+impl SyncChangeHandler for ProjectSyncObserver {
+    fn on_doc_changed<'a>(
+        &'a self,
+        doc_id: uuid::Uuid,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            self.apply_doc_change(doc_id).await;
+        })
+    }
 }
 
 pub fn list_pending_join_resumes(
@@ -131,11 +246,69 @@ pub struct StagedInviteInstall {
     manifest_bytes: Vec<u8>,
 }
 
+#[derive(Default)]
+pub struct SessionSecretCache {
+    join_session_secrets: Mutex<HashMap<String, PersistedJoinSecret>>,
+}
+
+impl SessionSecretCache {
+    pub fn cache_join_secret(&self, session_id: &str, secret: PersistedJoinSecret) {
+        if let Ok(mut cache) = self.join_session_secrets.lock() {
+            cache.insert(session_id.to_string(), secret);
+        }
+    }
+
+    pub fn load_join_secret(
+        &self,
+        store: &JoinSessionStore,
+        session_id: &str,
+    ) -> Result<Option<PersistedJoinSecret>, CoreError> {
+        if let Ok(cache) = self.join_session_secrets.lock() {
+            if let Some(secret) = cache.get(session_id) {
+                notes_crypto::debug_note_secret_cache_hit();
+                return Ok(Some(secret.clone()));
+            }
+        }
+        notes_crypto::debug_note_secret_cache_miss();
+
+        let secret = store.load_secret_bundle(session_id)?;
+        if let Some(secret_bundle) = &secret {
+            self.cache_join_secret(session_id, secret_bundle.clone());
+        }
+        Ok(secret)
+    }
+
+    pub fn remove_join_secret(&self, session_id: &str) {
+        if let Ok(mut cache) = self.join_session_secrets.lock() {
+            cache.remove(session_id);
+        }
+    }
+
+    pub fn has_join_passphrase(&self, session_id: &str) -> bool {
+        self.join_session_secrets
+            .lock()
+            .map(|cache| cache.contains_key(session_id))
+            .unwrap_or(false)
+    }
+
+    pub fn preload_join_secrets(&self, store: &JoinSessionStore) -> Result<usize, CoreError> {
+        let mut loaded = 0usize;
+        for session in store.load_all()? {
+            if let Some(secret) = store.load_secret_bundle(&session.session_id)? {
+                self.cache_join_secret(&session.session_id, secret);
+                loaded += 1;
+            }
+        }
+        Ok(loaded)
+    }
+}
+
 pub struct OwnerInvitePersistence {
     base_dir: std::path::PathBuf,
     store: Arc<OwnerInviteStateStore>,
     keystore: notes_crypto::KeyStore,
     owner_peer_id: String,
+    known_secret_ids: Mutex<HashSet<String>>,
 }
 
 impl OwnerInvitePersistence {
@@ -147,7 +320,27 @@ impl OwnerInvitePersistence {
             store,
             keystore,
             owner_peer_id,
+            known_secret_ids: Mutex::new(HashSet::new()),
         }
+    }
+
+    fn mark_secret_loaded(&self, invite_id: &str) {
+        if let Ok(mut known) = self.known_secret_ids.lock() {
+            known.insert(invite_id.to_string());
+        }
+    }
+
+    fn forget_secret(&self, invite_id: &str) {
+        if let Ok(mut known) = self.known_secret_ids.lock() {
+            known.remove(invite_id);
+        }
+    }
+
+    fn knows_secret(&self, invite_id: &str) -> bool {
+        self.known_secret_ids
+            .lock()
+            .map(|known| known.contains(invite_id))
+            .unwrap_or(false)
     }
 
     fn secret_key(invite_id: &str) -> String {
@@ -169,7 +362,9 @@ impl OwnerInvitePersistence {
             phase: match phase {
                 "PayloadPrepared" => notes_sync::invite::InviteSessionPhase::PayloadPrepared,
                 "PayloadSent" => notes_sync::invite::InviteSessionPhase::PayloadSent,
-                "AwaitingPreparedAck" => notes_sync::invite::InviteSessionPhase::AwaitingPreparedAck,
+                "AwaitingPreparedAck" => {
+                    notes_sync::invite::InviteSessionPhase::AwaitingPreparedAck
+                }
                 _ => notes_sync::invite::InviteSessionPhase::Reserved,
             },
         })
@@ -179,7 +374,9 @@ impl OwnerInvitePersistence {
         self.load_runtime_invites_with(|_, _, _| None)
     }
 
-    pub fn load_runtime_invites_with_manifest_reconcile(&self) -> Result<Vec<(String, PendingInvite)>, CoreError> {
+    pub fn load_runtime_invites_with_manifest_reconcile(
+        &self,
+    ) -> Result<Vec<(String, PendingInvite)>, CoreError> {
         let mut out = Vec::new();
         for record in self.store.load_all()? {
             if matches!(record.phase, PersistedOwnerInvitePhase::Consumed { .. }) {
@@ -188,10 +385,21 @@ impl OwnerInvitePersistence {
             }
 
             let passphrase = match self.keystore.load_key(&Self::secret_key(&record.invite_id)) {
-                Ok(bytes) => String::from_utf8(bytes)
-                    .map_err(|_| CoreError::InvalidData("invalid invite passphrase bytes".into()))?,
-                Err(_) => continue,
+                Ok(bytes) => String::from_utf8(bytes).map_err(|_| {
+                    CoreError::InvalidData("invalid invite passphrase bytes".into())
+                })?,
+                Err(notes_crypto::CryptoError::KeyNotFound(_)) => continue,
+                Err(err) => {
+                    log::warn!(
+                        "Skipping persisted invite {} until secret storage recovers: {}",
+                        record.invite_id,
+                        err
+                    );
+                    continue;
+                }
             };
+            notes_crypto::debug_note_secret_cache_miss();
+            self.mark_secret_loaded(&record.invite_id);
 
             let state = match &record.phase {
                 PersistedOwnerInvitePhase::Open => InviteState::Open,
@@ -200,12 +408,7 @@ impl OwnerInvitePersistence {
                     invitee_peer_id,
                     reserved_at,
                     phase,
-                } => Self::restore_reserved_state(
-                    session_id,
-                    invitee_peer_id,
-                    *reserved_at,
-                    phase,
-                ),
+                } => Self::restore_reserved_state(session_id, invitee_peer_id, *reserved_at, phase),
                 PersistedOwnerInvitePhase::PreparedAckReceived {
                     session_id,
                     invitee_peer_id,
@@ -216,14 +419,18 @@ impl OwnerInvitePersistence {
                         "viewer" => PeerRole::Viewer,
                         _ => PeerRole::Editor,
                     };
-                    if self
-                        .manifest_contains_peer(&record.project_name, invitee_peer_id, expected_role)?
-                    {
-                        InviteState::CommittedPendingAck(notes_sync::invite::InviteCommittedPendingAck {
-                            session_id: session_id.clone(),
-                            invitee_peer_id: invitee_peer_id.clone(),
-                            committed_at: restore_instant(*prepared_at),
-                        })
+                    if self.manifest_contains_peer(
+                        &record.project_name,
+                        invitee_peer_id,
+                        expected_role,
+                    )? {
+                        InviteState::CommittedPendingAck(
+                            notes_sync::invite::InviteCommittedPendingAck {
+                                session_id: session_id.clone(),
+                                invitee_peer_id: invitee_peer_id.clone(),
+                                committed_at: restore_instant(*prepared_at),
+                            },
+                        )
                     } else {
                         InviteState::Open
                     }
@@ -232,11 +439,13 @@ impl OwnerInvitePersistence {
                     session_id,
                     invitee_peer_id,
                     committed_at,
-                } => InviteState::CommittedPendingAck(notes_sync::invite::InviteCommittedPendingAck {
-                    session_id: session_id.clone(),
-                    invitee_peer_id: invitee_peer_id.clone(),
-                    committed_at: restore_instant(*committed_at),
-                }),
+                } => InviteState::CommittedPendingAck(
+                    notes_sync::invite::InviteCommittedPendingAck {
+                        session_id: session_id.clone(),
+                        invitee_peer_id: invitee_peer_id.clone(),
+                        committed_at: restore_instant(*committed_at),
+                    },
+                ),
                 PersistedOwnerInvitePhase::Consumed { .. } => continue,
             };
 
@@ -261,7 +470,10 @@ impl OwnerInvitePersistence {
         Ok(out)
     }
 
-    fn load_runtime_invites_with<F>(&self, reconcile: F) -> Result<Vec<(String, PendingInvite)>, CoreError>
+    fn load_runtime_invites_with<F>(
+        &self,
+        reconcile: F,
+    ) -> Result<Vec<(String, PendingInvite)>, CoreError>
     where
         F: Fn(&str, &str, &str) -> Option<()>,
     {
@@ -273,9 +485,13 @@ impl OwnerInvitePersistence {
             }
 
             let passphrase = match self.keystore.load_key(&Self::secret_key(&record.invite_id)) {
-                Ok(bytes) => String::from_utf8(bytes).map_err(|_| CoreError::InvalidData("invalid invite passphrase bytes".into()))?,
+                Ok(bytes) => String::from_utf8(bytes).map_err(|_| {
+                    CoreError::InvalidData("invalid invite passphrase bytes".into())
+                })?,
                 Err(_) => continue,
             };
+            notes_crypto::debug_note_secret_cache_miss();
+            self.mark_secret_loaded(&record.invite_id);
 
             let state = match &record.phase {
                 PersistedOwnerInvitePhase::Open => InviteState::Open,
@@ -284,23 +500,20 @@ impl OwnerInvitePersistence {
                     invitee_peer_id,
                     reserved_at,
                     phase,
-                } => Self::restore_reserved_state(
-                    session_id,
-                    invitee_peer_id,
-                    *reserved_at,
-                    phase,
-                ),
+                } => Self::restore_reserved_state(session_id, invitee_peer_id, *reserved_at, phase),
                 PersistedOwnerInvitePhase::PreparedAckReceived {
                     session_id,
                     invitee_peer_id,
                     prepared_at: _,
                 } => {
                     if reconcile(&record.project_name, invitee_peer_id, &record.role).is_some() {
-                        InviteState::CommittedPendingAck(notes_sync::invite::InviteCommittedPendingAck {
-                            session_id: session_id.clone(),
-                            invitee_peer_id: invitee_peer_id.clone(),
-                            committed_at: std::time::Instant::now(),
-                        })
+                        InviteState::CommittedPendingAck(
+                            notes_sync::invite::InviteCommittedPendingAck {
+                                session_id: session_id.clone(),
+                                invitee_peer_id: invitee_peer_id.clone(),
+                                committed_at: std::time::Instant::now(),
+                            },
+                        )
                     } else {
                         InviteState::Open
                     }
@@ -309,13 +522,15 @@ impl OwnerInvitePersistence {
                     session_id,
                     invitee_peer_id,
                     committed_at,
-                } => InviteState::CommittedPendingAck(notes_sync::invite::InviteCommittedPendingAck {
-                    session_id: session_id.clone(),
-                    invitee_peer_id: invitee_peer_id.clone(),
-                    committed_at: std::time::Instant::now()
-                        .checked_sub((Utc::now() - *committed_at).to_std().unwrap_or_default())
-                        .unwrap_or_else(std::time::Instant::now),
-                }),
+                } => InviteState::CommittedPendingAck(
+                    notes_sync::invite::InviteCommittedPendingAck {
+                        session_id: session_id.clone(),
+                        invitee_peer_id: invitee_peer_id.clone(),
+                        committed_at: std::time::Instant::now()
+                            .checked_sub((Utc::now() - *committed_at).to_std().unwrap_or_default())
+                            .unwrap_or_else(std::time::Instant::now),
+                    },
+                ),
                 PersistedOwnerInvitePhase::Consumed { .. } => continue,
             };
 
@@ -362,7 +577,10 @@ impl OwnerInvitePersistence {
             .any(|peer| peer.peer_id == invitee_peer_id && peer.role == expected_role))
     }
 
-    pub fn list_owner_invites(&self, project_name: Option<&str>) -> Result<Vec<OwnerInviteStatus>, CoreError> {
+    pub fn list_owner_invites(
+        &self,
+        project_name: Option<&str>,
+    ) -> Result<Vec<OwnerInviteStatus>, CoreError> {
         let mut out = Vec::new();
         for record in self.store.load_all()? {
             if project_name.is_some_and(|name| name != record.project_name) {
@@ -441,7 +659,25 @@ fn owner_phase_label(phase: &PersistedOwnerInvitePhase) -> &'static str {
 }
 
 impl InvitePersistenceHandler for OwnerInvitePersistence {
-    fn sync_invite(&self, passphrase: &str, invite: &PendingInvite) -> Result<(), notes_sync::invite::InviteError> {
+    fn sync_invite(
+        &self,
+        passphrase: &str,
+        invite: &PendingInvite,
+    ) -> Result<(), notes_sync::invite::InviteError> {
+        let is_consumed = matches!(invite.state, InviteState::Consumed(_));
+        let secret_name = Self::secret_key(&invite.invite_id);
+        let should_store_secret = if is_consumed {
+            false
+        } else {
+            let knows_secret = self.knows_secret(&invite.invite_id);
+            if knows_secret {
+                notes_crypto::debug_note_secret_cache_hit();
+            } else {
+                notes_crypto::debug_note_secret_cache_miss();
+            }
+            !knows_secret
+        };
+
         let phase = match &invite.state {
             InviteState::Open => PersistedOwnerInvitePhase::Open,
             InviteState::Reserved(reservation) => match reservation.phase {
@@ -457,23 +693,34 @@ impl InvitePersistenceHandler for OwnerInvitePersistence {
                     }
                 }
                 notes_sync::invite::InviteSessionPhase::PreparedAckReceived
-                | notes_sync::invite::InviteSessionPhase::Committed => PersistedOwnerInvitePhase::PreparedAckReceived {
-                    session_id: reservation.session_id.clone(),
-                    invitee_peer_id: reservation.invitee_peer_id.clone(),
-                    prepared_at: Utc::now(),
-                },
+                | notes_sync::invite::InviteSessionPhase::Committed => {
+                    PersistedOwnerInvitePhase::PreparedAckReceived {
+                        session_id: reservation.session_id.clone(),
+                        invitee_peer_id: reservation.invitee_peer_id.clone(),
+                        prepared_at: Utc::now(),
+                    }
+                }
             },
-            InviteState::CommittedPendingAck(committed) => PersistedOwnerInvitePhase::CommittedPendingAck {
-                session_id: committed.session_id.clone(),
-                invitee_peer_id: committed.invitee_peer_id.clone(),
-                committed_at: Utc::now(),
-            },
+            InviteState::CommittedPendingAck(committed) => {
+                PersistedOwnerInvitePhase::CommittedPendingAck {
+                    session_id: committed.session_id.clone(),
+                    invitee_peer_id: committed.invitee_peer_id.clone(),
+                    committed_at: Utc::now(),
+                }
+            }
             InviteState::Consumed(consumed) => PersistedOwnerInvitePhase::Consumed {
                 session_id: consumed.session_id.clone(),
                 invitee_peer_id: consumed.invitee_peer_id.clone(),
                 consumed_at: Utc::now(),
             },
         };
+
+        if should_store_secret {
+            self.keystore
+                .store_key(&secret_name, passphrase.as_bytes())
+                .map_err(|e| notes_sync::invite::InviteError::Lifecycle(e.to_string()))?;
+            self.mark_secret_loaded(&invite.invite_id);
+        }
 
         self.store
             .save(&PersistedOwnerInviteRecord {
@@ -490,12 +737,9 @@ impl InvitePersistenceHandler for OwnerInvitePersistence {
             })
             .map_err(|e| notes_sync::invite::InviteError::Lifecycle(e.to_string()))?;
 
-        if !matches!(invite.state, InviteState::Consumed(_)) {
-            self.keystore
-                .store_key(&Self::secret_key(&invite.invite_id), passphrase.as_bytes())
-                .map_err(|e| notes_sync::invite::InviteError::Lifecycle(e.to_string()))?;
-        } else {
-            let _ = self.keystore.delete_key(&Self::secret_key(&invite.invite_id));
+        if is_consumed {
+            self.forget_secret(&invite.invite_id);
+            let _ = self.keystore.delete_key(&secret_name);
         }
 
         Ok(())
@@ -505,6 +749,7 @@ impl InvitePersistenceHandler for OwnerInvitePersistence {
         self.store
             .delete(invite_id)
             .map_err(|e| notes_sync::invite::InviteError::Lifecycle(e.to_string()))?;
+        self.forget_secret(invite_id);
         let _ = self.keystore.delete_key(&Self::secret_key(invite_id));
         Ok(())
     }
@@ -552,6 +797,9 @@ impl OwnerInviteCoordinator {
         &self,
         ctx: &InviteAcceptanceContext,
     ) -> Result<InvitePayload, CoreError> {
+        self.project_manager
+            .ensure_local_actor_binding(&ctx.project_name, &self.local_peer_id.to_string())
+            .await?;
         let requested_role = match ctx.role.as_str() {
             "owner" => PeerRole::Owner,
             "editor" => PeerRole::Editor,
@@ -578,9 +826,13 @@ impl OwnerInviteCoordinator {
             false
         };
 
-        self.project_manager.init_epoch_keys(&ctx.project_name).await?;
+        self.project_manager
+            .init_epoch_keys(&ctx.project_name)
+            .await?;
 
-        let manifest_arc = self.project_manager.get_manifest_for_ui(&ctx.project_name)?;
+        let manifest_arc = self
+            .project_manager
+            .get_manifest_for_ui(&ctx.project_name)?;
         let manifest_data = {
             let mut manifest = manifest_arc.write().await;
             let current_owner = manifest.get_owner().unwrap_or_default();
@@ -598,30 +850,33 @@ impl OwnerInviteCoordinator {
             }
         };
 
-        let keys_dir = self
+        let owner_x25519_public = self
             .project_manager
-            .persistence()
-            .project_dir(&ctx.project_name)
-            .join(".p2p")
-            .join("keys");
-        std::fs::create_dir_all(&keys_dir).ok();
-        let keystore = notes_crypto::KeyStore::new(keys_dir);
-        let (_owner_secret, owner_x25519_public) = keystore
-            .get_or_create_x25519("x25519-identity")
-            .map_err(|e| CoreError::InvalidData(format!("X25519 key generation failed: {e}")))?;
+            .get_or_create_project_x25519_identity(&ctx.project_name)
+            .await?
+            .public_bytes();
 
-        let (current_epoch, epoch_key_hex) = if let Ok(epoch_mgr_arc) = self.project_manager.get_epoch_keys(&ctx.project_name) {
-            let mgr = epoch_mgr_arc.read().await;
-            let epoch = mgr.current_epoch();
-            let key = mgr
-                .current_key()
-                .ok()
-                .map(|k| Self::encode_hex(k.as_bytes()))
-                .unwrap_or_default();
-            (epoch, key)
-        } else {
-            (0, String::new())
-        };
+        let epoch_mgr_arc = self
+            .project_manager
+            .get_epoch_keys(&ctx.project_name)
+            .map_err(|_| {
+                CoreError::InvalidData(format!(
+                    "shared project '{}' is missing epoch keys",
+                    ctx.project_name
+                ))
+            })?;
+        let mgr = epoch_mgr_arc.read().await;
+        let current_epoch = mgr.current_epoch();
+        let epoch_key_hex = Self::encode_hex(
+            mgr.current_key()
+                .map_err(|_| {
+                    CoreError::InvalidData(format!(
+                        "shared project '{}' has unavailable epoch keys",
+                        ctx.project_name
+                    ))
+                })?
+                .as_bytes(),
+        );
 
         Ok(InvitePayload {
             invite_id: ctx.invite_id.clone(),
@@ -630,13 +885,16 @@ impl OwnerInviteCoordinator {
             project_name: ctx.project_name.clone(),
             role: ctx.role.clone(),
             manifest_hex: Self::encode_hex(&manifest_data),
-            owner_x25519_public_hex: Self::encode_hex(owner_x25519_public.as_bytes()),
+            owner_x25519_public_hex: Self::encode_hex(&owner_x25519_public),
             epoch_key_hex,
             epoch: current_epoch,
         })
     }
 
-    pub async fn apply_acceptance_commit(&self, ctx: &InviteAcceptanceContext) -> Result<(), CoreError> {
+    pub async fn apply_acceptance_commit(
+        &self,
+        ctx: &InviteAcceptanceContext,
+    ) -> Result<(), CoreError> {
         let requested_role = match ctx.role.as_str() {
             "owner" => PeerRole::Owner,
             "editor" => PeerRole::Editor,
@@ -664,7 +922,9 @@ impl OwnerInviteCoordinator {
         };
 
         if !already_member {
-            let manifest_arc = self.project_manager.get_manifest_for_ui(&ctx.project_name)?;
+            let manifest_arc = self
+                .project_manager
+                .get_manifest_for_ui(&ctx.project_name)?;
             let mut manifest = manifest_arc.write().await;
             manifest.add_peer(&ctx.invitee_peer_id, &ctx.role, "")?;
             let data = manifest.save();
@@ -675,14 +935,26 @@ impl OwnerInviteCoordinator {
                 .await?;
         }
 
+        let manifest_doc_id = self
+            .project_manager
+            .ensure_manifest_doc_loaded(&ctx.project_name)
+            .await?;
+        let registered_docs = self
+            .project_manager
+            .apply_manifest_doc_to_project(&ctx.project_name, &manifest_doc_id)
+            .await?;
+
         let peer_id: iroh::EndpointId = ctx
             .invitee_peer_id
             .parse()
             .map_err(|e| CoreError::InvalidInput(format!("invalid invitee peer ID: {e}")))?;
 
-        self.peer_manager.add_peer_to_project(&ctx.project_name, peer_id);
+        self.peer_manager
+            .add_peer_to_project(&ctx.project_name, peer_id);
 
-        let manifest_arc = self.project_manager.get_manifest_for_ui(&ctx.project_name)?;
+        let manifest_arc = self
+            .project_manager
+            .get_manifest_for_ui(&ctx.project_name)?;
         let doc_ids = {
             let manifest = manifest_arc.read().await;
             manifest
@@ -697,8 +969,32 @@ impl OwnerInviteCoordinator {
             "viewer" => notes_sync::sync_engine::PeerRole::Viewer,
             _ => notes_sync::sync_engine::PeerRole::Editor,
         };
-        for doc_id in doc_ids {
+        for doc_id in std::iter::once(manifest_doc_id).chain(doc_ids.into_iter()) {
             self.sync_engine.set_peer_role(doc_id, peer_id, sync_role);
+            if let Ok(doc_arc) = self.project_manager.doc_store().get_doc(&doc_id) {
+                self.sync_engine.register_doc(doc_id, doc_arc);
+            }
+            populate_doc_acl_from_parts(
+                &self.project_manager,
+                &self.sync_engine,
+                &self.local_peer_id,
+                &ctx.project_name,
+                doc_id,
+            )
+            .await;
+        }
+        for doc_id in registered_docs {
+            if let Ok(doc_arc) = self.project_manager.doc_store().get_doc(&doc_id) {
+                self.sync_engine.register_doc(doc_id, doc_arc);
+                populate_doc_acl_from_parts(
+                    &self.project_manager,
+                    &self.sync_engine,
+                    &self.local_peer_id,
+                    &ctx.project_name,
+                    doc_id,
+                )
+                .await;
+            }
         }
 
         Ok(())
@@ -709,7 +1005,13 @@ impl InviteLifecycleHandler for OwnerInviteCoordinator {
     fn prepare_payload<'a>(
         &'a self,
         ctx: &'a InviteAcceptanceContext,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<InvitePayload, notes_sync::invite::InviteError>> + Send + 'a>> {
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<InvitePayload, notes_sync::invite::InviteError>>
+                + Send
+                + 'a,
+        >,
+    > {
         Box::pin(async move {
             self.build_payload(ctx)
                 .await
@@ -720,7 +1022,13 @@ impl InviteLifecycleHandler for OwnerInviteCoordinator {
     fn commit_acceptance<'a>(
         &'a self,
         ctx: &'a InviteAcceptanceContext,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), notes_sync::invite::InviteError>> + Send + 'a>> {
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), notes_sync::invite::InviteError>>
+                + Send
+                + 'a,
+        >,
+    > {
         Box::pin(async move {
             self.apply_acceptance_commit(ctx)
                 .await
@@ -743,11 +1051,13 @@ pub fn persist_commit_confirmed_session(
 
 pub fn persist_payload_staged_session(
     store: &JoinSessionStore,
+    secret_cache: &SessionSecretCache,
     payload: &InvitePayload,
     owner_peer_id: &str,
     local_project_name: &str,
     passphrase: &str,
 ) -> Result<(), CoreError> {
+    let persisted_payload = persisted_payload(payload);
     store.save(&PersistedJoinSession {
         schema_version: 1,
         session_id: payload.session_id.clone(),
@@ -756,11 +1066,19 @@ pub fn persist_payload_staged_session(
         project_name: payload.project_name.clone(),
         local_project_name: local_project_name.to_string(),
         role: payload.role.clone(),
-        payload: serde_json::to_string(payload)?,
-        stage: PersistedJoinStage::PayloadStaged { staged_at: Utc::now() },
+        payload: serde_json::to_string(&persisted_payload)?,
+        stage: PersistedJoinStage::PayloadStaged {
+            staged_at: Utc::now(),
+        },
         updated_at: Utc::now(),
     })?;
-    store.save_secret(&payload.session_id, passphrase)
+    let secret = PersistedJoinSecret {
+        passphrase: passphrase.to_string(),
+        epoch_key_hex: (!payload.epoch_key_hex.is_empty()).then(|| payload.epoch_key_hex.clone()),
+    };
+    store.save_secret_bundle(&payload.session_id, &secret)?;
+    secret_cache.cache_join_secret(&payload.session_id, secret);
+    Ok(())
 }
 
 pub fn persist_commit_confirmed_payload(
@@ -769,6 +1087,7 @@ pub fn persist_commit_confirmed_payload(
     owner_peer_id: &str,
     local_project_name: &str,
 ) -> Result<(), CoreError> {
+    let persisted_payload = persisted_payload(payload);
     store.save(&PersistedJoinSession {
         schema_version: 1,
         session_id: payload.session_id.clone(),
@@ -777,7 +1096,7 @@ pub fn persist_commit_confirmed_payload(
         project_name: payload.project_name.clone(),
         local_project_name: local_project_name.to_string(),
         role: payload.role.clone(),
-        payload: serde_json::to_string(payload)?,
+        payload: serde_json::to_string(&persisted_payload)?,
         stage: PersistedJoinStage::CommitConfirmed {
             confirmed_at: Utc::now(),
         },
@@ -792,6 +1111,7 @@ pub fn persist_finalized_session(
     owner_peer_id: &str,
     local_project_name: &str,
 ) -> Result<(), CoreError> {
+    let persisted_payload = persisted_payload(payload);
     store.save(&PersistedJoinSession {
         schema_version: 1,
         session_id: session_id.to_string(),
@@ -800,7 +1120,7 @@ pub fn persist_finalized_session(
         project_name: payload.project_name.clone(),
         local_project_name: local_project_name.to_string(),
         role: payload.role.clone(),
-        payload: serde_json::to_string(payload)?,
+        payload: serde_json::to_string(&persisted_payload)?,
         stage: PersistedJoinStage::Finalized {
             finalized_at: Utc::now(),
         },
@@ -808,8 +1128,25 @@ pub fn persist_finalized_session(
     })
 }
 
-pub fn delete_join_session(store: &JoinSessionStore, session_id: &str) {
+pub fn delete_join_session(
+    store: &JoinSessionStore,
+    secret_cache: &SessionSecretCache,
+    session_id: &str,
+) {
+    secret_cache.remove_join_secret(session_id);
     let _ = store.delete(session_id);
+}
+
+fn persisted_payload(payload: &InvitePayload) -> InvitePayload {
+    let mut payload = payload.clone();
+    payload.epoch_key_hex.clear();
+    payload
+}
+
+fn rehydrate_payload(secret: &PersistedJoinSecret, payload: &mut InvitePayload) {
+    if payload.epoch_key_hex.is_empty() {
+        payload.epoch_key_hex = secret.epoch_key_hex.clone().unwrap_or_default();
+    }
 }
 
 pub async fn resume_owner_commit_status(
@@ -892,6 +1229,7 @@ pub async fn resume_owner_commit_status(
 
 pub async fn resume_join_sessions(
     join_session_store: Arc<JoinSessionStore>,
+    secret_cache: Arc<SessionSecretCache>,
     project_manager: Arc<ProjectManager>,
     sync_engine: Arc<SyncEngine>,
     peer_manager: Arc<PeerManager>,
@@ -923,22 +1261,34 @@ pub async fn resume_join_sessions(
                         error: None,
                     },
                 );
-                let Some(passphrase) = join_session_store.load_secret(&session.session_id).ok().flatten() else {
-                    log::warn!("Missing secret for staged join session {}; dropping", session.session_id);
-                    delete_join_session(&join_session_store, &session.session_id);
+                let Some(secret) = secret_cache
+                    .load_join_secret(&join_session_store, &session.session_id)
+                    .ok()
+                    .flatten()
+                else {
+                    log::warn!(
+                        "Missing secret for staged join session {}; dropping",
+                        session.session_id
+                    );
+                    delete_join_session(&join_session_store, &secret_cache, &session.session_id);
                     continue;
                 };
-                let payload: InvitePayload = match serde_json::from_str(&session.payload) {
+                let mut payload: InvitePayload = match serde_json::from_str(&session.payload) {
                     Ok(payload) => payload,
                     Err(err) => {
                         log::warn!("Failed to decode staged join payload: {err}");
-                        delete_join_session(&join_session_store, &session.session_id);
+                        delete_join_session(
+                            &join_session_store,
+                            &secret_cache,
+                            &session.session_id,
+                        );
                         continue;
                     }
                 };
+                rehydrate_payload(&secret, &mut payload);
                 let resume_session = match resume_owner_commit_status(
                     endpoint.clone(),
-                    passphrase,
+                    secret.passphrase.clone(),
                     session.owner_peer_id.clone(),
                 )
                 .await
@@ -1029,7 +1379,11 @@ pub async fn resume_join_sessions(
                         &session.local_project_name,
                     );
                     if send_applied_ack(resume_session).await.is_ok() {
-                        delete_join_session(&join_session_store, &session.session_id);
+                        delete_join_session(
+                            &join_session_store,
+                            &secret_cache,
+                            &session.session_id,
+                        );
                         emit_invite_accept_event(
                             app_handle.as_ref(),
                             notes_sync::events::InviteAcceptEvent {
@@ -1047,7 +1401,9 @@ pub async fn resume_join_sessions(
                     }
                     spawn_initial_invite_sync(
                         Arc::clone(&project_manager),
+                        Arc::clone(&sync_engine),
                         Arc::clone(&peer_manager),
+                        endpoint.id(),
                         result.project_name,
                         doc_ids,
                     );
@@ -1068,19 +1424,40 @@ pub async fn resume_join_sessions(
                         error: None,
                     },
                 );
-                let payload: InvitePayload = match serde_json::from_str(&session.payload) {
+                let Some(secret) = secret_cache
+                    .load_join_secret(&join_session_store, &session.session_id)
+                    .ok()
+                    .flatten()
+                else {
+                    log::warn!(
+                        "Missing secret for commit-confirmed join session {}; dropping",
+                        session.session_id
+                    );
+                    delete_join_session(&join_session_store, &secret_cache, &session.session_id);
+                    continue;
+                };
+                let mut payload: InvitePayload = match serde_json::from_str(&session.payload) {
                     Ok(payload) => payload,
                     Err(err) => {
                         log::warn!("Failed to decode persisted join payload: {err}");
-                        delete_join_session(&join_session_store, &session.session_id);
+                        delete_join_session(
+                            &join_session_store,
+                            &secret_cache,
+                            &session.session_id,
+                        );
                         continue;
                     }
                 };
+                rehydrate_payload(&secret, &mut payload);
                 let peer_id = match session.owner_peer_id.parse() {
                     Ok(peer_id) => peer_id,
                     Err(err) => {
                         log::warn!("Failed to parse persisted owner peer id: {err}");
-                        delete_join_session(&join_session_store, &session.session_id);
+                        delete_join_session(
+                            &join_session_store,
+                            &secret_cache,
+                            &session.session_id,
+                        );
                         continue;
                     }
                 };
@@ -1098,7 +1475,11 @@ pub async fn resume_join_sessions(
                         Ok(staged) => staged.manifest_bytes,
                         Err(err) => {
                             log::warn!("Failed to stage persisted join session: {err}");
-                            delete_join_session(&join_session_store, &session.session_id);
+                            delete_join_session(
+                                &join_session_store,
+                                &secret_cache,
+                                &session.session_id,
+                            );
                             continue;
                         }
                     },
@@ -1114,14 +1495,16 @@ pub async fn resume_join_sessions(
                 .map(|(result, doc_ids)| {
                     spawn_initial_invite_sync(
                         Arc::clone(&project_manager),
+                        Arc::clone(&sync_engine),
                         Arc::clone(&peer_manager),
+                        endpoint.id(),
                         result.project_name,
                         doc_ids,
                     );
                 })
                 .is_ok()
                 {
-                    delete_join_session(&join_session_store, &session.session_id);
+                    delete_join_session(&join_session_store, &secret_cache, &session.session_id);
                     emit_invite_accept_event(
                         app_handle.as_ref(),
                         notes_sync::events::InviteAcceptEvent {
@@ -1153,16 +1536,22 @@ pub async fn resume_join_sessions(
                         error: None,
                     },
                 );
-                if let Ok(Some(passphrase)) = join_session_store.load_secret(&session.session_id) {
+                if let Ok(Some(secret)) =
+                    secret_cache.load_join_secret(&join_session_store, &session.session_id)
+                {
                     if let Ok(resume_session) = resume_owner_commit_status(
                         endpoint.clone(),
-                        passphrase,
+                        secret.passphrase,
                         session.owner_peer_id.clone(),
                     )
                     .await
                     {
                         if send_applied_ack(resume_session).await.is_ok() {
-                            delete_join_session(&join_session_store, &session.session_id);
+                            delete_join_session(
+                                &join_session_store,
+                                &secret_cache,
+                                &session.session_id,
+                            );
                             emit_invite_accept_event(
                                 app_handle.as_ref(),
                                 notes_sync::events::InviteAcceptEvent {
@@ -1180,11 +1569,16 @@ pub async fn resume_join_sessions(
                         }
                     }
                 }
-                if let Ok(files) = project_manager.list_files(&session.local_project_name).await {
+                if let Ok(files) = project_manager
+                    .list_files(&session.local_project_name)
+                    .await
+                {
                     let doc_ids = files.into_iter().map(|file| file.id).collect::<Vec<_>>();
                     spawn_initial_invite_sync(
                         Arc::clone(&project_manager),
+                        Arc::clone(&sync_engine),
                         Arc::clone(&peer_manager),
+                        endpoint.id(),
                         session.local_project_name.clone(),
                         doc_ids,
                     );
@@ -1283,6 +1677,7 @@ pub async fn receive_invite_payload_session(
 pub async fn await_owner_commit_result(
     mut session: InviteAcceptanceSession,
     join_session_store: &JoinSessionStore,
+    secret_cache: &SessionSecretCache,
     local_project_name: &str,
 ) -> Result<InviteAcceptanceSession, CoreError> {
     use tokio::io::AsyncWriteExt;
@@ -1299,10 +1694,13 @@ pub async fn await_owner_commit_result(
         .map_err(|e| CoreError::InvalidData(format!("flush prepared ack failed: {e}")))?;
 
     let mut final_status = [0u8; 1];
-    tokio::time::timeout(Duration::from_secs(30), session.recv.read_exact(&mut final_status))
-        .await
-        .map_err(|_| CoreError::InvalidData("owner finalize timed out after 30s".into()))?
-        .map_err(|e| CoreError::InvalidData(format!("read final invite status failed: {e}")))?;
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        session.recv.read_exact(&mut final_status),
+    )
+    .await
+    .map_err(|_| CoreError::InvalidData("owner finalize timed out after 30s".into()))?
+    .map_err(|e| CoreError::InvalidData(format!("read final invite status failed: {e}")))?;
     if final_status[0] != 1 {
         let _ = session.send.finish();
         return Err(CoreError::InvalidData(
@@ -1316,6 +1714,11 @@ pub async fn await_owner_commit_result(
         &session.peer_id.to_string(),
         local_project_name,
     )?;
+    if let Some(secret) =
+        secret_cache.load_join_secret(join_session_store, &session.payload.session_id)?
+    {
+        secret_cache.cache_join_secret(&session.payload.session_id, secret);
+    }
 
     Ok(session)
 }
@@ -1353,7 +1756,8 @@ pub async fn stage_accepted_invite(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    let local_project_name = allocate_local_project_name(&project_manager, &payload.project_name).await?;
+    let local_project_name =
+        allocate_local_project_name(&project_manager, &payload.project_name).await?;
 
     Ok(StagedInviteInstall {
         local_project_name,
@@ -1377,6 +1781,34 @@ pub async fn finalize_accepted_invite(
         manifest_bytes,
     } = staged;
     let pm = Arc::clone(&project_manager);
+    let owner_pk_bytes = if payload.owner_x25519_public_hex.is_empty() {
+        None
+    } else {
+        Some(
+            hex_decode_32(&payload.owner_x25519_public_hex).map_err(|_| {
+                CoreError::InvalidData("invalid owner public key in invite payload".into())
+            })?,
+        )
+    };
+    let epoch_key_bytes =
+        if payload.epoch_key_hex.is_empty() {
+            None
+        } else {
+            Some(hex_decode_32(&payload.epoch_key_hex).map_err(|_| {
+                CoreError::InvalidData("invalid epoch key in invite payload".into())
+            })?)
+        };
+    let shared_payload = if manifest_bytes.is_empty() {
+        false
+    } else {
+        let manifest = ProjectManifest::load(&manifest_bytes)?;
+        !manifest.get_owner().unwrap_or_default().is_empty() || !manifest.list_peers()?.is_empty()
+    };
+    if shared_payload && (owner_pk_bytes.is_none() || epoch_key_bytes.is_none()) {
+        return Err(CoreError::InvalidData(
+            "shared invite payload is missing required crypto material".into(),
+        ));
+    }
 
     pm.create_project(&local_project_name).await.or_else(|e| {
         if matches!(e, CoreError::ProjectAlreadyExists(_)) {
@@ -1404,45 +1836,29 @@ pub async fn finalize_accepted_invite(
         std::fs::create_dir_all(&keys_dir).ok();
         let keystore = notes_crypto::KeyStore::new(keys_dir);
 
-        if !payload.owner_x25519_public_hex.is_empty() {
-            if let Ok(owner_pk_bytes) = hex_decode_32(&payload.owner_x25519_public_hex) {
-                keystore.store_key("owner-x25519-public", &owner_pk_bytes).ok();
-            }
+        if let Some(owner_pk_bytes) = owner_pk_bytes {
+            keystore
+                .store_key("owner-x25519-public", &owner_pk_bytes)
+                .ok();
         }
 
-        let _ = keystore.get_or_create_x25519("x25519-identity");
+        let _ = pm
+            .get_or_create_project_x25519_identity(&local_project_name)
+            .await?;
 
-        if !payload.epoch_key_hex.is_empty() {
-            if let Ok(epoch_key_bytes) = hex_decode_32(&payload.epoch_key_hex) {
-                let mgr = notes_crypto::EpochKeyManager::from_key(payload.epoch, &epoch_key_bytes);
-                if let Ok(data) = mgr.serialize() {
-                    let keychain_name = format!("epoch-keys-{local_project_name}");
-                    keystore.store_key(&keychain_name, &data).ok();
-                }
-            }
+        if let Some(epoch_key_bytes) = epoch_key_bytes {
+            let mgr = notes_crypto::EpochKeyManager::from_key(payload.epoch, &epoch_key_bytes);
+            pm.install_epoch_keys(&local_project_name, mgr).await?;
         }
     }
 
-    let files_for_sync = {
-        let manifest_arc = pm.get_manifest_for_ui(&local_project_name)?;
-        let manifest = manifest_arc.read().await;
-        manifest.list_files().unwrap_or_default()
-    };
-
-    let mut doc_ids = Vec::with_capacity(files_for_sync.len());
-    for file_info in &files_for_sync {
-        let doc_id = file_info.id;
-        doc_ids.push(doc_id);
-        if pm.doc_store().get_doc(&doc_id).is_err() {
-            if pm.doc_store().create_doc_with_id(doc_id).is_err() {
-                continue;
-            }
-        }
-        if let Ok(doc_arc) = pm.doc_store().get_doc(&doc_id) {
-            sync_engine.register_doc(doc_id, doc_arc);
-            populate_doc_acl_from_parts(&project_manager, &sync_engine, &endpoint.id(), &local_project_name, doc_id).await;
-        }
-    }
+    let doc_ids = register_remote_project_sync_objects(
+        &project_manager,
+        &sync_engine,
+        &endpoint.id(),
+        &local_project_name,
+    )
+    .await?;
 
     Ok((
         AcceptInviteResult {
@@ -1458,13 +1874,21 @@ async fn allocate_local_project_name(
     project_manager: &ProjectManager,
     base_name: &str,
 ) -> Result<String, CoreError> {
-    if !project_manager.persistence().is_initialized(base_name).await {
+    if !project_manager
+        .persistence()
+        .is_initialized(base_name)
+        .await
+    {
         return Ok(base_name.to_string());
     }
 
     for suffix in 1..=999 {
         let candidate = format!("{base_name}-{suffix}");
-        if !project_manager.persistence().is_initialized(&candidate).await {
+        if !project_manager
+            .persistence()
+            .is_initialized(&candidate)
+            .await
+        {
             return Ok(candidate);
         }
     }
@@ -1474,11 +1898,23 @@ async fn allocate_local_project_name(
 
 pub fn spawn_initial_invite_sync(
     project_manager: Arc<ProjectManager>,
+    sync_engine: Arc<SyncEngine>,
     peer_manager: Arc<PeerManager>,
+    local_peer_id: iroh::EndpointId,
     project_name: String,
     doc_ids: Vec<DocId>,
 ) {
     tauri::async_runtime::spawn(async move {
+        let _ = hydrate_missing_doc_snapshots(
+            &project_manager,
+            &sync_engine,
+            &peer_manager,
+            &local_peer_id,
+            &project_name,
+            &doc_ids,
+        )
+        .await;
+
         for doc_id in doc_ids {
             let mut ok = 0;
             for attempt in 0..10 {
@@ -1499,22 +1935,89 @@ pub fn spawn_initial_invite_sync(
     });
 }
 
+pub async fn perform_initial_invite_sync(
+    project_manager: Arc<ProjectManager>,
+    sync_engine: Arc<SyncEngine>,
+    peer_manager: Arc<PeerManager>,
+    local_peer_id: iroh::EndpointId,
+    project_name: &str,
+    doc_ids: &[DocId],
+) {
+    let _ = hydrate_missing_doc_snapshots(
+        &project_manager,
+        &sync_engine,
+        &peer_manager,
+        &local_peer_id,
+        project_name,
+        doc_ids,
+    )
+    .await;
+
+    for doc_id in doc_ids {
+        let mut ok = 0;
+        for attempt in 0..10 {
+            let results = peer_manager
+                .sync_doc_with_project_peers(project_name, *doc_id)
+                .await;
+            ok = results.iter().filter(|(_, r)| r.is_ok()).count();
+            if ok > 0 {
+                break;
+            }
+            let delay_ms = 200 + (attempt * 100);
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+        if ok > 0 {
+            let _ = project_manager.save_doc(project_name, doc_id).await;
+        }
+    }
+}
+
 pub async fn accept_invite_impl(
     project_manager: Arc<ProjectManager>,
     sync_engine: Arc<SyncEngine>,
     peer_manager: Arc<PeerManager>,
     join_session_store: Arc<JoinSessionStore>,
+    secret_cache: Arc<SessionSecretCache>,
     endpoint: Endpoint,
     app_handle: Option<AppHandle>,
     passphrase: String,
     owner_peer_id: String,
 ) -> Result<AcceptInviteResult, CoreError> {
-    let session = receive_invite_payload_session(endpoint.clone(), passphrase.clone(), owner_peer_id).await?;
+    let started_at = std::time::Instant::now();
+    log::info!("accept_invite_impl: start");
+    #[cfg(test)]
+    eprintln!("accept_invite_impl: start");
+    let session =
+        receive_invite_payload_session(endpoint.clone(), passphrase.clone(), owner_peer_id).await?;
+    log::info!(
+        "accept_invite_impl: payload received after {}ms",
+        started_at.elapsed().as_millis()
+    );
+    #[cfg(test)]
+    eprintln!(
+        "accept_invite_impl: payload received after {}ms",
+        started_at.elapsed().as_millis()
+    );
     let session_id = session.payload.session_id.clone();
-    let staged = stage_accepted_invite(Arc::clone(&project_manager), session.payload.clone(), session.peer_id).await?;
+    let staged = stage_accepted_invite(
+        Arc::clone(&project_manager),
+        session.payload.clone(),
+        session.peer_id,
+    )
+    .await?;
+    log::info!(
+        "accept_invite_impl: payload staged after {}ms",
+        started_at.elapsed().as_millis()
+    );
+    #[cfg(test)]
+    eprintln!(
+        "accept_invite_impl: payload staged after {}ms",
+        started_at.elapsed().as_millis()
+    );
     let local_project_name = staged.local_project_name.clone();
     persist_payload_staged_session(
         &join_session_store,
+        &secret_cache,
         &session.payload,
         &session.peer_id.to_string(),
         &local_project_name,
@@ -1534,7 +2037,23 @@ pub async fn accept_invite_impl(
             error: None,
         },
     );
-    let session = await_owner_commit_result(session, &join_session_store, &local_project_name).await?;
+    let session = await_owner_commit_result(
+        session,
+        &join_session_store,
+        &secret_cache,
+        &local_project_name,
+    )
+    .await?;
+    log::info!(
+        "accept_invite_impl: owner commit confirmed after {}ms",
+        started_at.elapsed().as_millis()
+    );
+    #[cfg(test)]
+    eprintln!(
+        "accept_invite_impl: owner commit confirmed after {}ms",
+        started_at.elapsed().as_millis()
+    );
+    let local_peer_id = endpoint.id();
     let (result, doc_ids) = finalize_accepted_invite(
         Arc::clone(&project_manager),
         Arc::clone(&sync_engine),
@@ -1543,6 +2062,17 @@ pub async fn accept_invite_impl(
         staged,
     )
     .await?;
+    log::info!(
+        "accept_invite_impl: finalize complete after {}ms ({} docs)",
+        started_at.elapsed().as_millis(),
+        doc_ids.len()
+    );
+    #[cfg(test)]
+    eprintln!(
+        "accept_invite_impl: finalize complete after {}ms ({} docs)",
+        started_at.elapsed().as_millis(),
+        doc_ids.len()
+    );
     emit_invite_accept_event(
         app_handle.as_ref(),
         notes_sync::events::InviteAcceptEvent {
@@ -1585,7 +2115,7 @@ pub async fn accept_invite_impl(
             },
         );
     } else {
-        delete_join_session(&join_session_store, &session_id);
+        delete_join_session(&join_session_store, &secret_cache, &session_id);
         emit_invite_accept_event(
             app_handle.as_ref(),
             notes_sync::events::InviteAcceptEvent {
@@ -1601,7 +2131,23 @@ pub async fn accept_invite_impl(
             },
         );
     }
-    spawn_initial_invite_sync(project_manager, peer_manager, result.project_name.clone(), doc_ids);
+    log::info!(
+        "accept_invite_impl: returning success after {}ms",
+        started_at.elapsed().as_millis()
+    );
+    #[cfg(test)]
+    eprintln!(
+        "accept_invite_impl: returning success after {}ms",
+        started_at.elapsed().as_millis()
+    );
+    spawn_initial_invite_sync(
+        project_manager,
+        sync_engine,
+        peer_manager,
+        local_peer_id,
+        result.project_name.clone(),
+        doc_ids,
+    );
     Ok(result)
 }
 
@@ -1625,8 +2171,8 @@ pub fn hex_decode_32(hex: &str) -> Result<[u8; 32], CoreError> {
 }
 
 pub async fn populate_doc_acl_from_parts(
-    project_manager: &Arc<ProjectManager>,
-    sync_engine: &Arc<SyncEngine>,
+    project_manager: &ProjectManager,
+    sync_engine: &SyncEngine,
     local_peer_id: &iroh::EndpointId,
     project: &str,
     doc_id: DocId,
@@ -1651,7 +2197,8 @@ pub async fn populate_doc_acl_from_parts(
     if let Ok(manifest_arc) = project_manager.get_manifest_for_ui(project) {
         let manifest = manifest_arc.read().await;
         if let Ok(aliases) = manifest.get_actor_aliases() {
-            let mut known_actors: std::collections::HashSet<String> = aliases.keys().cloned().collect();
+            let mut known_actors: std::collections::HashSet<String> =
+                aliases.keys().cloned().collect();
             if let Some(actor) = project_manager.doc_store().device_actor_hex() {
                 known_actors.insert(actor);
             }
@@ -1660,4 +2207,117 @@ pub async fn populate_doc_acl_from_parts(
             }
         }
     }
+}
+
+pub async fn register_project_sync_objects(
+    project_manager: &ProjectManager,
+    sync_engine: &SyncEngine,
+    local_peer_id: &iroh::EndpointId,
+    project: &str,
+) -> Result<Vec<DocId>, CoreError> {
+    project_manager
+        .ensure_local_actor_binding(project, &local_peer_id.to_string())
+        .await?;
+    let manifest_doc_id = project_manager.ensure_manifest_doc_loaded(project).await?;
+    let registered_docs = project_manager
+        .apply_manifest_doc_to_project(project, &manifest_doc_id)
+        .await?;
+
+    let mut all_doc_ids = Vec::with_capacity(registered_docs.len() + 1);
+    all_doc_ids.push(manifest_doc_id);
+    all_doc_ids.extend(registered_docs);
+
+    for doc_id in &all_doc_ids {
+        if let Ok(doc_arc) = project_manager.doc_store().get_doc(doc_id) {
+            sync_engine.register_doc(*doc_id, doc_arc);
+            populate_doc_acl_from_parts(
+                project_manager,
+                sync_engine,
+                local_peer_id,
+                project,
+                *doc_id,
+            )
+            .await;
+        }
+    }
+
+    Ok(all_doc_ids)
+}
+
+async fn register_remote_project_sync_objects(
+    project_manager: &ProjectManager,
+    sync_engine: &SyncEngine,
+    local_peer_id: &iroh::EndpointId,
+    project: &str,
+) -> Result<Vec<DocId>, CoreError> {
+    project_manager
+        .ensure_local_actor_binding(project, &local_peer_id.to_string())
+        .await?;
+    let manifest_doc_id = project_manager.ensure_manifest_doc_loaded(project).await?;
+    let registered_docs = project_manager
+        .apply_remote_manifest_doc_to_project(project, &manifest_doc_id)
+        .await?;
+
+    let mut all_doc_ids = Vec::with_capacity(registered_docs.len() + 1);
+    all_doc_ids.push(manifest_doc_id);
+    all_doc_ids.extend(registered_docs);
+
+    for doc_id in &all_doc_ids {
+        if let Ok(doc_arc) = project_manager.doc_store().get_doc(doc_id) {
+            sync_engine.register_doc(*doc_id, doc_arc);
+            populate_doc_acl_from_parts(
+                project_manager,
+                sync_engine,
+                local_peer_id,
+                project,
+                *doc_id,
+            )
+            .await;
+        }
+    }
+
+    Ok(all_doc_ids)
+}
+
+pub async fn hydrate_missing_doc_snapshots(
+    project_manager: &ProjectManager,
+    sync_engine: &SyncEngine,
+    peer_manager: &PeerManager,
+    local_peer_id: &iroh::EndpointId,
+    project: &str,
+    doc_ids: &[DocId],
+) -> Result<(), CoreError> {
+    for doc_id in doc_ids {
+        if project_manager.doc_snapshot_exists(project, doc_id).await? {
+            continue;
+        }
+
+        let results = peer_manager
+            .fetch_doc_snapshot_from_project_peers(project, *doc_id)
+            .await;
+        let snapshot = results.into_iter().find_map(|(_, result)| result.ok());
+        if let Some(snapshot) = snapshot {
+            project_manager
+                .doc_store()
+                .replace_doc(*doc_id, &snapshot)
+                .await?;
+            project_manager.save_doc(project, doc_id).await?;
+            if let Ok(doc_arc) = project_manager.doc_store().get_doc(doc_id) {
+                sync_engine.register_doc(*doc_id, doc_arc);
+                populate_doc_acl_from_parts(
+                    project_manager,
+                    sync_engine,
+                    local_peer_id,
+                    project,
+                    *doc_id,
+                )
+                .await;
+            }
+        } else {
+            log::warn!(
+                "No peer snapshot available for project {project} doc {doc_id}; keeping placeholder"
+            );
+        }
+    }
+    Ok(())
 }

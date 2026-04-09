@@ -2,6 +2,7 @@ import { tauriApi } from '../api/tauri.js';
 import { TauriRuntimeUnavailableError } from '../runtime/tauri.js';
 import { loadProjects } from './projects.svelte.js';
 import { loadProjectDocs } from './documents.svelte.js';
+import { hydrateProjectPeers, markProjectPeersLoading } from './presence.svelte.js';
 import type {
   AcceptInviteResult,
   BackendInviteAcceptEvent,
@@ -241,6 +242,8 @@ export async function acceptInvite(passphrase: string, ownerPeerId: string) {
     // Project state/APIs are keyed by project name, not manifest UUID.
     await loadProjects();
     await loadProjectDocs(result.projectName, { force: true, connectPeers: true });
+    markProjectPeersLoading(result.projectName);
+    hydrateProjectPeers(result.projectName, await tauriApi.getPeerStatus(result.projectName));
   } catch (error) {
     if (error instanceof TauriRuntimeUnavailableError) {
       // Dev mode — show mock success

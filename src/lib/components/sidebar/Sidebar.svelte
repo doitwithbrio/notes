@@ -3,6 +3,7 @@
 
   import { sortable } from '../../actions/sortable.js';
   import { isMac, modKey } from '../../utils/platform.js';
+  import { shouldIgnoreGlobalShortcut } from '../../utils/keyboard.js';
   import {
     documentState,
     loadProjectDocs,
@@ -15,10 +16,12 @@
     setDocPath,
   } from '../../state/documents.svelte.js';
   import { createProject, projectState, reorderProject, removeProject } from '../../state/projects.svelte.js';
+  import { clearProjectTodos } from '../../state/todos.svelte.js';
   import { openQuickOpen, uiState, toggleSidebar } from '../../state/ui.svelte.js';
-  import { closeEditorSession, editorSessionState } from '../../session/editor-session.svelte.js';
-  import { tauriApi } from '../../api/tauri.js';
-  import { openJoinDialog } from '../../state/invite.svelte.js';
+import { closeEditorSession, editorSessionState } from '../../session/editor-session.svelte.js';
+import { tauriApi } from '../../api/tauri.js';
+import { openJoinDialog } from '../../state/invite.svelte.js';
+import { evictProject } from '../../state/project-eviction.svelte.js';
   import {
     getWorkspaceRoute,
     beginMovedDoc,
@@ -120,16 +123,7 @@
       // Delete the project on the backend (removes all docs, manifest,
       // keys, search index, and the project directory from disk)
       await tauriApi.deleteProject(projectId);
-
-      // Remove docs from frontend state
-      const projectDocs = documentState.docs.filter((d) => d.projectId === projectId);
-      for (const doc of projectDocs) {
-        removeDoc(doc.id);
-      }
-
-      // Remove project from frontend state
-      removeProject(projectId);
-      handleDeletedProject(projectId);
+      await evictProject(projectId, 'deleted');
     } catch (err) {
       console.error('Failed to delete project:', err);
     }
@@ -327,6 +321,7 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
+    if (shouldIgnoreGlobalShortcut(e)) return;
     const mod = isMac ? e.metaKey : e.ctrlKey;
     if (!mod) return;
 

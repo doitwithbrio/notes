@@ -38,7 +38,7 @@ const mockState = vi.hoisted(() => ({
   clearVersionPreview: vi.fn(() => {
     mockState.versionReviewState.previewVersionId = null;
   }),
-  restoreVersionData: vi.fn(async () => undefined),
+  restoreVersionData: vi.fn(async () => true),
   loadVersions: vi.fn(async () => undefined),
   reloadActiveSession: vi.fn(async () => undefined),
 }));
@@ -107,8 +107,11 @@ function resetMockState() {
   mockState.getAdjacentSignificantVersionId.mockClear();
   mockState.clearVersionPreview.mockClear();
   mockState.restoreVersionData.mockClear();
+  mockState.restoreVersionData.mockImplementation(async () => true);
   mockState.loadVersions.mockClear();
+  mockState.loadVersions.mockImplementation(async () => undefined);
   mockState.reloadActiveSession.mockClear();
+  mockState.reloadActiveSession.mockImplementation(async () => undefined);
 }
 
 beforeEach(() => {
@@ -525,7 +528,7 @@ describe('workspace router', () => {
     const router = await loadRouter();
     let resolveRestore!: () => void;
     mockState.restoreVersionData.mockImplementationOnce(
-      async () => new Promise<undefined>((resolve) => { resolveRestore = () => resolve(undefined); }),
+      async () => new Promise<boolean>((resolve) => { resolveRestore = () => resolve(true); }),
     );
 
     await router.navigateToHistory('project-1', 'doc-a', 'version-1');
@@ -541,6 +544,66 @@ describe('workspace router', () => {
       docId: 'doc-a',
       mode: 'history',
       versionId: 'version-2',
+    });
+  });
+
+  it('does not reload a different session if restore completes after leaving the doc', async () => {
+    const router = await loadRouter();
+    let resolveRestore!: () => void;
+    mockState.restoreVersionData.mockImplementationOnce(
+      async () => new Promise<boolean>((resolve) => { resolveRestore = () => resolve(true); }),
+    );
+
+    await router.navigateToHistory('project-1', 'doc-a', 'version-1');
+
+    const restorePromise = router.restoreHistoryVersion('project-1', 'doc-a', 'version-1');
+    await router.navigateToDoc('project-1', 'doc-b');
+    resolveRestore();
+    await restorePromise;
+
+    expect(mockState.reloadActiveSession).not.toHaveBeenCalled();
+    expect(mockState.loadVersions).not.toHaveBeenCalledWith('doc-a');
+    expect(router.getWorkspaceRoute()).toEqual({
+      kind: 'doc',
+      projectId: 'project-1',
+      docId: 'doc-b',
+      mode: 'live',
+    });
+  });
+
+  it('stays in history when restore is unavailable and no restore happens', async () => {
+    const router = await loadRouter();
+    await router.navigateToHistory('project-1', 'doc-a', 'version-1');
+    mockState.restoreVersionData.mockImplementationOnce(async () => false);
+
+    await router.restoreHistoryVersion('project-1', 'doc-a', 'version-1');
+
+    expect(mockState.reloadActiveSession).not.toHaveBeenCalled();
+    expect(mockState.loadVersions).not.toHaveBeenCalled();
+    expect(router.getWorkspaceRoute()).toEqual({
+      kind: 'doc',
+      projectId: 'project-1',
+      docId: 'doc-a',
+      mode: 'history',
+      versionId: 'version-1',
+    });
+  });
+
+  it('returns to live even if session reload fails after a successful restore', async () => {
+    const router = await loadRouter();
+    await router.navigateToHistory('project-1', 'doc-a', 'version-1');
+    mockState.reloadActiveSession.mockImplementationOnce(async () => {
+      throw new Error('reload failed');
+    });
+
+    await expect(router.restoreHistoryVersion('project-1', 'doc-a', 'version-1')).rejects.toThrow('reload failed');
+
+    expect(mockState.loadVersions).not.toHaveBeenCalled();
+    expect(router.getWorkspaceRoute()).toEqual({
+      kind: 'doc',
+      projectId: 'project-1',
+      docId: 'doc-a',
+      mode: 'live',
     });
   });
 

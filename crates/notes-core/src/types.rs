@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::editor_schema::EditorDocument;
+
 /// Unique identifier for a document within a project.
 pub type DocId = Uuid;
 
@@ -84,12 +86,13 @@ pub struct ProjectSummary {
 /// Frontend-facing peer status record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PeerStatusSummary {
+pub struct ProjectPeerSummary {
     pub peer_id: String,
     pub connected: bool,
     pub alias: Option<String>,
-    pub role: Option<PeerRole>,
+    pub role: PeerRole,
     pub active_doc: Option<String>,
+    pub is_self: bool,
 }
 
 // ── Blame Types ──────────────────────────────────────────────────────
@@ -166,4 +169,31 @@ pub struct ProjectMetadata {
     pub owner: Option<String>,
     pub peer_count: usize,
     pub file_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DocumentSourceSchema {
+    LegacyText,
+    GraphV2,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UnsupportedNodeSummary {
+    pub count: usize,
+    pub node_types: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocReadSnapshot {
+    pub schema_version: u32,
+    pub source_schema: DocumentSourceSchema,
+    pub needs_migration: bool,
+    pub visible_text: String,
+    pub editor_document: EditorDocument,
+    pub unsupported_nodes: UnsupportedNodeSummary,
+    pub can_edit_rich_text: bool,
+    pub can_edit_plain_text: bool,
 }

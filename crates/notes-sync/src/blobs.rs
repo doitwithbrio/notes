@@ -8,8 +8,11 @@
 //! Missing blobs are fetched on-demand from connected peers.
 
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
-pub use iroh_blobs::Hash;
+use bytes::Bytes;
+use iroh::endpoint::Connection;
+use iroh_blobs::{store::fs::FsStore, BlobsProtocol, Hash};
 
 /// Re-export the ALPN for blob protocol registration.
 pub fn blob_alpn() -> &'static [u8] {
@@ -20,6 +23,9 @@ pub fn blob_alpn() -> &'static [u8] {
 pub struct BlobStore {
     /// Root directory for blob storage (e.g., `~/Notes/.p2p/blobs/`).
     store_dir: PathBuf,
+    /// Backing iroh blob store used for verified peer-to-peer transfer.
+    iroh_store: FsStore,
+    protocol: BlobsProtocol,
 }
 
 impl BlobStore {
@@ -28,7 +34,17 @@ impl BlobStore {
         tokio::fs::create_dir_all(&store_dir)
             .await
             .map_err(|e| BlobError::Io(format!("failed to create blob dir: {e}")))?;
-        Ok(Self { store_dir })
+
+        let iroh_store = FsStore::load(store_dir.join(".iroh"))
+            .await
+            .map_err(|e| BlobError::Io(format!("failed to create iroh blob store: {e}")))?;
+        let protocol = BlobsProtocol::new(&iroh_store, None);
+
+        Ok(Self {
+            store_dir,
+            iroh_store,
+            protocol,
+        })
     }
 
     /// Import raw bytes as a blob. Returns the blake3 hash.
@@ -41,6 +57,12 @@ impl BlobStore {
     ) -> Result<BlobMeta, BlobError> {
         let hash = Hash::new(data);
         let hash_hex = hash.to_hex();
+
+        self.iroh_store
+            .blobs()
+            .add_bytes(Bytes::copy_from_slice(data))
+            .await
+            .map_err(|e| BlobError::Io(format!("iroh blob import failed: {e}")))?;
 
         // Determine file extension from original filename
         let ext = original_filename
@@ -72,7 +94,10 @@ impl BlobStore {
             }
         }
 
-        log::info!("Imported blob: {hash_hex} ({} bytes, ext: {ext})", data.len());
+        log::info!(
+            "Imported blob: {hash_hex} ({} bytes, ext: {ext})",
+            data.len()
+        );
 
         Ok(BlobMeta {
             hash: hash_hex.to_string(),
@@ -103,18 +128,64 @@ impl BlobStore {
             }
         }
 
-        Err(BlobError::NotFound(hash_hex.to_string()))
+        let hash = Hash::from_str(hash_hex)
+            .map_err(|e| BlobError::Io(format!("invalid blob hash {hash_hex}: {e}")))?;
+        let data = self
+            .iroh_store
+            .blobs()
+            .get_bytes(hash)
+            .await
+            .map_err(|_| BlobError::NotFound(hash_hex.to_string()))?;
+        self.persist_local_copy(hash_hex, &data).await?;
+        Ok(data.to_vec())
+    }
+
+    /// Fetch a blob from a peer connection and persist it into the shared local store.
+    pub async fn fetch_from_connection(
+        &self,
+        connection: Connection,
+        hash_hex: &str,
+    ) -> Result<(), BlobError> {
+        let hash = Hash::from_str(hash_hex)
+            .map_err(|e| BlobError::Io(format!("invalid blob hash {hash_hex}: {e}")))?;
+        self.iroh_store
+            .remote()
+            .fetch(connection, hash)
+            .await
+            .map_err(|e| BlobError::Fetch(format!("peer blob fetch failed for {hash_hex}: {e}")))?;
+
+        let data =
+            self.iroh_store.blobs().get_bytes(hash).await.map_err(|e| {
+                BlobError::Fetch(format!("iroh blob read failed for {hash_hex}: {e}"))
+            })?;
+        self.persist_local_copy(hash_hex, &data).await?;
+        Ok(())
+    }
+
+    /// Cloneable protocol handler to register on the app router.
+    pub fn protocol(&self) -> BlobsProtocol {
+        self.protocol.clone()
+    }
+
+    async fn persist_local_copy(&self, hash_hex: &str, data: &[u8]) -> Result<(), BlobError> {
+        let ext = ext_from_bytes(data);
+        let blob_filename = format!("{hash_hex}.{ext}");
+        let blob_path = self.store_dir.join(blob_filename);
+
+        if !blob_path.exists() {
+            tokio::fs::write(&blob_path, data)
+                .await
+                .map_err(|e| BlobError::Io(format!("write blob failed: {e}")))?;
+        }
+
+        Ok(())
     }
 
     /// Check if a blob exists locally.
     pub async fn has(&self, hash_hex: &str) -> bool {
         if let Ok(mut entries) = tokio::fs::read_dir(&self.store_dir).await {
             while let Ok(Some(entry)) = entries.next_entry().await {
-                if entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(hash_hex)
-                {
+                if entry.file_name().to_string_lossy().starts_with(hash_hex) {
                     return true;
                 }
             }
@@ -157,11 +228,7 @@ impl BlobStore {
             .await
             .map_err(|e| BlobError::Io(format!("read entry failed: {e}")))?
         {
-            if entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(hash_hex)
-            {
+            if entry.file_name().to_string_lossy().starts_with(hash_hex) {
                 return Ok(entry.path());
             }
         }
@@ -197,6 +264,9 @@ pub enum BlobError {
 
     #[error("IO error: {0}")]
     Io(String),
+
+    #[error("Blob fetch failed: {0}")]
+    Fetch(String),
 }
 
 /// Compute a blob hash from raw data.
@@ -225,8 +295,28 @@ fn mime_from_ext(ext: &str) -> String {
     .to_string()
 }
 
+fn ext_from_bytes(data: &[u8]) -> &'static str {
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "png"
+    } else if data.starts_with(&[0xff, 0xd8, 0xff]) {
+        "jpg"
+    } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        "gif"
+    } else if data.starts_with(b"RIFF") && data.get(8..12) == Some(b"WEBP") {
+        "webp"
+    } else if data.starts_with(b"%PDF-") {
+        "pdf"
+    } else if data.starts_with(b"<svg") || data.windows(5).any(|window| window == b"<svg ") {
+        "svg"
+    } else {
+        "bin"
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use iroh::{endpoint::presets, protocol::Router, Endpoint};
+
     use super::*;
 
     #[tokio::test]
@@ -316,5 +406,88 @@ mod tests {
 
         let h3 = hash_data(b"different");
         assert_ne!(h1, h3);
+    }
+
+    #[tokio::test]
+    async fn test_fetches_missing_blob_from_peer_and_persists_locally() {
+        let sender_dir = tempfile::tempdir().unwrap();
+        let receiver_dir = tempfile::tempdir().unwrap();
+        let sender_store = BlobStore::new(sender_dir.path().join("blobs"))
+            .await
+            .unwrap();
+        let receiver_store = BlobStore::new(receiver_dir.path().join("blobs"))
+            .await
+            .unwrap();
+
+        let sender_endpoint = Endpoint::bind(presets::N0).await.unwrap();
+        let receiver_endpoint = Endpoint::bind(presets::N0).await.unwrap();
+
+        let sender_router = Router::builder(sender_endpoint.clone())
+            .accept(blob_alpn(), sender_store.protocol())
+            .spawn();
+        let receiver_router = Router::builder(receiver_endpoint.clone())
+            .accept(blob_alpn(), receiver_store.protocol())
+            .spawn();
+
+        let data = b"\x89PNG\r\n\x1a\npeer-fetched-image";
+        let meta = sender_store
+            .import(data, None, Some("diagram.png"))
+            .await
+            .unwrap();
+
+        assert!(!receiver_store.has(&meta.hash).await);
+
+        let connection = receiver_endpoint
+            .connect(sender_endpoint.addr(), blob_alpn())
+            .await
+            .unwrap();
+        receiver_store
+            .fetch_from_connection(connection, &meta.hash)
+            .await
+            .unwrap();
+
+        assert!(receiver_store.has(&meta.hash).await);
+        assert_eq!(receiver_store.read(&meta.hash).await.unwrap(), data);
+
+        let _ = sender_router.shutdown().await;
+        let _ = receiver_router.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_missing_remote_blob_returns_fetch_error() {
+        let sender_dir = tempfile::tempdir().unwrap();
+        let receiver_dir = tempfile::tempdir().unwrap();
+        let sender_store = BlobStore::new(sender_dir.path().join("blobs"))
+            .await
+            .unwrap();
+        let receiver_store = BlobStore::new(receiver_dir.path().join("blobs"))
+            .await
+            .unwrap();
+
+        let sender_endpoint = Endpoint::bind(presets::N0).await.unwrap();
+        let receiver_endpoint = Endpoint::bind(presets::N0).await.unwrap();
+
+        let sender_router = Router::builder(sender_endpoint.clone())
+            .accept(blob_alpn(), sender_store.protocol())
+            .spawn();
+        let receiver_router = Router::builder(receiver_endpoint.clone())
+            .accept(blob_alpn(), receiver_store.protocol())
+            .spawn();
+
+        let missing_hash = hash_to_hex(&hash_data(b"missing"));
+        let connection = receiver_endpoint
+            .connect(sender_endpoint.addr(), blob_alpn())
+            .await
+            .unwrap();
+
+        let result = receiver_store
+            .fetch_from_connection(connection, &missing_hash)
+            .await;
+
+        assert!(matches!(result, Err(BlobError::Fetch(_))));
+        assert!(!receiver_store.has(&missing_hash).await);
+
+        let _ = sender_router.shutdown().await;
+        let _ = receiver_router.shutdown().await;
     }
 }

@@ -2,7 +2,7 @@
   import type { Project } from '../../types/index.js';
   import { documentState } from '../../state/documents.svelte.js';
   import { todoState, addTodo, toggleTodo, removeTodo } from '../../state/todos.svelte.js';
-  import { presenceState } from '../../state/presence.svelte.js';
+  import { getProjectPeerById, getVisibleProjectPeers } from '../../state/presence.svelte.js';
   import { openShareDialog } from '../../state/invite.svelte.js';
   import { FileText, X, Share2 } from 'lucide-svelte';
   import { navigateToDoc } from '../../navigation/workspace-router.svelte.js';
@@ -19,24 +19,26 @@
 
   const pendingTodos = $derived(todos.filter((t) => !t.done));
   const doneTodos = $derived(todos.filter((t) => t.done));
+  const todosHydrating = $derived.by(() =>
+    todoState.loadingProjectIds.includes(project.id)
+    && !todoState.hydratedProjectIds.includes(project.id));
 
-  const onlinePeerCount = $derived(
-    presenceState.peers.filter((p) => p.online).length,
-  );
+  const projectPeers = $derived(getVisibleProjectPeers(project.id));
+  const onlinePeerCount = $derived(projectPeers.filter((peer) => peer.online).length);
 
   let newTodoText = $state('');
 
   function handleTodoKeydown(e: KeyboardEvent) {
     if (e.key === 'Enter') {
       e.preventDefault();
-      submitTodo();
+      void submitTodo();
     }
   }
 
-  function submitTodo() {
+  async function submitTodo() {
     const text = newTodoText.trim();
     if (!text) return;
-    addTodo(project.id, text);
+    await addTodo(project.id, text);
     newTodoText = '';
   }
 
@@ -51,6 +53,16 @@
   function getLinkedDocTitle(docId: string | undefined): string | null {
     if (!docId) return null;
     return documentState.docs.find((d) => d.id === docId)?.title ?? null;
+  }
+
+  function canToggleTodo(todo: typeof todos[number]) {
+    if (!project.canEdit) return false;
+    if (todo.source === 'manual') return true;
+    return !!todo.linkedDocId;
+  }
+
+  function canRemoveTodo(todo: typeof todos[number]) {
+    return project.canEdit && todo.source === 'manual';
   }
 
   const metaLine = $derived(() => {
@@ -101,24 +113,32 @@
           {/if}
         </div>
 
-        <div class="todo-input-wrap">
-          <input
-            class="todo-input"
-            type="text"
-            placeholder="add a todo..."
-            bind:value={newTodoText}
-            onkeydown={handleTodoKeydown}
-          />
-        </div>
+        {#if project.canEdit}
+          <div class="todo-input-wrap">
+            <input
+              class="todo-input"
+              type="text"
+              placeholder="add a todo..."
+              bind:value={newTodoText}
+              onkeydown={handleTodoKeydown}
+            />
+          </div>
+        {/if}
 
         <div class="todo-list">
+          {#if todosHydrating}
+            <p class="empty-hint">loading todos...</p>
+          {/if}
+
           {#each pendingTodos as todo (todo.id)}
             <div class="todo-item">
               <label class="todo-check">
                 <input
+                  aria-label={todo.text}
                   type="checkbox"
                   checked={todo.done}
-                  onchange={() => toggleTodo(todo.id)}
+                  disabled={!canToggleTodo(todo)}
+                  onchange={() => void toggleTodo(todo.id)}
                 />
               </label>
               <div class="todo-body">
@@ -133,9 +153,11 @@
                   {/if}
                 {/if}
               </div>
-              <button class="todo-remove" onclick={() => removeTodo(todo.id)} aria-label="remove">
-                <X size={12} strokeWidth={1.5} />
-              </button>
+              {#if canRemoveTodo(todo)}
+                <button class="todo-remove" onclick={() => void removeTodo(todo.id)} aria-label="remove">
+                  <X size={12} strokeWidth={1.5} />
+                </button>
+              {/if}
             </div>
           {/each}
 
@@ -143,21 +165,34 @@
             <div class="todo-item done">
               <label class="todo-check">
                 <input
+                  aria-label={todo.text}
                   type="checkbox"
                   checked={todo.done}
-                  onchange={() => toggleTodo(todo.id)}
+                  disabled={!canToggleTodo(todo)}
+                  onchange={() => void toggleTodo(todo.id)}
                 />
               </label>
               <div class="todo-body">
                 <span class="todo-text">{todo.text}</span>
+                {#if todo.linkedDocId}
+                  {@const title = getLinkedDocTitle(todo.linkedDocId)}
+                  {#if title}
+                    <span class="todo-link">
+                      <FileText size={10} strokeWidth={1.5} />
+                      {title}
+                    </span>
+                  {/if}
+                {/if}
               </div>
-              <button class="todo-remove" onclick={() => removeTodo(todo.id)} aria-label="remove">
-                <X size={12} strokeWidth={1.5} />
-              </button>
+              {#if canRemoveTodo(todo)}
+                <button class="todo-remove" onclick={() => void removeTodo(todo.id)} aria-label="remove">
+                  <X size={12} strokeWidth={1.5} />
+                </button>
+              {/if}
             </div>
           {/each}
 
-          {#if todos.length === 0}
+          {#if !todosHydrating && todos.length === 0}
             <p class="empty-hint">no todos yet</p>
           {/if}
         </div>
@@ -174,7 +209,7 @@
 
         <div class="file-list">
           {#each projectDocs as doc (doc.id)}
-            <button class="file-row" onclick={() => openDoc(doc.id)}>
+            <button class="file-row" data-file-title={doc.title} data-testid={`project-file-${doc.title}`} onclick={() => openDoc(doc.id)}>
               <FileText size={14} strokeWidth={1.5} class="file-icon" />
               <span class="file-info">
                 <span class="file-name">{doc.title}</span>
@@ -186,9 +221,9 @@
                 {#if doc.activePeers.length > 0}
                   <span class="active-peer-dots">
                     {#each doc.activePeers.slice(0, 3) as peerId (peerId)}
-                      {@const peer = presenceState.peers.find((p) => p.id === peerId)}
+                      {@const peer = getProjectPeerById(project.id, peerId)}
                       {#if peer}
-                        <span class="file-peer-dot" style="background: {peer.cursorColor}"></span>
+                          <span class="file-peer-dot" data-testid="file-active-peer-dot" style="background: {peer.cursorColor}"></span>
                       {/if}
                     {/each}
                   </span>
@@ -369,7 +404,8 @@
     transition: background var(--transition-fast);
   }
 
-  .todo-item:hover {
+  .todo-item:hover,
+  .todo-item:focus-within {
     background: var(--surface-hover);
   }
 
@@ -430,7 +466,8 @@
     transition: opacity var(--transition-fast), color var(--transition-fast);
   }
 
-  .todo-item:hover .todo-remove {
+  .todo-item:hover .todo-remove,
+  .todo-item:focus-within .todo-remove {
     opacity: 1;
   }
 

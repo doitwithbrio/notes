@@ -22,6 +22,8 @@ pub mod sync_engine;
 pub mod sync_session;
 pub mod sync_state_store;
 
+pub use iroh_gossip::net::GOSSIP_ALPN;
+pub use presence::PresenceManager;
 pub use protocol::*;
 pub use sync_engine::SyncEngine;
 pub use sync_state_store::SyncStateStore;

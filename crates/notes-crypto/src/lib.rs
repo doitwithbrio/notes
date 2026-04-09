@@ -20,5 +20,10 @@ pub use encryption::{decrypt_document, decrypt_snapshot, encrypt_document, encry
 pub use epochs::{EpochKeyManager, EpochKeys};
 pub use error::CryptoError;
 pub use key_wrapping::{unwrap_epoch_key, wrap_epoch_key};
-pub use keystore::KeyStore;
+pub use keystore::{
+    debug_enable_secret_read_tracking, debug_get_secret_read_stats, debug_note_secret_cache_hit,
+    debug_note_secret_cache_miss, debug_record_secret_read, debug_reset_secret_read_tracking,
+    debug_set_secret_read_phase, KeyStore, SecretReadBackend, SecretReadClass, SecretReadEvent,
+    SecretReadOutcome, SecretReadPhase, SecretReadStats,
+};
 pub use signing::SignedChange;

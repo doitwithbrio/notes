@@ -1,8 +1,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use automerge::sync::{Message as SyncMessage, SyncDoc, State as SyncState};
+use automerge::sync::{Message as SyncMessage, State as SyncState, SyncDoc};
 use automerge::AutoCommit;
+use automerge::ChangeHash;
 
 /// Generate a sync message, working around borrow lifetime issues with sync().
 fn gen_sync_msg(doc: &mut AutoCommit, sync_state: &mut SyncState) -> Option<Vec<u8>> {
@@ -10,20 +11,40 @@ fn gen_sync_msg(doc: &mut AutoCommit, sync_state: &mut SyncState) -> Option<Vec<
     msg.map(|m| m.encode())
 }
 
+#[derive(Debug, Clone)]
+pub struct AppliedRemoteChange {
+    pub before_heads: Vec<ChangeHash>,
+    pub after_heads: Vec<ChangeHash>,
+}
+
 /// Receive a sync message and generate a response.
-/// Returns (had_changes, response_bytes, new_change_hashes).
+/// Returns (applied_change, response_bytes, new_change_hashes).
 fn recv_and_gen(
     doc: &mut AutoCommit,
     sync_state: &mut SyncState,
     message: SyncMessage,
-) -> Result<(bool, Option<Vec<u8>>, Vec<automerge::ChangeHash>), automerge::AutomergeError> {
-    let heads_before: Vec<automerge::ChangeHash> = doc.get_heads().to_vec();
+) -> Result<
+    (
+        Option<AppliedRemoteChange>,
+        Option<Vec<u8>>,
+        Vec<ChangeHash>,
+    ),
+    automerge::AutomergeError,
+> {
+    let heads_before: Vec<ChangeHash> = doc.get_heads().to_vec();
     doc.sync().receive_sync_message(sync_state, message)?;
-    let heads_after = doc.get_heads();
-    let had_changes = heads_before != heads_after;
+    let heads_after = doc.get_heads().to_vec();
+    let applied_change = if heads_before != heads_after {
+        Some(AppliedRemoteChange {
+            before_heads: heads_before.clone(),
+            after_heads: heads_after.clone(),
+        })
+    } else {
+        None
+    };
 
     // Collect hashes of newly applied changes for signature verification
-    let new_hashes = if had_changes {
+    let new_hashes = if applied_change.is_some() {
         doc.get_changes(&heads_before)
             .iter()
             .map(|c| c.hash())
@@ -36,7 +57,7 @@ fn recv_and_gen(
         .sync()
         .generate_sync_message(sync_state)
         .map(|m| m.encode());
-    Ok((had_changes, response, new_hashes))
+    Ok((applied_change, response, new_hashes))
 }
 use tokio::sync::RwLock;
 
@@ -61,6 +82,8 @@ pub struct SyncSession {
     signatures: Option<Arc<dashmap::DashMap<([u8; 32], String), crate::protocol::ChangeSignature>>>,
     /// The remote peer's iroh identity (for logging).
     remote_peer: Option<iroh::EndpointId>,
+    /// Aggregate of remote heads applied during this session.
+    remote_change: Option<AppliedRemoteChange>,
 }
 
 impl SyncSession {
@@ -72,6 +95,7 @@ impl SyncSession {
             known_actor_ids: HashSet::new(),
             signatures: None,
             remote_peer: None,
+            remote_change: None,
         }
     }
 
@@ -84,6 +108,7 @@ impl SyncSession {
             known_actor_ids: HashSet::new(),
             signatures: None,
             remote_peer: None,
+            remote_change: None,
         }
     }
 
@@ -119,6 +144,10 @@ impl SyncSession {
     /// Get a reference to the sync state (for persisting after session).
     pub fn sync_state(&self) -> &SyncState {
         &self.sync_state
+    }
+
+    pub fn remote_change(&self) -> Option<AppliedRemoteChange> {
+        self.remote_change.clone()
     }
 
     /// Run the sync session as the initiator (outgoing connection).
@@ -204,13 +233,20 @@ impl SyncSession {
             let peer_msg = SyncMessage::decode(&msg_bytes)
                 .map_err(|e| SyncError::Protocol(format!("invalid sync message: {e}")))?;
 
-            let (had_changes, response, new_hashes) = {
+            let (applied_change, response, new_hashes) = {
                 let mut doc = doc.write().await;
                 recv_and_gen(&mut doc, &mut self.sync_state, peer_msg)?
             };
 
+            if let Some(change) = applied_change.clone() {
+                match &mut self.remote_change {
+                    Some(existing) => existing.after_heads = change.after_heads,
+                    None => self.remote_change = Some(change),
+                }
+            }
+
             // Post-receive signature verification (when ACL is configured)
-            if had_changes {
+            if applied_change.is_some() {
                 if let Some(ref allowed) = self.allowed_peers {
                     if let Err(e) = self.verify_new_changes(&doc, &new_hashes, allowed).await {
                         log::error!(
@@ -275,7 +311,7 @@ impl SyncSession {
         &self,
         doc: &Arc<RwLock<AutoCommit>>,
         new_hashes: &[automerge::ChangeHash],
-        _allowed_peers: &[iroh::EndpointId],
+        allowed_peers: &[iroh::EndpointId],
     ) -> Result<(), SyncError> {
         if new_hashes.is_empty() {
             return Ok(());
@@ -300,6 +336,17 @@ impl SyncSession {
                 let actor = change.actor_id().to_hex_string();
 
                 if !self.known_actor_ids.contains(&actor) {
+                    if let Some(remote_peer) = self.remote_peer {
+                        if allowed_peers.contains(&remote_peer) {
+                            log::warn!(
+                                "ACCEPTING first-seen actor {} for allowed peer {:?} in doc {:?}",
+                                &actor[..8.min(actor.len())],
+                                remote_peer,
+                                &self.doc_id[..4]
+                            );
+                            continue;
+                        }
+                    }
                     log::error!(
                         "REJECTED change {} from unknown actor {} in doc {:?} (remote: {:?})",
                         hash,
@@ -308,7 +355,8 @@ impl SyncSession {
                         self.remote_peer,
                     );
                     return Err(SyncError::SignatureError(format!(
-                        "change from unknown actor {}", &actor[..8.min(actor.len())]
+                        "change from unknown actor {}",
+                        &actor[..8.min(actor.len())]
                     )));
                 }
 
@@ -366,10 +414,7 @@ impl SyncSession {
 }
 
 /// Write bytes to a QUIC send stream, mapping errors to SyncError.
-async fn write_bytes(
-    send: &mut iroh::endpoint::SendStream,
-    data: &[u8],
-) -> Result<(), SyncError> {
+async fn write_bytes(send: &mut iroh::endpoint::SendStream, data: &[u8]) -> Result<(), SyncError> {
     send.write_all(data)
         .await
         .map_err(|e| SyncError::Io(Box::new(e)))?;

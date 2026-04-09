@@ -24,6 +24,8 @@ sha2 = "0.10"
 getrandom = "0.3"
 serde_json.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
+bytes.workspace = true
+futures-lite = "2"
 
 [dev-dependencies]
 tempfile = "3"

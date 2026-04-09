@@ -17,6 +17,14 @@ type SyncSnapshot = {
   isSharedProject: boolean;
 };
 
+type BlobImageState = 'loading' | 'missing' | 'ready';
+
+type PasteImageInput = {
+  filename: string;
+  mimeType: string;
+  base64: string;
+};
+
 type E2EBridge = {
   isReady(): boolean;
   setNetworkBlocked(blocked: boolean): Promise<void>;
@@ -78,12 +86,30 @@ export async function createProject(name: AppInstanceName, projectName: string) 
   const input = await app(name).$(selectors.projectNameInput);
   await input.waitForDisplayed({ timeout: 10_000 });
   await input.setValue(projectName);
-  await app(name).keys('Enter');
+  await (await app(name).$('button[aria-label="create project"]')).click();
   await waitForProjectVisible(name, projectName);
+  await waitForProjectHydrated(name, projectName);
 }
 
 export async function waitForProjectVisible(name: AppInstanceName, projectName: string) {
   await (await app(name).$(projectOpenSelector(projectName))).waitForDisplayed({ timeout: 30_000 });
+}
+
+export async function waitForProjectHydrated(name: AppInstanceName, projectName: string) {
+  const groupSelector = `[data-testid="project-group-${projectName}"]`;
+  await (await app(name).$(groupSelector)).waitForDisplayed({ timeout: 30_000 });
+  await app(name).waitUntil(async () => {
+    const group = await app(name).$(groupSelector);
+    if (!(await group.isExisting())) {
+      return false;
+    }
+    const html = await group.getHTML(false);
+    return !html.includes('loading notes...');
+  }, {
+    timeout: 30_000,
+    interval: 100,
+    timeoutMsg: `${name} project ${projectName} never finished hydrating`,
+  });
 }
 
 export async function expectProjectNotVisible(name: AppInstanceName, projectName: string) {
@@ -96,14 +122,16 @@ export async function expectProjectNotVisible(name: AppInstanceName, projectName
 
 export async function openProject(name: AppInstanceName, projectName: string) {
   await (await app(name).$(projectOpenSelector(projectName))).click();
+  await waitForProjectHydrated(name, projectName);
 }
 
 export async function createNote(name: AppInstanceName, projectName: string, noteTitle: string) {
+  await waitForProjectHydrated(name, projectName);
   await (await app(name).$(projectAddNoteSelector(projectName))).click();
   const input = await app(name).$(selectors.noteTitleInput);
   await input.waitForDisplayed({ timeout: 10_000 });
   await input.setValue(noteTitle);
-  await app(name).keys('Enter');
+  await (await app(name).$('button[aria-label="create note"]')).click();
   await waitForNoteVisible(name, noteTitle);
 }
 
@@ -123,6 +151,33 @@ export async function typeInEditor(name: AppInstanceName, text: string) {
   await app(name).keys(text.split(''));
 }
 
+export async function pasteImageIntoEditor(name: AppInstanceName, image: PasteImageInput) {
+  const editor = await app(name).$(selectors.editorMount);
+  await editor.waitForDisplayed({ timeout: 30_000 });
+  await editor.click();
+  await app(name).execute((payload, editorSelector) => {
+    const target = document.querySelector(editorSelector) as HTMLElement | null;
+    if (!target) {
+      throw new Error(`missing editor target: ${editorSelector}`);
+    }
+
+    const binary = atob(payload.base64);
+    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    const file = new File([bytes], payload.filename, { type: payload.mimeType });
+    const event = new ClipboardEvent('paste', { bubbles: true, cancelable: true });
+    Object.defineProperty(event, 'clipboardData', {
+      value: {
+        files: [file],
+        items: [{ kind: 'file', type: payload.mimeType, getAsFile: () => file }],
+        types: ['Files'],
+        getData: () => '',
+      },
+    });
+
+    target.dispatchEvent(event);
+  }, image, selectors.editorMount);
+}
+
 export async function readEditorText(name: AppInstanceName) {
   const editor = await app(name).$(selectors.editorMount);
   await editor.waitForDisplayed({ timeout: 30_000 });
@@ -133,6 +188,36 @@ export async function isEditorEditable(name: AppInstanceName) {
   const editor = await app(name).$(selectors.editorMount);
   await editor.waitForDisplayed({ timeout: 30_000 });
   return (await editor.getAttribute('contenteditable')) !== 'false';
+}
+
+export async function waitForBlobImageState(name: AppInstanceName, state: BlobImageState | BlobImageState[]) {
+  const expectedStates = Array.isArray(state) ? state : [state];
+  await app(name).waitUntil(async () => {
+    const nodes = await app(name).$$(selectors.blobImageNode);
+    if ((await nodes.length) === 0) return false;
+    for (const node of nodes) {
+      const current = await node.getAttribute('data-state');
+      if (current && expectedStates.includes(current as BlobImageState)) {
+        return true;
+      }
+    }
+    return false;
+  }, {
+    timeout: 45_000,
+    interval: 250,
+    timeoutMsg: `${name} never showed a blob image state in [${expectedStates.join(', ')}]`,
+  });
+}
+
+export async function waitForBlobImageCount(name: AppInstanceName, count: number) {
+  await app(name).waitUntil(async () => {
+    const nodes = await app(name).$$(selectors.blobImageNode);
+    return (await nodes.length) === count;
+  }, {
+    timeout: 45_000,
+    interval: 250,
+    timeoutMsg: `${name} never showed ${count} blob image node(s)`,
+  });
 }
 
 export async function waitForEditorText(name: AppInstanceName, snippet: string) {
@@ -214,6 +299,35 @@ export async function expectJoinFailure(name: AppInstanceName, expectedText?: st
 export async function waitForPeerRow(name: AppInstanceName, peerId: string) {
   await openPeersPanel(name);
   await (await app(name).$(peerRowSelector(peerId))).waitForDisplayed({ timeout: 30_000 });
+}
+
+export async function waitForPeerState(name: AppInstanceName, peerId: string, state: 'online' | 'offline') {
+  await openPeersPanel(name);
+  await app(name).waitUntil(async () => {
+    return (await (await app(name).$(peerRowSelector(peerId))).getAttribute('data-state')) === state;
+  }, {
+    timeout: 30_000,
+    interval: 250,
+    timeoutMsg: `${name} never showed peer ${peerId} as ${state}`,
+  });
+}
+
+export async function waitForPeersEmpty(name: AppInstanceName) {
+  await openPeersPanel(name);
+  await (await app(name).$('[data-testid="peers-empty"]')).waitForDisplayed({ timeout: 30_000 });
+}
+
+export async function waitForFileActivePeerCount(name: AppInstanceName, noteTitle: string, count: number) {
+  await app(name).waitUntil(async () => {
+    const row = await app(name).$(`[data-file-title="${noteTitle}"]`);
+    if (!(await row.isExisting())) return false;
+    const dots = await row.$$('[data-testid="file-active-peer-dot"]');
+    return (await dots.length) === count;
+  }, {
+    timeout: 30_000,
+    interval: 250,
+    timeoutMsg: `${name} never showed ${count} active peer dots for ${noteTitle}`,
+  });
 }
 
 export async function removePeer(name: AppInstanceName, peerId: string) {

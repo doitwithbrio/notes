@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { Document } from '../../types/index.js';
   import { documentState } from '../../state/documents.svelte.js';
-  import { getPeerById } from '../../state/presence.svelte.js';
+  import { getProjectPeerById } from '../../state/presence.svelte.js';
   import { getWorkspaceRoute, isDocRoute } from '../../navigation/workspace-router.svelte.js';
 
   let {
@@ -31,7 +31,7 @@
 
   const peersHere = $derived.by(() =>
     doc.activePeers
-      .map((peerId) => getPeerById(peerId))
+      .map((peerId) => getProjectPeerById(doc.projectId, peerId))
       .filter((peer): peer is NonNullable<typeof peer> => !!peer?.online)
       .slice(0, 3),
   );

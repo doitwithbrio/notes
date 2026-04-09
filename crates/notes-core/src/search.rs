@@ -142,6 +142,14 @@ impl SearchIndex {
         Ok(())
     }
 
+    /// Remove all documents for a project from the search index.
+    pub fn remove_project(&self, project: &str) -> Result<(), CoreError> {
+        self.conn
+            .execute("DELETE FROM notes_fts WHERE project = ?1", params![project])
+            .map_err(|e| CoreError::InvalidData(format!("FTS project delete failed: {e}")))?;
+        Ok(())
+    }
+
     /// Search for notes matching a query.
     /// Returns results ranked by relevance.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>, CoreError> {

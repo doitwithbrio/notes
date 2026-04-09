@@ -1,8 +1,11 @@
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use automerge::AutoCommit;
+use automerge::ChangeHash;
 use dashmap::DashMap;
 use iroh::endpoint::Connection;
 use iroh::protocol::AcceptError;
@@ -31,7 +34,7 @@ pub enum PeerRole {
 /// and provides methods to initiate outgoing sync with peers.
 ///
 /// Remote change notifications are sent via a `tokio::sync::broadcast` channel.
-/// Subscribe with `SyncEngine::subscribe_remote_changes()` to receive `Uuid` doc IDs.
+/// Subscribe with `SyncEngine::subscribe_remote_changes()` to receive remote change baselines.
 /// Maximum concurrent connections handled by the sync engine.
 const MAX_CONNECTIONS: usize = 32;
 
@@ -45,6 +48,18 @@ const MAX_SIGNATURES_PER_DOC: usize = 10_000;
 
 /// Maximum concurrent bidirectional streams per connection.
 const MAX_STREAMS_PER_CONNECTION: usize = 16;
+
+pub trait SyncChangeHandler: Send + Sync {
+    fn on_doc_changed<'a>(&'a self, doc_id: Uuid) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteDocChange {
+    pub doc_id: Uuid,
+    pub before_heads: Vec<ChangeHash>,
+    pub after_heads: Vec<ChangeHash>,
+    pub peer_id: Option<String>,
+}
 
 pub struct SyncEngine {
     /// Documents available for sync, keyed by their 32-byte wire ID.
@@ -66,13 +81,15 @@ pub struct SyncEngine {
     sync_state_store: Option<Arc<crate::SyncStateStore>>,
 
     /// Channel for notifying about remote changes.
-    change_tx: tokio::sync::broadcast::Sender<Uuid>,
+    change_tx: tokio::sync::broadcast::Sender<RemoteDocChange>,
 
     /// Semaphore limiting concurrent incoming connections.
     connection_semaphore: Arc<Semaphore>,
 
     /// Test-only network gate used by desktop E2E.
     network_blocked: Arc<AtomicBool>,
+
+    change_handler: Arc<std::sync::RwLock<Option<Arc<dyn SyncChangeHandler>>>>,
 }
 
 impl std::fmt::Debug for SyncEngine {
@@ -95,6 +112,7 @@ impl SyncEngine {
             change_tx,
             connection_semaphore: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             network_blocked: Arc::new(AtomicBool::new(false)),
+            change_handler: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -104,9 +122,32 @@ impl SyncEngine {
     }
 
     /// Subscribe to remote change notifications.
-    /// Returns a receiver that yields the DocId (as Uuid) of changed documents.
-    pub fn subscribe_remote_changes(&self) -> tokio::sync::broadcast::Receiver<Uuid> {
+    /// Returns a receiver that yields the changed doc and pre/post-sync heads.
+    pub fn subscribe_remote_changes(&self) -> tokio::sync::broadcast::Receiver<RemoteDocChange> {
         self.change_tx.subscribe()
+    }
+
+    pub async fn fetch_doc_snapshot_from_peer(
+        &self,
+        connection: &Connection,
+        doc_id: Uuid,
+    ) -> Result<Vec<u8>, SyncError> {
+        let doc_key = uuid_to_doc_key(doc_id);
+        let (mut send, mut recv) = connection.open_bi().await?;
+        let header =
+            protocol::encode_stream_header(protocol::MessageType::ViewerSnapshot, &doc_key);
+        send.write_all(&header)
+            .await
+            .map_err(|e| SyncError::Io(Box::new(e)))?;
+        let snapshot = crate::sync_session::read_framed(&mut recv).await?;
+        let _ = send.finish();
+        Ok(snapshot)
+    }
+
+    pub fn set_change_handler(&self, handler: Arc<dyn SyncChangeHandler>) {
+        if let Ok(mut slot) = self.change_handler.write() {
+            *slot = Some(handler);
+        }
     }
 
     pub fn set_network_blocked(&self, blocked: bool) {
@@ -116,7 +157,6 @@ impl SyncEngine {
     pub fn is_network_blocked(&self) -> bool {
         self.network_blocked.load(Ordering::Relaxed)
     }
-
 
     /// Register a document for sync.
     pub fn register_doc(&self, doc_id: Uuid, doc: Arc<RwLock<AutoCommit>>) {
@@ -142,12 +182,7 @@ impl SyncEngine {
     }
 
     /// Set the ACL role for a peer on a document.
-    pub fn set_peer_role(
-        &self,
-        doc_id: Uuid,
-        peer_id: iroh::EndpointId,
-        role: PeerRole,
-    ) {
+    pub fn set_peer_role(&self, doc_id: Uuid, peer_id: iroh::EndpointId, role: PeerRole) {
         let key = uuid_to_doc_key(doc_id);
         self.acl.insert((key, peer_id), role);
     }
@@ -159,11 +194,7 @@ impl SyncEngine {
     }
 
     /// Check a peer's role for a document.
-    fn check_peer_role(
-        &self,
-        doc_key: &[u8; 32],
-        peer_id: &iroh::EndpointId,
-    ) -> PeerRole {
+    fn check_peer_role(&self, doc_key: &[u8; 32], peer_id: &iroh::EndpointId) -> PeerRole {
         self.acl
             .get(&(*doc_key, *peer_id))
             .map(|entry| *entry.value())
@@ -194,10 +225,7 @@ impl SyncEngine {
     }
 
     /// Get all stored signatures for a document (for transmitting as sidecar).
-    pub fn get_signatures_for_doc(
-        &self,
-        doc_id: Uuid,
-    ) -> Vec<crate::protocol::ChangeSignature> {
+    pub fn get_signatures_for_doc(&self, doc_id: Uuid) -> Vec<crate::protocol::ChangeSignature> {
         let key = uuid_to_doc_key(doc_id);
         self.signatures
             .iter()
@@ -272,8 +300,22 @@ impl SyncEngine {
             }
         }
 
-        // Notify that remote changes may have been applied
-        let _ = self.change_tx.send(doc_id);
+        if let Some(remote_change) = session.remote_change() {
+            let handler = self
+                .change_handler
+                .read()
+                .ok()
+                .and_then(|slot| slot.clone());
+            if let Some(handler) = handler {
+                handler.on_doc_changed(doc_id).await;
+            }
+            let _ = self.change_tx.send(RemoteDocChange {
+                doc_id,
+                before_heads: remote_change.before_heads,
+                after_heads: remote_change.after_heads,
+                peer_id: Some(peer_id.to_string()),
+            });
+        }
 
         log::info!("Outgoing sync complete for doc {doc_id}");
         Ok(())
@@ -281,10 +323,7 @@ impl SyncEngine {
 
     /// Handle an incoming sync connection (called by the ProtocolHandler).
     async fn handle_connection(&self, connection: Connection) -> Result<(), SyncError> {
-        log::debug!(
-            "Incoming sync connection from {:?}",
-            connection.remote_id()
-        );
+        log::debug!("Incoming sync connection from {:?}", connection.remote_id());
 
         let stream_semaphore = Semaphore::new(MAX_STREAMS_PER_CONNECTION);
 
@@ -296,9 +335,10 @@ impl SyncEngine {
             }
 
             // Limit concurrent streams per connection
-            let _stream_permit = stream_semaphore.acquire().await.map_err(|_| {
-                SyncError::Protocol("stream semaphore closed".to_string())
-            })?;
+            let _stream_permit = stream_semaphore
+                .acquire()
+                .await
+                .map_err(|_| SyncError::Protocol("stream semaphore closed".to_string()))?;
 
             // Accept the next bidirectional stream
             let (mut send, mut recv) = match connection.accept_bi().await {
@@ -373,9 +413,24 @@ impl SyncEngine {
                         log::error!("Sync session error for doc {:?}: {e}", &doc_id[..4]);
                     }
 
-                    // Notify about potential changes
-                    if let Some(uuid) = doc_key_to_uuid(&doc_id) {
-                        let _ = self.change_tx.send(uuid);
+                    // Notify about actual remote changes
+                    if let (Some(uuid), Some(remote_change)) =
+                        (doc_key_to_uuid(&doc_id), session.remote_change())
+                    {
+                        let handler = self
+                            .change_handler
+                            .read()
+                            .ok()
+                            .and_then(|slot| slot.clone());
+                        if let Some(handler) = handler {
+                            handler.on_doc_changed(uuid).await;
+                        }
+                        let _ = self.change_tx.send(RemoteDocChange {
+                            doc_id: uuid,
+                            before_heads: remote_change.before_heads,
+                            after_heads: remote_change.after_heads,
+                            peer_id: Some(remote_id.to_string()),
+                        });
                     }
 
                     let _ = send.finish();
@@ -399,7 +454,10 @@ impl SyncEngine {
                     // Read and store incoming signature batch (with size cap)
                     match crate::sync_session::read_framed(&mut recv).await {
                         Ok(batch_bytes) => {
-                            if let Ok(batch) = serde_json::from_slice::<protocol::SignatureBatchPayload>(&batch_bytes) {
+                            if let Ok(batch) = serde_json::from_slice::<
+                                protocol::SignatureBatchPayload,
+                            >(&batch_bytes)
+                            {
                                 if batch.signatures.len() > MAX_SIGNATURES_PER_BATCH {
                                     log::warn!(
                                         "Rejected oversized signature batch ({} sigs, max {}) for doc {:?}",
@@ -409,10 +467,12 @@ impl SyncEngine {
                                     );
                                 } else {
                                     for sig in batch.signatures {
-                                        self.signatures.insert((doc_id, sig.change_hash.clone()), sig);
+                                        self.signatures
+                                            .insert((doc_id, sig.change_hash.clone()), sig);
                                     }
                                     // Enforce per-doc cap: if too many signatures, evict for this doc
-                                    let doc_sig_count = self.signatures
+                                    let doc_sig_count = self
+                                        .signatures
                                         .iter()
                                         .filter(|e| e.key().0 == doc_id)
                                         .count();
@@ -427,7 +487,10 @@ impl SyncEngine {
                                         // (simple approach — full LRU is overkill for v1)
                                         self.signatures.retain(|k, _| k.0 != doc_id);
                                     }
-                                    log::debug!("Received signature batch for doc {:?}", &doc_id[..4]);
+                                    log::debug!(
+                                        "Received signature batch for doc {:?}",
+                                        &doc_id[..4]
+                                    );
                                 }
                             }
                         }
@@ -464,6 +527,7 @@ impl iroh::protocol::ProtocolHandler for SyncEngine {
             change_tx: self.change_tx.clone(),
             connection_semaphore: Arc::clone(&self.connection_semaphore),
             network_blocked: Arc::clone(&self.network_blocked),
+            change_handler: self.change_handler.clone(),
         };
         let semaphore = Arc::clone(&self.connection_semaphore);
 

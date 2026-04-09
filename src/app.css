@@ -86,6 +86,66 @@
   --right-sidebar-width: 280px;
   --right-sidebar-collapsed: 44px;
 
+  /* Design-system aliases */
+  --space-0: 0;
+  --space-2: 2px;
+  --space-4: 4px;
+  --space-6: 6px;
+  --space-8: 8px;
+  --space-10: 10px;
+  --space-12: 12px;
+  --space-14: 14px;
+  --space-16: 16px;
+  --space-20: 20px;
+  --space-24: 24px;
+  --space-32: 32px;
+  --space-40: 40px;
+  --space-48: 48px;
+  --space-80: 80px;
+  --space-100: 100px;
+
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --radius-xl: 12px;
+  --radius-2xl: 16px;
+  --radius-pill: 999px;
+  --radius-round: 50%;
+
+  --text-label: 12px;
+  --text-body-sm: 13px;
+  --text-body: 14px;
+  --text-title: 16px;
+  --text-display: 20px;
+
+  --font-weight-regular: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+  --font-weight-bold: 700;
+
+  --line-tight: 1.25;
+  --line-body: 1.5;
+  --line-relaxed: 1.65;
+
+  --status-danger-fg: var(--danger-fg);
+  --status-danger-bg: var(--danger-bg);
+  --status-danger-border: var(--danger-border);
+  --status-sync-connected: var(--accent);
+  --status-sync-slow: var(--diff-changed);
+  --status-sync-offline: var(--text-tertiary);
+  --status-sync-local: var(--text-tertiary);
+
+  --overlay-width-md: 560px;
+  --overlay-height-md: 440px;
+  --overlay-offset-top: var(--space-100);
+  --z-overlay: 100;
+
+  --motion-enter-fade: 150ms var(--ease-smooth);
+  --motion-enter-panel: 200ms var(--ease-out-expo);
+  --motion-progress: 250ms var(--ease-smooth);
+  --motion-spin: 1s linear infinite;
+
   /* Transitions */
   --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
   --ease-smooth: cubic-bezier(0.4, 0, 0.2, 1);

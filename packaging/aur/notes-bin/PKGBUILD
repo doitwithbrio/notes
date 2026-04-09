@@ -1,6 +1,8 @@
+# Maintainer: doitwithbrio
+
 pkgname=notes-bin
 _pkgname=notes
-pkgver=0.1.5
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Local-first, peer-to-peer, end-to-end encrypted markdown notes app"
 arch=('x86_64')
@@ -10,9 +12,8 @@ depends=('desktop-file-utils' 'hicolor-icon-theme')
 provides=('notes')
 conflicts=('notes')
 options=('!strip')
-install=${pkgname}.install
 source_x86_64=("${url}/releases/download/v${pkgver}/${_pkgname}_${pkgver}_amd64.AppImage")
-sha256sums_x86_64=('b37b0244ee87122ff77a166a5d64c6cb6b140a531e5ffec44adbb31168fd183d')
+sha256sums_x86_64=('SKIP')
 
 package() {
   cd "$srcdir"
@@ -44,8 +45,21 @@ package() {
 #!/bin/sh
 export NOTES_DISABLE_UPDATER=1
 export NOTES_UPDATER_REASON="${NOTES_UPDATER_REASON:-Updates are managed by Omarchy/AUR for this install.}"
-: "${WEBKIT_DISABLE_DMABUF_RENDERER:=1}"
-export WEBKIT_DISABLE_DMABUF_RENDERER
+
+if [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
+  : "${WEBKIT_DISABLE_DMABUF_RENDERER:=1}"
+  export WEBKIT_DISABLE_DMABUF_RENDERER
+fi
+
+if [ "${NOTES_PREFER_X11:-0}" = "1" ] && [ -z "${GDK_BACKEND:-}" ] && [ -n "${DISPLAY:-}" ]; then
+  export GDK_BACKEND=x11
+fi
+
+if [ "${GDK_BACKEND:-}" = "x11" ]; then
+  : "${WEBKIT_DISABLE_COMPOSITING_MODE:=1}"
+  export WEBKIT_DISABLE_COMPOSITING_MODE
+fi
+
 exec /opt/${_pkgname}/${_pkgname}.AppImage --appimage-extract-and-run "$@"
 EOF
 
